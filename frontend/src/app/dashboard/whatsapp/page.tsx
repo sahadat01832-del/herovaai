@@ -2,7 +2,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   Smartphone, Plus, WifiOff, Trash2, Send, Bot,
-  RefreshCw, User, MessageSquare, Clock, CheckCircle2, AlertTriangle
+  RefreshCw, User, MessageSquare, Clock, CheckCircle2, AlertTriangle, Save,
 } from 'lucide-react'
 import { whatsappApi } from '@/lib/api'
 import { io, Socket } from 'socket.io-client'
@@ -26,6 +26,9 @@ interface WASession {
   autoReply: boolean
   autoReplyMode: string
   useMemory: boolean
+  tone?: string
+  customPrompt?: string
+  lastError?: string | null
   qrCode?: string | null
   totalMessagesReceived: number
   totalMessagesSent: number
@@ -51,6 +54,8 @@ export default function WhatsAppPage() {
   const [showNewSession, setShowNewSession] = useState(false)
   const [sendMsg, setSendMsg] = useState('')
   const [manualPhone, setManualPhone] = useState('')
+  const [toneDraft, setToneDraft] = useState<Record<string, string>>({})
+  const [promptDraft, setPromptDraft] = useState<Record<string, string>>({})
   const [loading, setLoading] = useState(false)
   const socketRef = useRef<Socket | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -241,6 +246,20 @@ export default function WhatsAppPage() {
     }
   }
 
+  const saveReplySettings = async (session: WASession) => {
+    try {
+      const d: any = await whatsappApi.updateSettings(session._id, {
+        tone: toneDraft[session._id] ?? session.tone ?? '',
+        customPrompt: promptDraft[session._id] ?? session.customPrompt ?? '',
+      })
+      setSessions(prev => prev.map(s => (s._id === session._id ? d.session : s)))
+      if (selectedSession?._id === session._id) setSelectedSession(d.session)
+      toast.success('Reply settings saved')
+    } catch (err: any) {
+      toast.error(err.message)
+    }
+  }
+
   const activeMessages = selectedCustomer
     ? messages.filter(m => m.from === selectedCustomer || m.to === selectedCustomer)
     : messages
@@ -334,6 +353,11 @@ export default function WhatsAppPage() {
                       <div className={`w-2 h-2 rounded-full ${statusCfg.dot} animate-pulse`} />
                       <span className={`text-xs ${statusCfg.color}`}>{statusCfg.label}</span>
                     </div>
+                    {session.lastError && (
+                      <p className="text-[10px] text-red-300/80 mt-1 max-w-[240px]">
+                        {session.lastError}
+                      </p>
+                    )}
                   </div>
                   <button
                     onClick={() => deleteSession(session._id)}
@@ -408,6 +432,26 @@ export default function WhatsAppPage() {
                         session.autoReply ? 'left-6' : 'left-1'
                       }`}
                     />
+                  </button>
+                </div>
+
+                {/* AI Reply Tone & Owner Instructions */}
+                <div className="p-3 rounded-xl bg-white/5 space-y-2">
+                  <span className="text-xs font-semibold text-white block">Reply Tone &amp; Instructions</span>
+                  <input
+                    className="input text-xs"
+                    placeholder="Tone (e.g. warm, formal, short replies)"
+                    defaultValue={session.tone || ''}
+                    onChange={e => setToneDraft(prev => ({ ...prev, [session._id]: e.target.value }))}
+                  />
+                  <textarea
+                    className="input text-xs min-h-[60px]"
+                    placeholder="Extra instructions for the AI (business rules, offers, what never to promise)"
+                    defaultValue={session.customPrompt || ''}
+                    onChange={e => setPromptDraft(prev => ({ ...prev, [session._id]: e.target.value }))}
+                  />
+                  <button onClick={() => saveReplySettings(session)} className="btn-ghost text-xs py-1.5">
+                    <Save className="w-3.5 h-3.5" /> Save reply settings
                   </button>
                 </div>
 

@@ -82,6 +82,37 @@ class LMStudioService {
     }
   }
 
+  // Ids LM Studio itself reports it can serve
+  async getModelIds() {
+    // Wake the daemon first: an idle LM Studio answers nothing, and an unanswered list would
+    // be reported to callers as "it lists no such model", which is a different fact.
+    await this.ensureServerRunning();
+    try {
+      const response = await axios.get(`${this.baseUrl}/models`, { timeout: 5000 });
+      return (response.data?.data || []).map(m => m.id).filter(Boolean);
+    } catch (err) {
+      console.warn(`⚠️  Could not list LM Studio models: ${err.message}`);
+      return [];
+    }
+  }
+
+  /**
+   * The chat-capable model with the smallest parameter count LM Studio lists. Used when nobody
+   * pinned a local model: auto-replies must not depend on loading tens of GB into RAM, and the
+   * choice is derived from the live list instead of a hardcoded id that may not be installed.
+   * Returns null when LM Studio is down or lists nothing conversational.
+   */
+  async pickDefaultChatModel() {
+    const live = await this.getModelIds();
+    const chatCapable = live.filter(id => !/embed|tts|whisper|rerank/i.test(id));
+    if (chatCapable.length === 0) return null;
+    const sizeInBillions = (id) => {
+      const match = id.match(/(\d+(?:\.\d+)?)\s?b(?![a-z])/i);
+      return match ? parseFloat(match[1]) : Infinity;
+    };
+    return chatCapable.slice().sort((a, b) => sizeInBillions(a) - sizeInBillions(b))[0];
+  }
+
   // Ensure model is loaded with TTL (auto RAM free after 20 seconds of inactivity)
   async ensureModelLoaded(modelKey, ttlSeconds = 20) {
     await this.ensureServerRunning();

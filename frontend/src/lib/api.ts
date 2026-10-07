@@ -103,6 +103,11 @@ export const adminApi = {
     return apiRequest<any>(`/admin/conversations${qs}`)
   },
   getSettings: () => apiRequest<any>('/admin/settings'),
+  getWhatsAppSessions: () => apiRequest<any>('/admin/whatsapp/sessions'),
+  getWhatsAppMessages: (id: string, contact?: string) => {
+    const qs = contact ? '?' + new URLSearchParams({ contact }).toString() : ''
+    return apiRequest<any>(`/admin/whatsapp/sessions/${id}/messages${qs}`)
+  },
   getSubscriptions: () => apiRequest<any>('/admin/subscriptions'),
   updateUserSubscription: (id: string, data: any) =>
     apiRequest<any>(`/admin/users/${id}/subscription`, { method: 'PUT', body: JSON.stringify(data) }),

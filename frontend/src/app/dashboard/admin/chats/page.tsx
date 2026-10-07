@@ -1,6 +1,22 @@
 'use client'
 import { useState, useEffect } from 'react'
-import { MessageSquare, ChevronDown, ChevronUp, User, Bot, RefreshCw } from 'lucide-react'
+import { MessageSquare, ChevronDown, ChevronUp, User, Bot, RefreshCw, Smartphone, AlertTriangle } from 'lucide-react'
+
+interface WASession {
+  _id: string
+  sessionName: string
+  owner: { id: string; name: string; email: string } | null
+  status: string
+  phoneNumber?: string
+  autoReply: boolean
+  autoReplyMode: string
+  totalMessagesReceived: number
+  totalMessagesSent: number
+  lastActive?: string
+  lastError?: string | null
+  customerCount: number
+  lastAiModel?: string | null
+}
 import { adminApi } from '@/lib/api'
 import toast from 'react-hot-toast'
 
@@ -10,9 +26,44 @@ export default function AdminChatsPage() {
   const [loading, setLoading] = useState(true)
   const [total, setTotal] = useState(0)
 
+  // WhatsApp: every user's sessions, and the model behind each AI reply
+  const [waSessions, setWaSessions] = useState<WASession[]>([])
+  const [waOpen, setWaOpen] = useState<string | null>(null)
+  const [waThreads, setWaThreads] = useState<Record<string, any[]>>({})
+  const [waLoading, setWaLoading] = useState(true)
+
   useEffect(() => {
     loadChats()
+    loadWhatsApp()
   }, [])
+
+  const loadWhatsApp = async () => {
+    setWaLoading(true)
+    try {
+      const d: any = await adminApi.getWhatsAppSessions()
+      setWaSessions(d.sessions || [])
+    } catch (err: any) {
+      toast.error(err.message)
+    } finally {
+      setWaLoading(false)
+    }
+  }
+
+  const openWhatsAppSession = async (session: WASession) => {
+    if (waOpen === session._id) {
+      setWaOpen(null)
+      return
+    }
+    setWaOpen(session._id)
+    if (!waThreads[session._id]) {
+      try {
+        const d: any = await adminApi.getWhatsAppMessages(session._id)
+        setWaThreads(prev => ({ ...prev, [session._id]: d.messages || [] }))
+      } catch (err: any) {
+        toast.error(err.message)
+      }
+    }
+  }
 
   const loadChats = async () => {
     setLoading(true)
@@ -38,9 +89,83 @@ export default function AdminChatsPage() {
             Live overview of all user chats across LM Studio and ContentBot
           </p>
         </div>
-        <button onClick={loadChats} className="btn-ghost text-xs">
+        <button
+          onClick={() => { loadChats(); loadWhatsApp() }}
+          className="btn-ghost text-xs"
+        >
           <RefreshCw className="w-3.5 h-3.5" /> Refresh
         </button>
+      </div>
+
+      {/* ─── WhatsApp sessions: customers, status, and the model that answered ─── */}
+      <div className="glass rounded-2xl p-4 space-y-3">
+        <div className="flex items-center gap-2">
+          <Smartphone className="w-5 h-5 text-green-400" />
+          <h2 className="font-semibold text-white text-sm">WhatsApp Sessions &amp; AI Replies</h2>
+          <span className="text-[11px] text-dark-400">({waSessions.length})</span>
+        </div>
+
+        {waLoading ? (
+          <div className="flex items-center justify-center py-8">
+            <div className="w-6 h-6 border-2 border-brand-500 border-t-transparent rounded-full animate-spin" />
+          </div>
+        ) : waSessions.length === 0 ? (
+          <p className="text-xs text-dark-400">No WhatsApp session has been created yet</p>
+        ) : (
+          waSessions.map(session => (
+            <div key={session._id} className="rounded-xl border border-white/8 overflow-hidden">
+              <button
+                onClick={() => openWhatsAppSession(session)}
+                className="w-full flex items-center justify-between p-3 hover:bg-white/5 transition-all text-left"
+              >
+                <div className="min-w-0">
+                  <p className="text-sm text-white truncate">
+                    {session.owner?.name || 'Unknown user'}
+                    <span className="text-dark-400"> · {session.sessionName.split('_').slice(1).join('_') || session.sessionName}</span>
+                  </p>
+                  <p className="text-[11px] text-dark-400">
+                    {session.status}
+                    {session.phoneNumber ? ` · ${session.phoneNumber}` : ''}
+                    {' '}· auto-reply {session.autoReply ? session.autoReplyMode : 'off'}
+                    {' '}· {session.customerCount} customer(s) · {session.totalMessagesReceived} in / {session.totalMessagesSent} out
+                  </p>
+                  {session.lastAiModel && (
+                    <p className="text-[11px] text-brand-300">last AI reply: {session.lastAiModel}</p>
+                  )}
+                  {session.lastError && (
+                    <p className="text-[11px] text-red-300/80 flex items-center gap-1 mt-0.5">
+                      <AlertTriangle className="w-3 h-3" /> {session.lastError}
+                    </p>
+                  )}
+                </div>
+                {waOpen === session._id
+                  ? <ChevronUp className="w-4 h-4 text-dark-400 flex-shrink-0" />
+                  : <ChevronDown className="w-4 h-4 text-dark-400 flex-shrink-0" />}
+              </button>
+
+              {waOpen === session._id && (
+                <div className="border-t border-white/8 p-3 space-y-2 max-h-96 overflow-y-auto bg-black/20">
+                  {(waThreads[session._id] || []).length === 0 ? (
+                    <p className="text-xs text-dark-400">No customer messages yet</p>
+                  ) : (
+                    (waThreads[session._id] || []).map((msg: any, i: number) => (
+                      <div key={i} className={`flex ${msg.direction === 'incoming' ? '' : 'flex-row-reverse'}`}>
+                        <div className={`max-w-[80%] rounded-xl px-3 py-2 text-xs ${msg.direction === 'incoming' ? 'msg-user text-white' : 'msg-ai text-dark-100'}`}>
+                          <p className="text-[10px] text-dark-400 mb-0.5">
+                            {msg.direction === 'incoming' ? msg.from : 'AI reply'}
+                            {msg.aiModel ? ` · ${msg.aiModel}` : ''}
+                            {msg.status === 'failed' ? ' · not delivered' : ''}
+                          </p>
+                          <p className="whitespace-pre-wrap">{msg.body}</p>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          ))
+        )}
       </div>
 
       <div className="space-y-3">

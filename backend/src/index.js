@@ -103,6 +103,9 @@ async function startServer() {
     }
   }
 
+  // No WhatsApp client survives a restart, so reconcile the stored states before serving.
+  await require('./services/wppConnectService').reconcileOnBoot();
+
   // Seed admin on first run
   const { seedAdmin } = require('./utils/seed');
   await seedAdmin();

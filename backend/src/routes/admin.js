@@ -131,6 +131,92 @@ router.get('/conversations', async (req, res) => {
   }
 });
 
+// ─── WhatsApp: every user's sessions (admin view) ─────────────────────────
+// The admin could only see dashboard conversations before this; WhatsApp customers and the
+// model that answered them were invisible.
+router.get('/whatsapp/sessions', async (req, res) => {
+  try {
+    const sessions = await WhatsAppSession.find()
+      .populate('userId', 'name email')
+      .sort({ lastActive: -1, createdAt: -1 });
+
+    const rows = sessions.map(session => {
+      const messages = session.messages || [];
+      const customers = new Set();
+      messages.forEach(m => {
+        const other = m.direction === 'incoming' ? m.from : m.to;
+        if (other && other !== 'me') customers.add(other);
+      });
+      const lastAi = [...messages].reverse().find(m => m.aiGenerated && m.aiModel);
+
+      return {
+        _id: session._id,
+        sessionName: session.sessionName,
+        owner: session.userId
+          ? { id: session.userId._id, name: session.userId.name, email: session.userId.email }
+          : null,
+        status: session.status,
+        phoneNumber: session.phoneNumber,
+        autoReply: session.autoReply,
+        autoReplyMode: session.autoReplyMode,
+        useMemory: session.useMemory,
+        tone: session.tone,
+        customPrompt: session.customPrompt,
+        totalMessagesReceived: session.totalMessagesReceived,
+        totalMessagesSent: session.totalMessagesSent,
+        lastActive: session.lastActive,
+        lastError: session.lastError,
+        lastErrorAt: session.lastErrorAt,
+        customerCount: customers.size,
+        lastAiModel: lastAi ? lastAi.aiModel : null,
+      };
+    });
+
+    res.json({ success: true, sessions: rows, total: rows.length });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── WhatsApp: one session's customer threads, with reply provenance ──────
+router.get('/whatsapp/sessions/:id/messages', async (req, res) => {
+  try {
+    const { contact } = req.query;
+    const session = await WhatsAppSession.findById(req.params.id).populate('userId', 'name email');
+    if (!session) return res.status(404).json({ success: false, message: 'Session not found' });
+
+    let messages = (session.messages || []).map(m => (m.toObject ? m.toObject() : { ...m }));
+
+    const customerSet = new Set();
+    messages.forEach(m => {
+      const other = m.direction === 'incoming' ? m.from : m.to;
+      if (other && other !== 'me') customerSet.add(other);
+    });
+
+    if (contact) messages = messages.filter(m => m.from === contact || m.to === contact);
+
+    res.json({
+      success: true,
+      session: {
+        _id: session._id,
+        sessionName: session.sessionName,
+        status: session.status,
+        phoneNumber: session.phoneNumber,
+        autoReply: session.autoReply,
+        autoReplyMode: session.autoReplyMode,
+        lastError: session.lastError,
+        owner: session.userId
+          ? { id: session.userId._id, name: session.userId.name, email: session.userId.email }
+          : null,
+      },
+      customers: Array.from(customerSet),
+      messages: messages.slice(-200),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ─── Settings (LM Studio URL, ContentBot key, etc.) ───────────────────────
 router.get('/settings', async (req, res) => {
   res.json({
