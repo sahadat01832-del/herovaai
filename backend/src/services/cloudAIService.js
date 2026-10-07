@@ -14,8 +14,10 @@
  */
 
 const axios = require('axios');
+const catalogService = require('./catalogService');
 
-// Full verified catalog of available models across all providers
+// Curated catalog of models this deployment wants to offer. Whether each id can actually
+// serve is checked against the provider's live list by catalogService, never assumed here.
 const ALL_MODELS_CATALOG = [
   // ── Groq (Ultra-Fast — Instant WhatsApp Replies) ──
   {
@@ -193,33 +195,6 @@ const ALL_MODELS_CATALOG = [
     group: 'OpenRouter Free',
   },
   {
-    id: 'meta-llama/llama-3.3-70b-instruct:free',
-    name: 'Llama 3.3 70B Instruct',
-    provider: 'openrouter',
-    badge: '🦙 Free · Meta',
-    description: 'Meta flagship open model for customer service',
-    multimodal: false,
-    group: 'OpenRouter Free',
-  },
-  {
-    id: 'deepseek/deepseek-chat-v3-0324:free',
-    name: 'DeepSeek Chat V3 Free',
-    provider: 'openrouter',
-    badge: '🔮 Free · DeepSeek',
-    description: 'DeepSeek V3 reasoning & multi-turn dialog',
-    multimodal: false,
-    group: 'OpenRouter Free',
-  },
-  {
-    id: 'mistralai/mistral-small-24b-instruct-2501:free',
-    name: 'Mistral Small 24B Free',
-    provider: 'openrouter',
-    badge: '🌊 Free · Mistral',
-    description: 'European state-of-the-art multilingual model',
-    multimodal: false,
-    group: 'OpenRouter Free',
-  },
-  {
     id: 'liquid/lfm-2.5-2.6b:free',
     name: 'Liquid LFM 2.6B Free',
     provider: 'openrouter',
@@ -249,27 +224,27 @@ const ALL_MODELS_CATALOG = [
 
   // ── DeepSeek Direct ──
   {
-    id: 'deepseek/deepseek-chat',
-    name: 'DeepSeek Chat (Direct)',
+    id: 'deepseek/deepseek-flash',
+    name: 'DeepSeek V4.1 Flash (Direct)',
     provider: 'deepseek',
-    badge: '🔮 DeepSeek Direct',
-    description: 'Direct API to DeepSeek official servers',
-    multimodal: false,
+    badge: '🔮 DeepSeek V4.1',
+    description: '1M-context DeepSeek-V4.1-Flash, text and image input',
+    multimodal: true,
     group: 'DeepSeek Direct',
   },
   {
-    id: 'deepseek/deepseek-reasoner',
-    name: 'DeepSeek Reasoner R1',
+    id: 'deepseek/deepseek-v4-pro',
+    name: 'DeepSeek V4 Pro (Direct)',
     provider: 'deepseek',
-    badge: '🧩 DeepSeek R1',
-    description: 'DeepSeek flagship chain-of-thought reasoner',
+    badge: '🧩 DeepSeek V4 Pro',
+    description: 'DeepSeek-V4-Pro reasoning and large-context analysis',
     multimodal: false,
     group: 'DeepSeek Direct',
   },
 
   // ── Cohere Direct ──
   {
-    id: 'command-r-plus',
+    id: 'command-r-plus-08-2024',
     name: 'Cohere Command R+',
     provider: 'cohere',
     badge: '🌊 Cohere R+',
@@ -298,6 +273,20 @@ const ALL_MODELS_CATALOG = [
     group: 'OpenAI',
   },
 ];
+
+/**
+ * A specific model was asked for and could not serve. Strict routing raises this instead of
+ * quietly answering with some other model, so the caller can say so plainly.
+ */
+class ModelUnavailableError extends Error {
+  constructor(message, { model, availability = 'out_of_stock' } = {}) {
+    super(message);
+    this.name = 'ModelUnavailableError';
+    this.code = 'MODEL_UNAVAILABLE';
+    this.model = model;
+    this.availability = availability;
+  }
+}
 
 class CloudAIService {
   constructor() {
@@ -373,13 +362,28 @@ class CloudAIService {
     });
   }
 
-  async generateCompletion({ model, messages = [], systemPrompt = '', attachments = [], temperature = 0.7 }) {
+  async generateCompletion({ model, messages = [], systemPrompt = '', attachments = [], temperature = 0.7,
+                            allowFailover = false }) {
     this.refreshKeys();
     const targetModel = model || 'groq/qwen/qwen3.8-27b';
     const modelDef = ALL_MODELS_CATALOG.find(m => m.id === targetModel);
     const provider = modelDef?.provider || 'openrouter';
 
     const errors = [];
+
+    // ── Availability gate ────────────────────────────────────────────────────
+    // A picked model is a promise: either it answers, or the caller hears why. Only an
+    // explicit allowFailover turns the request back into best-effort routing.
+    const servable = await catalogService.checkServable(provider, targetModel);
+    if (!servable.ok && servable.availability !== catalogService.UNVERIFIED && !allowFailover) {
+      throw new ModelUnavailableError(
+        `${targetModel} is unavailable (${servable.availability}): ${servable.reason}`,
+        { model: targetModel, availability: servable.availability });
+    }
+    if (!servable.ok) {
+      console.warn(`[CloudAIService] ${targetModel} is ${servable.availability} — `
+        + `${servable.reason}; attempting anyway${allowFailover ? ' with failover' : ''}.`);
+    }
 
     // ── Primary Attempt based on requested provider ──
     try {
@@ -412,8 +416,13 @@ class CloudAIService {
       }
       return await this.callOpenRouterWithKeyRotation(targetModel, messages, systemPrompt, attachments, temperature);
     } catch (err) {
-      console.warn(`[CloudAIService] Primary provider "${provider}" failed (${err.message}). Entering Failover Chain...`);
       errors.push(`${provider}: ${err.message}`);
+      if (!allowFailover) {
+        throw new ModelUnavailableError(
+          `${targetModel} could not answer: ${err.message}`,
+          { model: targetModel, availability: servable.availability });
+      }
+      console.warn(`[CloudAIService] Primary provider "${provider}" failed (${err.message}). Entering Failover Chain...`);
     }
 
     // ── FAILOVER CHAIN (Guarantees zero-downtime reply) ──
@@ -422,7 +431,7 @@ class CloudAIService {
       try {
         console.log(`[CloudAIService] Fallback 1: Trying Groq Qwen 3.8 27B...`);
         const res = await this.callGroq('groq/qwen/qwen3.8-27b', messages, systemPrompt, temperature);
-        res.modelUsed = `${res.modelUsed} (Failover from ${targetModel})`;
+        res.failedOverFrom = targetModel;
         return res;
       } catch (e) { errors.push(`groq-fallback: ${e.message}`); }
     }
@@ -432,7 +441,7 @@ class CloudAIService {
       try {
         console.log(`[CloudAIService] Fallback 2: Trying Gemini 2.5 Flash...`);
         const res = await this.callGeminiWithKeyRotation('gemini-2.5-flash', messages, systemPrompt, attachments, temperature);
-        res.modelUsed = `${res.modelUsed} (Failover from ${targetModel})`;
+        res.failedOverFrom = targetModel;
         return res;
       } catch (e) { errors.push(`gemini-fallback: ${e.message}`); }
     }
@@ -442,7 +451,7 @@ class CloudAIService {
       try {
         console.log(`[CloudAIService] Fallback 3: Trying OpenRouter Nemotron 3.5...`);
         const res = await this.callOpenRouterWithKeyRotation('nvidia/nemotron-3.5-lightning:free', messages, systemPrompt, attachments, temperature);
-        res.modelUsed = `${res.modelUsed} (Failover from ${targetModel})`;
+        res.failedOverFrom = targetModel;
         return res;
       } catch (e) { errors.push(`openrouter-fallback: ${e.message}`); }
     }
@@ -452,7 +461,7 @@ class CloudAIService {
       try {
         console.log(`[CloudAIService] Fallback 4: Trying UnoRouter...`);
         const res = await this.callUnoRouter('unorouter/agnes-3.0-flash:free', messages, systemPrompt, temperature);
-        res.modelUsed = `${res.modelUsed} (Failover from ${targetModel})`;
+        res.failedOverFrom = targetModel;
         return res;
       } catch (e) { errors.push(`unorouter-fallback: ${e.message}`); }
     }
@@ -462,7 +471,7 @@ class CloudAIService {
       try {
         console.log(`[CloudAIService] Fallback 5: Trying Agnes 3.0 Flash...`);
         const res = await this.callAgnesWithKeyRotation('agnes/agnes-3.0-flash', messages, systemPrompt, temperature);
-        res.modelUsed = `${res.modelUsed} (Failover from ${targetModel})`;
+        res.failedOverFrom = targetModel;
         return res;
       } catch (e) { errors.push(`agnes-fallback: ${e.message}`); }
     }
@@ -472,7 +481,7 @@ class CloudAIService {
       try {
         console.log(`[CloudAIService] Fallback 6: Trying LLM7...`);
         const res = await this.callLLM7('llm7/GLM-5.3-Flash', messages, systemPrompt, temperature);
-        res.modelUsed = `${res.modelUsed} (Failover from ${targetModel})`;
+        res.failedOverFrom = targetModel;
         return res;
       } catch (e) { errors.push(`llm7-fallback: ${e.message}`); }
     }
@@ -794,7 +803,9 @@ class CloudAIService {
   // ── DeepSeek Direct ──────────────────────────────────────────────────────
   async callDeepSeek(modelId, messages, systemPrompt, temperature = 0.7) {
     if (!this.deepSeekKey) throw new Error('DEEPSEEK_API_KEY not configured');
-    const dsModel = modelId === 'deepseek/deepseek-reasoner' ? 'deepseek-reasoner' : 'deepseek-chat';
+    // DeepSeek renamed its models (deepseek-chat and deepseek-reasoner are gone from its live
+    // list), so the request carries the catalog id verbatim instead of a stale hardcoded id.
+    const dsModel = modelId.replace(/^deepseek\//, '');
 
     const msgs = [];
     if (systemPrompt) msgs.push({ role: 'system', content: systemPrompt });
@@ -825,7 +836,8 @@ class CloudAIService {
   // ── Cohere Direct ────────────────────────────────────────────────────────
   async callCohere(modelId, messages, systemPrompt, temperature = 0.7) {
     if (!this.cohereKey) throw new Error('COHERE_API_KEY not configured');
-    const cohereModel = modelId.includes('7b') ? 'command-r7b-12-2024' : 'command-r-plus';
+    // As with DeepSeek: pass through what was requested rather than a hardcoded fallback id.
+    const cohereModel = modelId.replace(/^cohere\//, '');
 
     const chatHistory = [];
     for (const msg of messages.slice(0, -1)) {
@@ -892,4 +904,9 @@ class CloudAIService {
   }
 }
 
-module.exports = new CloudAIService();
+const service = new CloudAIService();
+// Attached (rather than re-exported) so every existing `require('../services/cloudAIService')`
+// call site keeps working while still being able to catch this specific failure.
+service.ModelUnavailableError = ModelUnavailableError;
+service.ALL_MODELS_CATALOG = ALL_MODELS_CATALOG;
+module.exports = service;

@@ -20,6 +20,10 @@ const userRoutes = require('./routes/user');
 // Import passport config
 require('./config/passport');
 
+// Warm the provider probes in the background: /models composes from them, so the first
+// request should not be the one that discovers whether every provider is reachable.
+require('./services/catalogService').warm();
+
 const app = express();
 const httpServer = createServer(app);
 const io = new Server(httpServer, {

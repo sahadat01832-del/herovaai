@@ -274,11 +274,15 @@ async function generateAIReply(userId, incomingMessage, session, recentHistory =
 
     // ── Tier 1: Cloud AI with Multi-Key Rotation & Auto-Failover (Instant ~300ms) ──
     try {
+      // A verified Groq id (the previous one is not in Groq's live list), overridable per
+      // deployment. allowFailover is explicit here: a customer message must get an answer,
+      // and whichever model answered is recorded in the log line below.
       const cloudRes = await cloudAIService.generateCompletion({
-        model: 'groq/llama-3.3-70b-versatile', // Blazing fast for WhatsApp
+        model: process.env.WHATSAPP_AI_MODEL || 'groq/qwen/qwen3.8-27b',
         messages: chatMessages,
         systemPrompt,
         temperature: 0.65,
+        allowFailover: true,
       });
 
       if (cloudRes?.text && cloudRes.text.trim()) {

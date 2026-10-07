@@ -6,6 +6,7 @@ const AIMemory = require('../models/AIMemory');
 const { authenticate } = require('../middleware/auth');
 const lmStudioService = require('../services/lmStudioService');
 const cloudAIService = require('../services/cloudAIService');
+const catalogService = require('../services/catalogService');
 const tokenQuotaService = require('../services/tokenQuotaService');
 
 function classifyModel(modelId, source = 'local') {
@@ -216,6 +217,7 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
 
     let aiResponse = '';
     let modelUsed = chosenModel;
+    let failedOverFrom = null;
     let tokensUsed = 0;
 
     // ── Mode: Cloud API Models (OpenRouter / Gemini+ / OpenAI) ───────────────
@@ -225,16 +227,20 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
         content: m.content,
       }));
 
+      // Strict by default: the chosen model answers, or the caller is told why not.
+      // Failover happens only when this request explicitly asks for it.
       const apiResult = await cloudAIService.generateCompletion({
         model: chosenModel,
         messages: contextMessages,
         systemPrompt,
         attachments,
         temperature: req.user.chatSettings?.temperature || 0.7,
+        allowFailover: req.body.allowFailover === true,
       });
 
       aiResponse = apiResult.text;
       modelUsed = apiResult.modelUsed || chosenModel;
+      failedOverFrom = apiResult.failedOverFrom || null;
       tokensUsed = apiResult.tokensUsed || 0;
 
       // Record tokens to user's 7-day quota
@@ -298,6 +304,7 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
       role: 'assistant',
       content: aiResponse,
       model: modelUsed,
+      failedOverFrom,
       tokens: tokensUsed,
       artifacts,
       timestamp: new Date(),
@@ -319,6 +326,7 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
         response: aiResponse,
         mode: chatMode,
         model: modelUsed,
+        failedOverFrom,
         skill: chosenSkill,
         hasArtifacts: artifacts.length > 0,
         timestamp: new Date(),
@@ -332,9 +340,21 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
       conversationId: convo._id,
       artifacts,
       tokensUsed,
+      modelUsed,
+      failedOverFrom,
     });
   } catch (err) {
     console.error('Chat error:', err.message);
+    if (err.code === 'MODEL_UNAVAILABLE') {
+      return res.status(409).json({
+        success: false,
+        modelUnavailable: true,
+        model: err.model,
+        availability: err.availability,
+        message: err.message,
+        hint: 'Pick a model the catalog lists as available, or resend with allowFailover: true.',
+      });
+    }
     if (err.code === 'ECONNREFUSED') {
       return res.status(503).json({
         success: false,
@@ -345,10 +365,23 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
   }
 });
 
+// Composed model list, kept warm for a minute: the probe runs against ten providers and
+// the UI refetches on every panel open.
+const MODELS_CACHE_TTL_MS = 60 * 1000;
+let modelsCache = { at: 0, payload: null };
+
 // ─── List available models (Local + API Models + ContentBot) ───────────────
 router.get('/models', async (req, res) => {
+  // Composed from a probe of every provider, so the compose cost is paid once per minute
+  // instead of on every keystroke-driven refetch.
+  const wantsFresh = Boolean(req.query.refresh);
+  if (!wantsFresh && modelsCache.payload && Date.now() - modelsCache.at < MODELS_CACHE_TTL_MS) {
+    return res.json({ ...modelsCache.payload, cached: true });
+  }
+
   const lmUrl = process.env.LM_STUDIO_BASE_URL || 'http://localhost:1234/v1';
   let lmModels = [];
+  let lmLoadedIds = [];
   let isLmOnline = false;
 
   try {
@@ -366,42 +399,57 @@ router.get('/models', async (req, res) => {
     isLmOnline = false;
   }
 
-  if (lmModels.length === 0) {
-    lmModels = [
-      { id: 'qwen2-0.5b-uncensored', name: 'Qwen 2 0.5B Uncensored', source: 'local', tier: 'free', isPaid: false, badge: 'FREE (0.5B)' },
-      { id: 'gemma-3-1b-it-glm-4.7-flash-heretic-uncensored-thinking_gguf', name: 'Gemma 3 1B Thinking', source: 'local', tier: 'free', isPaid: false, badge: 'FREE (1B)' },
-      { id: 'gemma-3-1b-it-heretic-extreme-uncensored-abliterated-i1', name: 'Gemma 3 1B Heretic', source: 'local', tier: 'free', isPaid: false, badge: 'FREE (1B)' },
-      { id: 'qwen3.5-4b-uncensored-hauhaucs-aggressive', name: 'Qwen 3.5 4B Uncensored', source: 'local', tier: 'paid', isPaid: true, badge: 'PRO / PAID (4B)' },
-      { id: 'qwen3.8-27b-uncensored', name: 'Qwen 3.8 3B Uncensored', source: 'local', tier: 'paid', isPaid: true, badge: 'PRO / PAID (3B)' },
-      { id: 'gemma-4-26b-a4b-it-ultra-uncensored-heretic-i1', name: 'Gemma 4 26B Heretic', source: 'local', tier: 'paid', isPaid: true, badge: 'PRO / PAID (26B)' },
-    ];
+  // No invented stand-ins: if LM Studio serves nothing, the list says so and stays empty.
+  // An offline local server is a fact about this machine, not a model menu.
+  try {
+    lmLoadedIds = (await lmStudioService.getLoadedModels()) || [];
+  } catch {
+    lmLoadedIds = [];
   }
 
-  // Cloud API Models from available keys
-  const apiModels = cloudAIService.getAvailableModels().map(m => ({
-    id: m.id,
-    name: m.name,
-    source: 'api',
-    tier: 'free',
-    isPaid: false,
-    badge: m.badge,
-    description: m.description,
-    multimodal: m.multimodal,
-    group: m.group,
-  }));
+  // Cloud API Models: key present AND the provider's live list contains the id.
+  // Pricing comes from the provider where it publishes one; otherwise it is left unclaimed.
+  await catalogService.ensureFresh();
+  const apiModels = catalogService.annotate(cloudAIService.getAvailableModels())
+    .filter(m => m.availability !== catalogService.OUT_OF_STOCK)
+    .map(m => ({
+      id: m.id,
+      name: m.name,
+      source: 'api',
+      tier: m.tier,
+      isPaid: m.isPaid,
+      availability: m.availability,
+      servable: m.servable,
+      pricing: m.pricing,
+      badge: m.badge,
+      description: m.description,
+      multimodal: m.multimodal,
+      group: m.group,
+    }));
 
   const contentbotModels = [
     { id: 'contentbot-standard', name: 'ContentBot Standard Agent', source: 'contentbot', tier: 'free', isPaid: false, badge: 'ContentBot Free' },
     { id: 'contentbot-pro', name: 'ContentBot Pro Multi-Agent', source: 'contentbot', tier: 'paid', isPaid: true, badge: 'ContentBot Pro' },
   ];
 
-  res.json({
+  const payload = {
     success: true,
     lmStudioOnline: isLmOnline,
+    lmStudioLoaded: lmLoadedIds,
+    lmStudioNote: isLmOnline
+      ? (lmLoadedIds.length ? `${lmLoadedIds.length} model(s) loaded` : 'server up, nothing loaded')
+      : 'LM Studio is not reachable on port 1234',
     models: [...apiModels, ...lmModels, ...contentbotModels],
     apiModels,
     localModels: lmModels,
-  });
+    outOfStock: catalogService.annotate(cloudAIService.getAvailableModels())
+      .filter(m => m.availability === catalogService.OUT_OF_STOCK)
+      .map(m => ({ id: m.id, name: m.name, provider: m.provider, availability: m.availability })),
+    catalog: catalogService.snapshot(),
+    cached: false,
+  };
+  modelsCache = { at: Date.now(), payload };
+  res.json(payload);
 });
 
 // ─── Get User 7-Day Token Quota Status ────────────────────────────────────
