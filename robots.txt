@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://sahadat01832-del.github.io/herovaai/sitemap.xml
