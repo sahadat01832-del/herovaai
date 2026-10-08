@@ -21,6 +21,18 @@ change, so the published buttons never rot.
 The policy text here mirrors the app's own `/privacy` and `/terms` pages (`frontend/src/app/(marketing)/`).
 Change them together — the app is the source of truth, this is the mirror search engines can reach.
 
+## Getting found
+
+Two things make this site show up when someone searches for HerovaAi:
+
+1. **Telling the engines it changed.** The IndexNow key in this repo (`5777205fe281a11b6895aa5cc9572b0d.txt`) lets
+   Bing — and DuckDuckGo, which reads Bing — pick up the site without an account. Because this is a project page,
+   the key lives under `/herovaai/`, so submissions must pass it explicitly as `keyLocation`.
+2. **Claiming the site (one-time, ~2 minutes each).** Google Search Console and Bing Webmaster Tools both accept a
+   `<meta name="...-verification">` tag: paste the token they show you into the empty tag in `index.html`, push,
+   then submit `sitemap.xml` in the dashboard. Google has no anonymous submission path, so this step is what
+   actually gets the pages into Google's index rather than waiting for a crawler to stumble onto them.
+
 ## Local preview
 
 ```bash
