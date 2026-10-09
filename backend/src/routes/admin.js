@@ -7,6 +7,8 @@ const AIMemory = require('../models/AIMemory');
 const bcrypt = require('bcryptjs');
 const keyVault = require('../services/keyVault');
 const googleAuth = require('../services/googleAuth');
+const PaymentOrder = require('../models/PaymentOrder');
+const subs = require('../services/subscriptionService');
 const { authenticate, adminOnly } = require('../middleware/auth');
 
 /** Same rule as the user routes: trim, sanity-check, never echo back. */
@@ -475,6 +477,155 @@ router.get('/subscriptions', async (req, res) => {
         totalUsers: users.length,
       },
     });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/* ─── Nagad settings (where the money goes, and who confirms it) ────────── */
+// The wallet number is what buyers see on the checkout screen, so it is
+// validated hard: 11 digits starting 01, no spaces, or it is refused. The RSA
+// keys for automatic confirmation are NOT editable here — they are secrets and
+// belong in backend/.env or the key vault.
+const appSettings = require('../services/appSettings');
+const nagadService = require('../services/nagad');
+
+router.get('/nagad', async (_req, res) => {
+  const stored = appSettings.get(appSettings.NAGAD) || {};
+  const mode = nagadService.mode();
+  res.json({
+    success: true,
+    settings: {
+      wallet: stored.wallet || nagadService.config().wallet || '',
+      holder: stored.holder || nagadService.config().holder || '',
+      autoVerify: stored.autoVerify !== false,
+      note: stored.note || '',
+    },
+    live: {
+      auto: mode.auto,
+      manual: mode.manual,
+      reason: mode.reason,
+      merchantId: Boolean(nagadService.config().merchantId),
+      merchantKeys: Boolean(nagadService.config().merchantPrivateKey && nagadService.config().pgwPublicKey),
+    },
+  });
+});
+
+router.put('/nagad', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const patch = {};
+
+    if (body.wallet !== undefined) {
+      const wallet = String(body.wallet || '').replace(/[^\d]/g, '');
+      if (!wallet) return res.status(400).json({ success: false, message: 'Enter the Nagad number buyers should send money to.' });
+      if (!/^01[3-9]\d{8}$/.test(wallet)) {
+        return res.status(400).json({ success: false, message: 'That is not an 11-digit Nagad number (example: 01712345678).' });
+      }
+      patch.wallet = wallet;
+    }
+    if (body.holder !== undefined) patch.holder = String(body.holder || '').slice(0, 80);
+    if (body.autoVerify !== undefined) patch.autoVerify = Boolean(body.autoVerify);
+    if (body.note !== undefined) patch.note = String(body.note || '').slice(0, 200);
+
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ success: false, message: 'Nothing to update' });
+    }
+
+    const saved = await appSettings.set(appSettings.NAGAD, patch, { userId: req.user._id });
+    const mode = nagadService.mode();
+    res.json({
+      success: true,
+      settings: { wallet: saved.wallet, holder: saved.holder, autoVerify: saved.autoVerify !== false, note: saved.note },
+      live: { auto: mode.auto, manual: mode.manual, reason: mode.reason },
+      message: mode.manual ? 'Nagad checkout is ready.' : 'Saved, but without a wallet number Nagad stays off.',
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/* ─── Payment review (Nagad TrxIDs the owner has to confirm) ────────────── */
+// Nagad's personal (send-money) number has no API, so these orders cannot
+// confirm themselves: they wait in `awaiting_review` until someone here says
+// the money really arrived. Approving goes through subscriptionService, the
+// same code path as a gateway callback, so a plan can never be granted twice.
+router.get('/payments', async (req, res) => {
+  try {
+    const status = String(req.query.status || '').trim();
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+    const filter = { gateway: 'nagad' };
+    if (status) filter.status = status;
+    // Waiting orders first: this list exists to be emptied.
+    const orders = await PaymentOrder.find(filter)
+      .populate('userId', 'name email phone subscription')
+      .sort({ status: 1, createdAt: -1 })
+      .limit(limit);
+
+    const [waiting, paidToday] = await Promise.all([
+      PaymentOrder.countDocuments({ gateway: 'nagad', status: 'awaiting_review' }),
+      PaymentOrder.countDocuments({ status: 'paid', paidAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } }),
+    ]);
+
+    res.json({
+      success: true,
+      orders: orders.map((order) => ({
+        tranId: order.tranId,
+        tier: order.tier,
+        amount: order.amount,
+        currency: order.currency,
+        gateway: order.gateway,
+        status: order.status,
+        nagadTrxId: order.nagadTrxId,
+        senderNumber: order.senderNumber,
+        submittedAt: order.submittedAt,
+        reviewNote: order.reviewNote,
+        verifiedBy: order.verifiedBy,
+        user: order.userId
+          ? { id: order.userId._id, name: order.userId.name, email: order.userId.email, phone: order.userId.phone, tier: order.userId.subscription?.tier }
+          : null,
+        createdAt: order.createdAt,
+        paidAt: order.paidAt,
+      })),
+      summary: { awaitingReview: waiting, paidLast24h: paidToday },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/payments/:tranId/approve', async (req, res) => {
+  try {
+    const order = await PaymentOrder.findOne({ tranId: String(req.params.tranId || '').trim() });
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    const note = String(req.body?.note || '').slice(0, 300);
+    const result = await subs.settleOrder(order, {
+      verifiedBy: 'reviewer',
+      reviewerId: req.user._id,
+      note: note || `Confirmed by ${req.user.name || req.user.email}`,
+    });
+    res.json({
+      success: true,
+      alreadyPaid: Boolean(result.alreadyPaid),
+      message: result.alreadyPaid
+        ? 'That order was already paid — nothing changed.'
+        : `${order.tier.toUpperCase()} switched on for this customer.`,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/payments/:tranId/reject', async (req, res) => {
+  try {
+    const order = await PaymentOrder.findOne({ tranId: String(req.params.tranId || '').trim() });
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    const note = String(req.body?.note || '').slice(0, 300) || 'No matching Nagad payment found';
+    const result = await subs.rejectOrder(order, { reviewerId: req.user._id, note });
+    if (!result.ok) {
+      return res.status(409).json({ success: false, message: 'That order is already paid — refusing it would not refund the plan. Refund in Nagad instead.' });
+    }
+    res.json({ success: true, message: 'Order marked rejected. The customer can submit a new TrxID.' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

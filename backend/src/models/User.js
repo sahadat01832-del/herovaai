@@ -31,6 +31,11 @@ const UserSchema = new mongoose.Schema({
     status: { type: String, enum: ['active', 'cancelled', 'expired'], default: 'active' },
     startDate: { type: Date, default: Date.now },
     expiresAt: { type: Date, default: null },
+    // How the current plan was granted: 'auto' = gateway said paid,
+    // 'reviewer' = a human checked a Nagad TrxID, null = never paid (free).
+    verifiedBy: { type: String, enum: ['auto', 'reviewer', null], default: null },
+    verifiedByAdmin: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    lastPaymentNote: { type: String, default: '' },
   },
   // Token Quota (1M tokens per 7 days limit)
   tokenQuota: {

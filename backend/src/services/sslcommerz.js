@@ -34,11 +34,12 @@ const configured = () => {
   return Boolean(storeId && storePasswd);
 };
 
-/** Plan prices in USD (matches the dashboard page). Override from .env. */
+/**
+ * Plan prices now come from the single taka table (config/plans.js), so a card
+ * checkout and a Nagad send-money order can never quote different numbers.
+ */
 function priceFor(tier) {
-  if (tier === 'pro') return Number(process.env.PAYMENT_PRO_USD || 19);
-  if (tier === 'enterprise') return Number(process.env.PAYMENT_ENTERPRISE_USD || 49);
-  return 0;
+  return require('../config/plans').priceFor(tier);
 }
 
 /**

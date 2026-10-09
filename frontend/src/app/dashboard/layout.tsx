@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter, usePathname } from 'next/navigation'
 import Link from 'next/link'
 import {
-  BarChart3, Brain, ChevronLeft, ChevronRight, CreditCard, KeyRound, LayoutDashboard,
+  Banknote, BarChart3, Brain, ChevronLeft, ChevronRight, CreditCard, KeyRound, LayoutDashboard,
   LogOut, Menu, MessageSquare, Plus, Search, Settings, Shield, Smartphone, Sparkles,
   Users, X, Zap,
 } from 'lucide-react'
@@ -48,6 +48,7 @@ const ACCOUNT: NavItem[] = [
 
 const ADMIN: NavItem[] = [
   { href: '/dashboard/admin/users',    icon: Users,       label: 'Users & Plans', hint: 'Accounts and tiers' },
+  { href: '/dashboard/admin/payments', icon: Banknote,    label: 'Payments',      hint: 'Nagad orders and the wallet number' },
   { href: '/dashboard/admin/api-keys', icon: KeyRound,    label: 'API Keys',      hint: 'Provider key vault' },
   { href: '/dashboard/admin/chats',    icon: BarChart3,   label: 'All Chats',     hint: 'Every conversation' },
 ]

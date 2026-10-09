@@ -149,6 +149,9 @@ async function startServer() {
   // catalog because availability depends on which keys exist.
   const keyVault = require('./services/keyVault');
   await keyVault.hydrate();
+  // Dashboard-editable configuration (Nagad wallet, channel settings) must be in
+  // memory before the first payment or scheduled post reads it.
+  await require('./services/appSettings').hydrate();
   const vaultStats = keyVault.stats();
   console.log(`🔐 Key vault ready: ${vaultStats.slots} slot(s) with runtime keys${vaultStats.hydrationError ? ` (warning: ${vaultStats.hydrationError})` : ''}`);
   if (vaultStats.slots > 0) require('./services/catalogService').refresh();

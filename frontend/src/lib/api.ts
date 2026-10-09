@@ -74,12 +74,34 @@ export const chatApi = {
   getLmStatus: () => apiRequest<any>('/chat/lm-studio/status'),
 }
 
-// ─── Payments (SSLCommerz sandbox by default; cards, bKash, Nagad) ──────────
+// ─── Payments ──────────────────────────────────────────────────────────────
+// Three plans priced in taka: free ৳0, pro ৳100/month, enterprise ৳300/month.
+// Nagad is the local rail: buyers send money to the owner's Nagad number and the
+// order is confirmed automatically when Nagad's merchant API is configured,
+// otherwise by the owner checking the TrxID. SSLCommerz (cards/bKash) is the
+// second rail for buyers who prefer it.
 export const paymentApi = {
-  /** Open a checkout session for a paid tier. Returns { url, tranId, amount }. */
+  /** Plan table + which gateways are live. Public. */
+  plans: () => apiRequest<any>('/payments/plans', { cache: 'no-store' }),
+  /** Open an SSLCommerz session for a paid tier. Returns { url, tranId, amount }. */
   init: (tier: 'pro' | 'enterprise') =>
     apiRequest<any>('/payments/init', { method: 'POST', body: JSON.stringify({ tier }) }),
   status: (tranId: string) => apiRequest<any>(`/payments/status/${tranId}`),
+  orders: () => apiRequest<any>('/payments/orders'),
+
+  // Nagad
+  nagadConfig: () => apiRequest<any>('/payments/nagad/config', { cache: 'no-store' }),
+  /** Create a Nagad order: auto mode returns { url }, manual mode the wallet to pay. */
+  nagadOrder: (tier: 'pro' | 'enterprise') =>
+    apiRequest<any>('/payments/nagad/order', { method: 'POST', body: JSON.stringify({ tier }) }),
+  /** Record the TrxID from the Nagad SMS. */
+  nagadSubmit: (tranId: string, trxId: string, senderNumber: string) =>
+    apiRequest<any>('/payments/nagad/submit', {
+      method: 'POST',
+      body: JSON.stringify({ tranId, trxId, senderNumber }),
+    }),
+  nagadVerify: (tranId: string) =>
+    apiRequest<any>(`/payments/nagad/verify/${tranId}`, { method: 'POST', body: JSON.stringify({}) }),
 }
 
 // ─── User ──────────────────────────────────────────────────────────────────
@@ -189,6 +211,19 @@ export const adminApi = {
     return apiRequest<any>(`/admin/whatsapp/sessions/${id}/messages${qs}`)
   },
   getSubscriptions: () => apiRequest<any>('/admin/subscriptions'),
+
+  // Nagad orders waiting for a human, plus where the money should land.
+  getPayments: (params?: Record<string, string>) => {
+    const qs = params ? '?' + new URLSearchParams(params).toString() : ''
+    return apiRequest<any>(`/admin/payments${qs}`)
+  },
+  approvePayment: (tranId: string, note?: string) =>
+    apiRequest<any>(`/admin/payments/${tranId}/approve`, { method: 'POST', body: JSON.stringify({ note }) }),
+  rejectPayment: (tranId: string, note?: string) =>
+    apiRequest<any>(`/admin/payments/${tranId}/reject`, { method: 'POST', body: JSON.stringify({ note }) }),
+  getNagadSettings: () => apiRequest<any>('/admin/nagad'),
+  updateNagadSettings: (data: { wallet?: string; holder?: string; autoVerify?: boolean; note?: string }) =>
+    apiRequest<any>('/admin/nagad', { method: 'PUT', body: JSON.stringify(data) }),
   updateUserSubscription: (id: string, data: any) =>
     apiRequest<any>(`/admin/users/${id}/subscription`, { method: 'PUT', body: JSON.stringify(data) }),
   resetUserTokens: (id: string) =>
