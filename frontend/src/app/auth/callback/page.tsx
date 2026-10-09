@@ -1,7 +1,8 @@
 'use client'
 import { Suspense, useEffect } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { setToken } from '@/lib/auth'
+import { setToken, setUser } from '@/lib/auth'
+import { authApi } from '@/lib/api'
 import { Zap } from 'lucide-react'
 
 function CallbackHandler() {
@@ -10,12 +11,20 @@ function CallbackHandler() {
 
   useEffect(() => {
     const token = params.get('token')
-    if (token) {
-      setToken(token)
-      router.push('/dashboard')
-    } else {
+    if (!token) {
       router.push('/login?error=oauth')
+      return
     }
+    // The dashboard guard needs BOTH token and user: email login sets both,
+    // but this page used to set only the token, which bounced every Google
+    // sign-in straight back to /login. Load the profile before entering.
+    setToken(token)
+    authApi.me()
+      .then((data: any) => {
+        if (data?.user) setUser(data.user)
+        router.push('/dashboard')
+      })
+      .catch(() => router.push('/login?error=oauth'))
   }, [params, router])
 
   return (
