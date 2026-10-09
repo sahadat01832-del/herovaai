@@ -74,6 +74,14 @@ export const chatApi = {
   getLmStatus: () => apiRequest<any>('/chat/lm-studio/status'),
 }
 
+// ─── Payments (SSLCommerz sandbox by default; cards, bKash, Nagad) ──────────
+export const paymentApi = {
+  /** Open a checkout session for a paid tier. Returns { url, tranId, amount }. */
+  init: (tier: 'pro' | 'enterprise') =>
+    apiRequest<any>('/payments/init', { method: 'POST', body: JSON.stringify({ tier }) }),
+  status: (tranId: string) => apiRequest<any>(`/payments/status/${tranId}`),
+}
+
 // ─── User ──────────────────────────────────────────────────────────────────
 export const userApi = {
   getProfile: () => apiRequest<any>('/user/profile'),

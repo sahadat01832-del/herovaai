@@ -16,6 +16,7 @@ const chatRoutes = require('./routes/chat');
 const whatsappRoutes = require('./routes/whatsapp');
 const memoryRoutes = require('./routes/memory');
 const userRoutes = require('./routes/user');
+const paymentRoutes = require('./routes/payments');
 
 // Import passport config
 require('./config/passport');
@@ -68,6 +69,7 @@ app.use('/api/chat', chatRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
 app.use('/api/memory', memoryRoutes);
 app.use('/api/user', userRoutes);
+app.use('/api/payments', paymentRoutes);
 
 // Health check
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date() }));

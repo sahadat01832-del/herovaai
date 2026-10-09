@@ -166,11 +166,22 @@ router.put('/password', authenticate, async (req, res) => {
 });
 
 // ─── Update subscription (choose / switch tier) ──────────────────────────
+// Paid tiers can ONLY arrive through a validated gateway callback
+// (routes/payments.js): anyone choosing pro/enterprise here gets a 402
+// pointing at checkout. Downgrades to free stay self-serve; admins keep
+// their override in routes/admin.js.
 router.put('/subscription', authenticate, async (req, res) => {
   try {
     const { tier } = req.body;
     if (!['free', 'pro', 'enterprise'].includes(tier)) {
       return res.status(400).json({ success: false, message: 'Invalid subscription tier' });
+    }
+    if (tier !== 'free') {
+      return res.status(402).json({
+        success: false,
+        code: 'PAYMENT_REQUIRED',
+        message: `${tier.toUpperCase()} needs checkout — use the Pay button, it switches on automatically once paid`,
+      });
     }
 
     const user = await User.findById(req.user._id);

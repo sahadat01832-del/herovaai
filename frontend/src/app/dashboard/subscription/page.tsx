@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 import {
   BarChart3, Check, Clock, Cpu, CreditCard, Layers, RefreshCw, Shield, Sparkles, Zap,
 } from 'lucide-react'
-import { chatApi, userApi } from '@/lib/api'
+import { chatApi, paymentApi, userApi } from '@/lib/api'
 import { useAuth } from '@/contexts/AuthContext'
 import { cn } from '@/lib/cn'
 import { compactNumber, formatDateTime, percent, relativeTime } from '@/lib/format'
@@ -104,6 +104,17 @@ export default function SubscriptionPage() {
 
   useEffect(() => { void load() }, [load])
 
+  // Back from the payment gateway: ?payment=success|failed|cancelled|invalid.
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search).get('payment')
+    if (!q) return
+    if (q === 'success') toast.success('Payment received — welcome to your new plan')
+    else if (q === 'failed' || q === 'cancelled') toast.error(`Checkout ${q} — no charge was made, try again when ready`)
+    else toast('Checkout finished with an unclear result — check with support if you were charged')
+    window.history.replaceState(null, '', window.location.pathname)
+    void load()
+  }, [load])
+
   const currentTier: string = quota?.tier || user?.subscription?.tier || 'free'
   const used = quota?.tokensUsed7d ?? user?.tokenQuota?.tokensUsed7d ?? 0
   const limit = quota?.weeklyLimit ?? user?.tokenQuota?.weeklyLimit ?? 1_000_000
@@ -113,6 +124,24 @@ export default function SubscriptionPage() {
 
   const applyPlan = async () => {
     if (!pendingPlan) return
+    // Free is a self-serve downgrade. Paid tiers MUST go through checkout —
+    // the server answers 402 to any direct upgrade attempt.
+    if (pendingPlan.id !== 'free') {
+      setSwitching(true)
+      try {
+        const res: any = await paymentApi.init(pendingPlan.id)
+        if (res?.url) {
+          window.location.href = res.url
+          return
+        }
+        toast.error('Checkout did not return a payment page — try again')
+      } catch (err: any) {
+        toast.error(err.message || 'Checkout is not available right now')
+      } finally {
+        setSwitching(false)
+      }
+      return
+    }
     setSwitching(true)
     try {
       const res: any = await userApi.updateSubscription(pendingPlan.id)
@@ -325,9 +354,11 @@ export default function SubscriptionPage() {
         tone="primary"
         title={pendingPlan ? `Switch to ${pendingPlan.name}?` : ''}
         description={pendingPlan
-          ? `Your weekly allowance becomes ${compactNumber(pendingPlan.limit)} tokens. Existing usage in this window is kept, and the change takes effect immediately.`
+          ? pendingPlan.id === 'free'
+            ? `Your weekly allowance becomes ${compactNumber(pendingPlan.limit)} tokens. Existing usage in this window is kept, and the change takes effect immediately.`
+            : `You go to the secure checkout (cards, bKash, Nagad) for ${pendingPlan.name}. Your plan switches on automatically once the payment validates.`
           : ''}
-        confirmLabel="Switch plan"
+        confirmLabel={pendingPlan?.id === 'free' ? 'Switch plan' : 'Pay & switch'}
       />
     </div>
   )
