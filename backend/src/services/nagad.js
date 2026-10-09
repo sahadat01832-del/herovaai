@@ -114,7 +114,7 @@ function mode() {
     wallet: c.wallet,
     holder: c.holder,
     reason: c.wallet
-      ? `Send money to the Nagad number above, then paste the TrxID — a person confirms it within a few minutes${missing.length ? ` (automatic checking needs the Nagad merchant ${missing.join(', ')})` : ''}.`
+      ? `Send money to the Nagad number above, then paste the TrxID — a person confirms it within a few minutes${missing.length ? ` (automatic checking still needs: ${missing.join(', ')})` : ''}.`
       : 'The owner has not published a Nagad number yet, so Nagad cannot be offered right now.',
   };
 }

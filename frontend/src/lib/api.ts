@@ -104,6 +104,21 @@ export const paymentApi = {
     apiRequest<any>(`/payments/nagad/verify/${tranId}`, { method: 'POST', body: JSON.stringify({}) }),
 }
 
+// ─── Channels (Facebook, Messenger, Instagram, Telegram, YouTube, webhook) ──
+// The catalogue carries each platform's capabilities and numbered setup steps;
+// credentials are only ever sent, never read back (the API returns `configured`).
+export const channelApi = {
+  list: () => apiRequest<any>('/channels', { cache: 'no-store' }),
+  connect: (id: string, data: { credentials?: Record<string, string>; automations?: Record<string, any>; label?: string }) =>
+    apiRequest<any>(`/channels/${id}/connect`, { method: 'POST', body: JSON.stringify(data) }),
+  test: (id: string) => apiRequest<any>(`/channels/${id}/test`, { method: 'POST', body: JSON.stringify({}) }),
+  setAutomations: (id: string, data: Record<string, any>) =>
+    apiRequest<any>(`/channels/${id}/automations`, { method: 'PUT', body: JSON.stringify(data) }),
+  postNow: (id: string, text?: string) =>
+    apiRequest<any>(`/channels/${id}/post-now`, { method: 'POST', body: JSON.stringify({ text }) }),
+  disconnect: (id: string) => apiRequest<any>(`/channels/${id}`, { method: 'DELETE' }),
+}
+
 // ─── User ──────────────────────────────────────────────────────────────────
 export const userApi = {
   getProfile: () => apiRequest<any>('/user/profile'),

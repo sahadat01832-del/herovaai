@@ -5,7 +5,7 @@ import { useRouter, usePathname } from 'next/navigation'
 import Link from 'next/link'
 import {
   Banknote, BarChart3, Brain, ChevronLeft, ChevronRight, CreditCard, KeyRound, LayoutDashboard,
-  LogOut, Menu, MessageSquare, Plus, Search, Settings, Shield, Smartphone, Sparkles,
+  LogOut, Menu, MessageSquare, Plug, Plus, Search, Settings, Shield, Smartphone, Sparkles,
   Users, X, Zap,
 } from 'lucide-react'
 import { AuthProvider, useAuth } from '@/contexts/AuthContext'
@@ -35,10 +35,11 @@ interface NavItem {
 }
 
 const WORKSPACE: NavItem[] = [
-  { href: '/dashboard',          icon: LayoutDashboard, label: 'Dashboard',    hint: 'Overview and activity' },
-  { href: '/dashboard/chat',     icon: MessageSquare,   label: 'Chat',         hint: 'Ask a local or cloud model' },
-  { href: '/dashboard/memory',   icon: Brain,           label: 'AI Memory',    hint: 'Business profile and persona' },
-  { href: '/dashboard/whatsapp', icon: Smartphone,      label: 'WhatsApp',     hint: 'Sessions and auto-reply' },
+  { href: '/dashboard',               icon: LayoutDashboard, label: 'Dashboard',    hint: 'Overview and activity' },
+  { href: '/dashboard/chat',          icon: MessageSquare,   label: 'Chat',         hint: 'Ask a local or cloud model' },
+  { href: '/dashboard/memory',        icon: Brain,           label: 'AI Memory',    hint: 'Business profile and persona' },
+  { href: '/dashboard/whatsapp',      icon: Smartphone,      label: 'WhatsApp',     hint: 'Sessions and auto-reply' },
+  { href: '/dashboard/connections',   icon: Plug,            label: 'Connections',  hint: 'Facebook, Messenger, Instagram, YouTube' },
 ]
 
 const ACCOUNT: NavItem[] = [
@@ -56,6 +57,7 @@ const ADMIN: NavItem[] = [
 const MOBILE_NAV = [
   { href: '/dashboard/chat',         icon: MessageSquare, label: 'Chat' },
   { href: '/dashboard/whatsapp',     icon: Smartphone,    label: 'WhatsApp' },
+  { href: '/dashboard/connections',  icon: Plug,          label: 'Channels' },
   { href: '/dashboard/subscription', icon: CreditCard,    label: 'Plans' },
   { href: '/dashboard/memory',       icon: Brain,         label: 'Memory' },
   { href: '/dashboard/settings',     icon: Settings,      label: 'Settings' },

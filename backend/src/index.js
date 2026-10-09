@@ -17,6 +17,7 @@ const whatsappRoutes = require('./routes/whatsapp');
 const memoryRoutes = require('./routes/memory');
 const userRoutes = require('./routes/user');
 const paymentRoutes = require('./routes/payments');
+const channelRoutes = require('./routes/channels');
 
 // Import passport config
 require('./config/passport');
@@ -48,8 +49,12 @@ app.use(cors({
   credentials: true,
 }));
 app.use(morgan('dev'));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
+// Keep the exact bytes of every body on req.rawBody. Meta signs the raw payload
+// (an HMAC of the bytes they sent), so verifying a webhook signature after the
+// JSON parser has reserialised the object would always fail.
+const keepRaw = (req, _res, buf) => { if (buf?.length) req.rawBody = buf; };
+app.use(express.json({ limit: '10mb', verify: keepRaw }));
+app.use(express.urlencoded({ extended: true, verify: keepRaw }));
 app.use(session({
   secret: process.env.SESSION_SECRET || 'fallback-secret',
   resave: false,
@@ -70,6 +75,8 @@ app.use('/api/whatsapp', whatsappRoutes);
 app.use('/api/memory', memoryRoutes);
 app.use('/api/user', userRoutes);
 app.use('/api/payments', paymentRoutes);
+// Channel connections + the platform webhooks (Meta, Telegram) that call home.
+app.use('/api/channels', channelRoutes);
 
 // Health check
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date() }));
@@ -166,6 +173,10 @@ async function startServer() {
   // Seed admin on first run
   const { seedAdmin } = require('./utils/seed');
   await seedAdmin();
+
+  // Daily channel posts and YouTube comment replies run on a timer, not on a
+  // request — start it only once the database is really up.
+  require('./services/channelScheduler').start();
 
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
