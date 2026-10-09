@@ -20,9 +20,12 @@ const userRoutes = require('./routes/user');
 // Import passport config
 require('./config/passport');
 
-// Warm the provider probes in the background: /models composes from them, so the first
-// request should not be the one that discovers whether every provider is reachable.
-require('./services/catalogService').warm();
+// NOTE: catalog warm() used to run here at require time. It fires a storm of
+// HTTPS+DNS probes, and on a flaky line those clog libuv's 4-thread DNS pool —
+// starving the Mongo driver's own `localhost` lookup until server selection
+// timed out and the app fell back to throwaway in-memory storage. It now runs
+// after the database is up (see startServer below).
+const warmCatalog = () => require('./services/catalogService').warm();
 
 const app = express();
 // Behind the gateway/tunnel every request arrives from 127.0.0.1, so trust the
@@ -91,15 +94,41 @@ async function startServer() {
   // which looked exactly like "my saved chats disappeared". Give the real
   // database a fair chance before falling back.
   let uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/contentbot';
+  // Never make the database depend on DNS: a literal `localhost` hostname costs
+  // a threadpool getaddrinfo, which stalls behind unrelated slow lookups on a
+  // flaky line (exactly how boots fell back to in-memory storage). 127.0.0.1
+  // connects without touching the resolver.
+  try {
+    const parsed = new URL(uri);
+    if (parsed.hostname === 'localhost') {
+      parsed.hostname = '127.0.0.1';
+      uri = parsed.toString();
+    }
+  } catch (_e) { /* keep the URI as configured */ }
   const connectOptions = {
     serverSelectionTimeoutMS: Number(process.env.MONGODB_SELECTION_TIMEOUT_MS || 15000),
     connectTimeoutMS: Number(process.env.MONGODB_CONNECT_TIMEOUT_MS || 15000),
   };
-  try {
-    await mongoose.connect(uri, connectOptions);
-    console.log(`✅ MongoDB connected: ${uri}`);
-  } catch (err) {
-    console.warn(`⚠️  External MongoDB connection failed (${err.message}). Starting local In-Memory MongoDB...`);
+  let attempts = 0;
+  for (;;) {
+    try {
+      await mongoose.connect(uri, connectOptions);
+      console.log(`✅ MongoDB connected: ${uri}`);
+      break;
+    } catch (err) {
+      attempts += 1;
+      // One retry: a single slow lookup storm (boot probes, slow disk wake) must
+      // not throw away the persistent database. Anything persistent still falls
+      // through to memory below.
+      if (attempts >= 2) {
+        console.warn(`⚠️  External MongoDB connection failed (${err.message}). Starting local In-Memory MongoDB...`);
+        break;
+      }
+      console.warn(`⚠️  MongoDB connect attempt ${attempts} failed (${err.message}) — retrying once...`);
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+  if (mongoose.connection.readyState !== 1) {
     try {
       const { MongoMemoryServer } = require('mongodb-memory-server');
       const mongod = await MongoMemoryServer.create({
@@ -121,6 +150,10 @@ async function startServer() {
   const vaultStats = keyVault.stats();
   console.log(`🔐 Key vault ready: ${vaultStats.slots} slot(s) with runtime keys${vaultStats.hydrationError ? ` (warning: ${vaultStats.hydrationError})` : ''}`);
   if (vaultStats.slots > 0) require('./services/catalogService').refresh();
+
+  // Catalog probes warmed only now that the database owns the event loop —
+  // never before the connect above (see the note at warmCatalog).
+  warmCatalog();
 
   // No WhatsApp client survives a restart, so reconcile the stored states before serving.
   await require('./services/wppConnectService').reconcileOnBoot(io);
