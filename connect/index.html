@@ -529,27 +529,56 @@
         render();
       });
       reset.className = 'btn ghost';
-      reset.style.fontSize = '12px';
-      reset.style.padding = '0.35rem 0.7rem';
     }
     render();
   });
 
   /* ---- copy buttons ---- */
+  function flash(btn, text) {
+    var original = 'Copy';
+    btn.textContent = text;
+    setTimeout(function () { btn.textContent = original; }, 1600);
+  }
+
+  function legacyCopy(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    return ok;
+  }
+
   Array.prototype.slice.call(document.querySelectorAll('[data-copy]')).forEach(function (btn) {
     btn.addEventListener('click', function () {
       var row = btn.closest('.copy-row');
       var code = row ? row.querySelector('code') : null;
       if (!code) return;
       var text = code.textContent.trim();
-      var done = function () { btn.textContent = 'Copied'; setTimeout(function () { btn.textContent = 'Copy'; }, 1500); };
+
+      function succeed() { flash(btn, 'Copied'); }
+      function fallback() {
+        if (legacyCopy(text)) { succeed(); return; }
+        // last resort: select the text so the visitor can copy it themselves
+        try {
+          var range = document.createRange();
+          range.selectNodeContents(code);
+          var sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+        } catch (e) {}
+        flash(btn, 'Press Ctrl+C');
+      }
+
       if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(done, function () {});
+        navigator.clipboard.writeText(text).then(succeed, fallback);
       } else {
-        var ta = document.createElement('textarea');
-        ta.value = text; document.body.appendChild(ta); ta.select();
-        try { document.execCommand('copy'); done(); } catch (e) {}
-        document.body.removeChild(ta);
+        fallback();
       }
     });
   });

@@ -255,3 +255,8 @@ footer nav a:hover { color: var(--text); text-decoration: none; }
 }
 .copy-row button:hover { border-color: var(--line-strong); background: var(--gold-soft); }
 .wizard .fine { margin-top: 1rem; }
+
+/* Sticky header must not swallow a click on a tab that sits at the very top */
+.tabs, .panel { scroll-margin-top: 5.5rem; }
+
+.wizard-toolbar .btn { font-size: 12px; padding: 0.35rem 0.7rem; }
