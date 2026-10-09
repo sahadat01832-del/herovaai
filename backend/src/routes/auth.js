@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const passport = require('passport');
+const rateLimit = require('express-rate-limit');
 const router = express.Router();
 const User = require('../models/User');
 const AIMemory = require('../models/AIMemory');
@@ -14,8 +15,19 @@ const signToken = (userId) => jwt.sign(
   { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
 );
 
+// Password endpoints face the open internet: slow down guessing without
+// bothering real users (10 tries per 15 min per IP; Google OAuth and /me are
+// unaffected — Google throttles its own picker, tokens can't be guessed).
+const passwordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many attempts — wait 15 minutes and try again' },
+});
+
 // ─── Register ─────────────────────────────────────────────────────────────
-router.post('/register', async (req, res) => {
+router.post('/register', passwordLimiter, async (req, res) => {
   try {
     const { name, email, password, phone } = req.body;
     if (!name || !email || !password) {
@@ -43,7 +55,7 @@ router.post('/register', async (req, res) => {
 });
 
 // ─── Login ────────────────────────────────────────────────────────────────
-router.post('/login', async (req, res) => {
+router.post('/login', passwordLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
