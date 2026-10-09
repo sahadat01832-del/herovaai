@@ -15,6 +15,7 @@
 const ChannelConnection = require('../models/ChannelConnection');
 const channelService = require('./channelService');
 const adapters = require('./channels/adapters');
+const appSettings = require('./appSettings');
 const mongoose = require('mongoose');
 
 const TICK_MS = Number(process.env.CHANNEL_TICK_MS || 60000);
@@ -37,6 +38,10 @@ function postIsDue(connection, now = new Date()) {
 }
 
 async function runDailyPosts(now) {
+  // Platform switch first: with scheduled posting off, the due list is never even
+  // read, so nothing is claimed and nothing has to be un-claimed.
+  if (!appSettings.flag('autoPosts')) return;
+
   const due = await ChannelConnection.find({
     'automations.autoPost': true,
     status: 'connected',

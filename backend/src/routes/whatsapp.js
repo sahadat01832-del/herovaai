@@ -1,8 +1,12 @@
 const express = require('express');
 const router = express.Router();
+const path = require('path');
 const WhatsAppSession = require('../models/WhatsAppSession');
 const { authenticate } = require('../middleware/auth');
 const wppConnectService = require('../services/wppConnectService');
+const flowService = require('../services/flowService');
+const User = require('../models/User');
+const appSettings = require('../services/appSettings');
 
 // Which model answered is an admin-only record (/api/admin/whatsapp/...), so every session the
 // OWNER's API returns goes through here rather than each route remembering to strip it.
@@ -39,6 +43,13 @@ router.get('/sessions/:id', authenticate, async (req, res) => {
 // ─── Create / Connect a new session ───────────────────────────────────────
 router.post('/sessions', authenticate, async (req, res) => {
   try {
+    if (!appSettings.flag('whatsappEnabled')) {
+      return res.status(503).json({
+        success: false,
+        message: 'Connecting WhatsApp numbers is paused by the administrator. Existing sessions keep running.',
+      });
+    }
+
     const { sessionName } = req.body;
     if (!sessionName) return res.status(400).json({ success: false, message: 'Session name is required' });
 
@@ -49,6 +60,25 @@ router.post('/sessions', authenticate, async (req, res) => {
     let session = await WhatsAppSession.findOne({ userId: req.user._id, sessionName: fullSessionName });
     const live = await wppConnectService.getSessionState(fullSessionName);
 
+    // ── Plan limit: how many WhatsApp numbers one owner may connect ────────
+    // Checked only when this is a NEW session. Starting one that already exists
+    // (a reconnect after a restart) is always allowed — the limit is on numbers,
+    // not on clicking connect twice.
+    if (!session) {
+      const owner = await User.findById(req.user._id).select('subscription').lean();
+      const tier = owner?.subscription?.tier || 'free';
+      const limit = appSettings.limitFor(tier, 'whatsapp');
+      const used = await WhatsAppSession.countDocuments({ userId: req.user._id });
+      if (limit && used >= limit) {
+        return res.status(409).json({
+          success: false,
+          message: `Your ${tier} plan connects ${limit} WhatsApp number${limit === 1 ? '' : 's'}. Delete one of your sessions, or upgrade to run more at the same time.`,
+        });
+      }
+    }
+
+    // The record exists before anything can queue it — a queued session with no
+    // row to write its position onto would wait forever, invisibly.
     if (!session) {
       session = await WhatsAppSession.create({
         userId: req.user._id,
@@ -62,6 +92,26 @@ router.post('/sessions', authenticate, async (req, res) => {
       session.status = 'qr_pending';
       session.qrCode = null;
       await session.save();
+    }
+
+    // ── Host capacity: every live session is a Chromium process ────────────
+    // The platform ceiling protects the machine that answers EVERY owner's
+    // messages. At the limit the request joins the launch queue rather than being
+    // refused: the browser starts by itself when a slot frees, and the owner is
+    // told where they are in line instead of being told to come back later.
+    const headroom = wppConnectService.launchHeadroom();
+    if (!live.active && headroom.ceiling && headroom.headroom <= 0) {
+      const position = await wppConnectService.enqueueLaunch(fullSessionName, req.user._id, req.io);
+      const queued = await WhatsAppSession.findOne({ userId: req.user._id, sessionName: fullSessionName });
+      return res.status(202).json({
+        success: true,
+        queued: true,
+        position,
+        session: forOwner(queued || session),
+        running: headroom.running,
+        ceiling: headroom.ceiling,
+        message: `The server is running its limit of ${headroom.ceiling} live WhatsApp session(s). You are number ${position} in line — this number starts on its own the moment a slot frees, so you can leave this page open.`,
+      });
     }
 
     // Start WPPConnect session. A failure to even start (missing library, unwritable profile)
@@ -229,12 +279,25 @@ router.post('/sessions/:id/send', authenticate, async (req, res) => {
       });
     }
 
-    await wppConnectService.sendMessage(session.sessionName, to, message);
+    const mediaUrl = req.body.mediaUrl || null;
+    let localFile = null;
+    if (mediaUrl) {
+      localFile = flowService.findMediaFile(path.basename(mediaUrl));
+    } else if (req.body.mediaPath) {
+      localFile = req.body.mediaPath;
+    }
+
+    if (localFile) {
+      await wppConnectService.sendMedia(session.sessionName, to, localFile, message);
+    } else {
+      await wppConnectService.sendMessage(session.sessionName, to, message);
+    }
 
     const outgoing = {
       from: 'me',
       to,
       body: message,
+      mediaUrl: mediaUrl || null,
       direction: 'outgoing',
       status: 'sent',
       timestamp: new Date(),

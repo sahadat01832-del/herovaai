@@ -22,6 +22,35 @@ const User = require('../models/User');
 const lmStudioService = require('./lmStudioService');
 const cloudAIService = require('./cloudAIService');
 const catalogService = require('./catalogService');
+const flowService = require('./flowService');
+const appSettings = require('./appSettings');
+
+function detectMediaGenerationIntent(text) {
+  if (!text || typeof text !== 'string') return null;
+  const t = text.trim();
+  if (/\b(how\s+(to|do|can)|code\s+to|python|javascript|script\s+to|explain\s+how|tutorial|api\s+to)\b/i.test(t)) {
+    return null;
+  }
+  const isVideo = /\b(generate|create|make|produce|render|animate)\s+(a\s+|an\s+)?(video|clip|short film|movie|animation|cinematic video)\b/i.test(t) ||
+    /^\s*\/(video|veo)\s+/i.test(t);
+
+  const isImage = /\b(generate|create|make|draw|paint|render|produce)\s+(a\s+|an\s+)?(image|picture|photo|illustration|wallpaper|artwork|portrait|landscape|graphic|visual)\b/i.test(t) ||
+    /^\s*\/(image|img|draw|flow)\s+/i.test(t);
+
+  if (isVideo) {
+    const prompt = t.replace(/^\s*\/(video|veo)\s+/i, '')
+                    .replace(/^(please\s+)?(can you\s+)?(generate|create|make|produce|render|animate)\s+(a\s+|an\s+)?(video|clip|short film|movie|animation|cinematic video)(\s+of|\s+showing|\s+about|\s*:)?\s*/i, '')
+                    .trim();
+    return { type: 'video', prompt: prompt || t };
+  }
+  if (isImage) {
+    const prompt = t.replace(/^\s*\/(image|img|draw|flow)\s+/i, '')
+                    .replace(/^(please\s+)?(can you\s+)?(generate|create|make|draw|paint|render|produce)\s+(a\s+|an\s+)?(image|picture|photo|illustration|wallpaper|artwork|portrait|landscape|graphic|visual)(\s+of|\s+showing|\s+about|\s*:)?\s*/i, '')
+                    .trim();
+    return { type: 'image', prompt: prompt || t };
+  }
+  return null;
+}
 
 // In-memory map of active wppconnect clients: sessionName -> { client, userId, startedAt }
 const activeSessions = new Map();
@@ -207,6 +236,8 @@ async function startSession(sessionName, userId, io) {
   }
 
   clearStaleLocks(sessionName);
+  // A session that is starting is no longer waiting in line.
+  WhatsAppSession.findOneAndUpdate({ sessionName, userId }, { $set: { queuePosition: null } }).catch(() => {});
   console.log(`📱 Starting WPPConnect session: ${sessionName}`);
 
   let clientPromise;
@@ -335,12 +366,16 @@ async function startSession(sessionName, userId, io) {
         lastError: message, lastErrorAt: new Date(), qrCode: null,
       });
       emit(io, userId, 'whatsapp-status', { sessionName, status: 'error', error: message });
+      // A failed launch releases its slot like any other exit.
+      void drainLaunchQueue().catch(() => {});
     });
 
   return { ok: true, alreadyRunning: false, pendingScan: true };
 }
 
 async function stopSession(sessionName) {
+  // An owner who disconnects, deletes or stops a queued session leaves the line.
+  dequeueLaunch(sessionName);
   const pending = pendingSessions.get(sessionName);
   if (pending) {
     // Mark it cancelled and forget it before touching the browser. The resolve handler checks
@@ -387,6 +422,9 @@ async function closeSession(sessionName, { removeProfile = false } = {}) {
     // Locks from a killed browser would block the next launch on this profile.
     clearStaleLocks(sessionName);
   }
+
+  // A slot has just been freed: anyone waiting gets their browser now.
+  void drainLaunchQueue().catch(() => {});
 }
 
 /**
@@ -411,7 +449,21 @@ async function reconcileOnBoot(io) {
     }
     if (stale.length) console.log(`♻️  Reconciled ${stale.length} WhatsApp session(s) after restart`);
 
+    // Booting is the one moment every owner's sessions start at once, so the
+    // platform ceiling is checked here too: restoring ten browsers on a host that
+    // can hold six is how a restart turns into an out-of-memory loop. Restored
+    // sessions beyond the ceiling stay disconnected and say so — their owner
+    // reconnects when the load drops.
+    const ceiling = Number(appSettings.platform().maxActiveWhatsapp) || 0;
+    let launched = 0;
     for (const session of restore) {
+      if (ceiling && launched >= ceiling) {
+        // Not "left disconnected": queued, so it comes up on its own as soon as
+        // one of the sessions restored above frees its slot.
+        const position = await enqueueLaunch(session.sessionName, session.userId, io);
+        console.log(`⏳ ${session.sessionName} queued after restart at position ${position} (ceiling ${ceiling})`);
+        continue;
+      }
       await setStatus(session.sessionName, session.userId, 'qr_pending', {
         qrCode: null, lastError: null, lastErrorAt: null,
       });
@@ -419,6 +471,7 @@ async function reconcileOnBoot(io) {
       if (!started.ok) {
         console.error(`Could not restore WhatsApp session ${session.sessionName}: ${started.error}`);
       } else {
+        launched += 1;
         console.log(`♻️  Restoring WhatsApp session ${session.sessionName}`);
       }
     }
@@ -641,6 +694,14 @@ async function handleIncomingMessage(sessionName, userId, message, io) {
       && !message.isGroupMsg && Boolean(message.body);
     if (!wantsReply) return;
 
+    // Master switch from the admin panel. The customer's message is stored (it
+    // is), the owner still gets the alert, and no automatic reply is sent — which
+    // is exactly what "stop all auto-replies" has to mean.
+    if (!appSettings.flag('aiReplies')) {
+      console.log(`[Auto-Reply] platform-wide AI replies are off — ${fromNumber} stored, not answered`);
+      return;
+    }
+
     console.log(`🤖 Triggering AI auto-reply for WhatsApp customer: ${fromNumber}`);
 
     // Conversation history with this customer, excluding the message just stored.
@@ -649,7 +710,7 @@ async function handleIncomingMessage(sessionName, userId, message, io) {
       .slice(-6);
 
     const reply = await generateAIReply(userId, message.body, session, history);
-    if (!reply || !reply.text) {
+    if (!reply || (!reply.text && !reply.mediaPath)) {
       console.warn(`[WhatsApp Auto-Reply] No tier produced a reply for ${fromNumber}`);
       return;
     }
@@ -657,7 +718,8 @@ async function handleIncomingMessage(sessionName, userId, message, io) {
     const outgoingMsg = {
       from: 'me',
       to: fromNumber,
-      body: reply.text,
+      body: reply.text || (reply.mediaPath ? `[Media: ${path.basename(reply.mediaPath)}]` : ''),
+      mediaUrl: reply.mediaUrl || null,
       direction: 'outgoing',
       aiGenerated: true,
       aiModel: reply.answeredBy,
@@ -667,7 +729,11 @@ async function handleIncomingMessage(sessionName, userId, message, io) {
 
     // A failed send is recorded as a failed send — not rounded up to "sent", and not lost.
     try {
-      await sendMessage(sessionName, fromNumber, reply.text);
+      if (reply.mediaPath && fs.existsSync(reply.mediaPath)) {
+        await sendMedia(sessionName, fromNumber, reply.mediaPath, reply.text || '');
+      } else {
+        await sendMessage(sessionName, fromNumber, reply.text);
+      }
     } catch (err) {
       outgoingMsg.status = 'failed';
       console.warn(`[WhatsApp Auto-Reply] Reply generated by ${reply.answeredBy} could not be sent: ${err.message}`);
@@ -742,6 +808,53 @@ async function generateAIReply(userId, incomingMessage, session, recentHistory =
       content: h.body,
     }));
     chatMessages.push({ role: 'user', content: incomingMessage });
+
+    // ── Tier 0: Google Flow MCP Media Generation ──────────────────────────
+    const mediaIntent = detectMediaGenerationIntent(incomingMessage);
+    if (mediaIntent) {
+      try {
+        const flowStatus = await flowService.getStatus();
+        if (flowStatus.ready) {
+          const userSettings = user?.chatSettings || {};
+          const flowModel = mediaIntent.type === 'video'
+            ? (userSettings.flowVideoModel || 'omni-flash')
+            : (userSettings.flowImageModel || 'nano-banana-2');
+          const flowRatio = userSettings.flowAspectRatio || (mediaIntent.type === 'video' ? '16:9' : '1:1');
+
+          console.log(`🎨 WhatsApp triggering Google Flow with model ${flowModel} for ${mediaIntent.type}: "${mediaIntent.prompt}"`);
+          const genResult = await flowService.generateMedia({
+            prompt: mediaIntent.prompt,
+            mediaType: mediaIntent.type,
+            model: flowModel,
+            ratio: flowRatio,
+          });
+          const fname = genResult.filename || (genResult.url ? path.basename(genResult.url) : null);
+          const localPath = fname ? flowService.findMediaFile(fname) : null;
+          if (localPath && fs.existsSync(localPath)) {
+            const caption = `✨ Generated ${mediaIntent.type} (${flowModel})\n\nPrompt: "${mediaIntent.prompt}"`;
+            return {
+              text: caption,
+              mediaPath: localPath,
+              mediaUrl: genResult.url || `/api/media/${fname}`,
+              answeredBy: 'google-flow-mcp',
+            };
+          } else if (genResult.pending) {
+            return {
+              text: `⏳ Your ${mediaIntent.type} is being generated by Google Flow in the background (Job: ${genResult.jobId || 'in progress'}).`,
+              answeredBy: 'google-flow-mcp',
+            };
+          }
+        } else {
+          console.warn(`[WhatsApp Auto-Reply] Media intent detected but Flow MCP is not ready`);
+          return {
+            text: `🎨 I received your request to generate a ${mediaIntent.type} ("${mediaIntent.prompt}").\n\nOur Google Flow media generator is currently offline or waiting for session link in the dashboard. Our team has been notified!`,
+            answeredBy: 'google-flow-mcp',
+          };
+        }
+      } catch (flowErr) {
+        console.warn(`[WhatsApp Auto-Reply] Flow generation failed: ${flowErr.message}`);
+      }
+    }
 
     // ── Tier 1: cloud, on a catalog id that verifies in its provider's live list ──
     const pinnedCloud = process.env.WHATSAPP_AI_MODEL || 'groq/qwen/qwen3.8-27b';
@@ -933,8 +1046,163 @@ async function sendMessage(sessionName, to, message) {
   return sent;
 }
 
+/** Send media (image/video/document) via an active session. Throws when no live client exists. */
+async function sendMedia(sessionName, to, filePath, caption = '') {
+  const entry = activeSessions.get(sessionName);
+  if (!entry) throw new Error('WhatsApp session is not active in this process (scan the QR or reconnect)');
+  const phone = String(to).includes('@') ? to : `${to}@c.us`;
+  const filename = path.basename(filePath);
+  const ext = path.extname(filePath).toLowerCase();
+  let sent;
+  if (['.jpg', '.jpeg', '.png', '.webp'].includes(ext)) {
+    sent = await entry.client.sendImage(phone, filePath, filename, caption);
+  } else {
+    sent = await entry.client.sendFile(phone, filePath, filename, caption);
+  }
+  trackOwnSend(sessionName, phone, caption || `[Media: ${filename}]`, sent ?? null);
+  return sent;
+}
+
 function getActiveSessions() {
   return Array.from(activeSessions.keys());
+}
+
+/**
+ * Live browser inventory for the admin panel: which sessions actually have a
+ * Chromium behind them right now, and how many. The session count in MongoDB can
+ * say "connected" while the process serves nothing (a restart clears browsers),
+ * so the admin view needs this number, not a stored status.
+ *
+ * Every entry is one running browser (~300-500 MB), which is why the platform
+ * ceiling in `maxActiveWhatsapp` is enforced against the length of this list.
+ */
+function liveSessionReport() {
+  const live = [];
+  for (const [sessionName, entry] of activeSessions.entries()) {
+    live.push({ sessionName, userId: String(entry.userId || ''), startedAt: entry.startedAt || null, state: 'connected-browser' });
+  }
+  for (const [sessionName, entry] of pendingSessions.entries()) {
+    live.push({ sessionName, userId: String(entry.userId || ''), startedAt: entry.startedAt || null, state: 'waiting-for-scan' });
+  }
+  return live;
+}
+
+/** Launch headroom: how many more browsers this host is allowed to open. */
+function launchHeadroom() {
+  const ceiling = Number(appSettings.platform().maxActiveWhatsapp) || 0;
+  const running = activeSessions.size + pendingSessions.size;
+  return { ceiling, running, headroom: Math.max(0, ceiling - running) };
+}
+
+/* ───────────────────────────── launch queue ─────────────────────────────── */
+
+/**
+ * Waiting list for browser launches, in the order owners asked.
+ *
+ * Refusing a connect because the host is at its ceiling punishes the owner for
+ * the behaviour of strangers, so the request is remembered instead: the number
+ * starts by itself as soon as a slot frees (a session closes, or its owner
+ * disconnects), and the owner is told exactly where they are in line meanwhile.
+ * It is in-memory on purpose — a queue entry is worthless after a restart, and
+ * reconcileOnBoot rebuilds the list from the sessions that were connected.
+ */
+const launchQueue = []; // [{ sessionName, userId, io }]
+
+const queueIndexOf = (sessionName) => launchQueue.findIndex((entry) => entry.sessionName === sessionName);
+
+/** Where this session sits in line, or null when it is not queued. */
+function queuePosition(sessionName) {
+  const index = queueIndexOf(sessionName);
+  return index === -1 ? null : index + 1;
+}
+
+/** Add (or move to the end) and write the position onto the session record. */
+async function enqueueLaunch(sessionName, userId, io) {
+  const existing = queueIndexOf(sessionName);
+  if (existing !== -1) launchQueue.splice(existing, 1);
+  launchQueue.push({ sessionName, userId, io, queuedAt: new Date() });
+  const position = queuePosition(sessionName);
+  await setStatus(sessionName, userId, 'disconnected', {
+    queuePosition: position,
+    lastError: `Waiting for a free slot — the server is at its limit of ${launchHeadroom().ceiling} live WhatsApp session(s). You are number ${position} in line; this session starts on its own when a slot frees.`,
+    lastErrorAt: new Date(),
+  });
+  emit(io, userId, 'whatsapp-queued', { sessionName, position });
+  return position;
+}
+
+function dequeueLaunch(sessionName) {
+  const index = queueIndexOf(sessionName);
+  if (index === -1) return false;
+  launchQueue.splice(index, 1);
+  return true;
+}
+
+/** Rewrite positions after the line moves, so the UI never shows a stale number. */
+async function refreshQueuePositions() {
+  for (let index = 0; index < launchQueue.length; index += 1) {
+    const entry = launchQueue[index];
+    const position = index + 1;
+    await WhatsAppSession.findOneAndUpdate(
+      { sessionName: entry.sessionName, userId: entry.userId },
+      { $set: { queuePosition: position } },
+    ).catch(() => null);
+  }
+}
+
+/**
+ * Start as many waiting sessions as the ceiling allows, oldest request first.
+ * Called whenever a slot can have freed (a browser closed, a launch failed) and
+ * on a timer, so a queue can never sit stuck behind a slot nobody released.
+ */
+async function drainLaunchQueue() {
+  while (launchQueue.length) {
+    const { ceiling, headroom } = launchHeadroom();
+    if (ceiling && headroom <= 0) break;
+    const next = launchQueue.shift();
+    await setStatus(next.sessionName, next.userId, 'qr_pending', { queuePosition: null, qrCode: null });
+    const started = await startSession(next.sessionName, next.userId, next.io);
+    if (!started.ok) {
+      // The launch itself is broken (no library, unwritable profile) — say so
+      // rather than leaving the owner waiting for a slot that is already free.
+      console.warn(`Queued session ${next.sessionName} could not start: ${started.error}`);
+      await setStatus(next.sessionName, next.userId, 'error', {
+        lastError: started.error, lastErrorAt: new Date(), queuePosition: null,
+      }).catch(() => null);
+    } else {
+      console.log(`▶️  Started queued session ${next.sessionName}`);
+    }
+  }
+  await refreshQueuePositions();
+}
+
+let drainTimer = null;
+/** Self-healing sweep: also catches slots freed by a browser that died quietly. */
+function startQueueDrain() {
+  if (drainTimer) return { started: false, reason: 'already running' };
+  const everyMs = Number(process.env.WHATSAPP_QUEUE_TICK_MS || 30000);
+  drainTimer = setInterval(() => { void drainLaunchQueue().catch(() => {}); }, everyMs);
+  if (drainTimer.unref) drainTimer.unref();
+  return { started: true, everyMs };
+}
+
+/** Queue snapshot for the admin/usage views. */
+function queueSnapshot() {
+  return launchQueue.map((entry, index) => ({
+    position: index + 1,
+    sessionName: entry.sessionName,
+    userId: String(entry.userId || ''),
+    queuedAt: entry.queuedAt || null,
+  }));
+}
+
+/** How many sessions (browsers) one owner currently has live. */
+function liveCountForUser(userId) {
+  const id = String(userId || '');
+  let count = 0;
+  for (const entry of activeSessions.values()) if (String(entry.userId || '') === id) count += 1;
+  for (const entry of pendingSessions.values()) if (String(entry.userId || '') === id) count += 1;
+  return count;
 }
 
 // ─── Route-facing single-speaker helpers (dashboard manual control) ─────────
@@ -960,9 +1228,11 @@ async function muteState(sessionId, userId, customer) {
 }
 
 module.exports = {
-  startSession, closeSession, sendMessage, getActiveSessions,
+  startSession, closeSession, sendMessage, sendMedia, getActiveSessions,
   getSessionState, reconcileOnBoot, handleIncomingMessage, mapStatus,
   browserPidsFor, trackOwnSend,
+  liveSessionReport, launchHeadroom, liveCountForUser, stopSession,
+  enqueueLaunch, dequeueLaunch, drainLaunchQueue, startQueueDrain, queueSnapshot, queuePosition,
   // single-speaker rule
   muteWindowMin, muteKeyOf, activeMute, applyMute, clearMute, wantsRealOwner, handoffRes, HANDOFF_PATTERNS,
   ownerTookOver, resumeAi, muteState,

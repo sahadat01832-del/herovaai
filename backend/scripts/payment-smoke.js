@@ -17,7 +17,9 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const axios = require('axios');
 
-const API = (process.env.API || `http://127.0.0.1:${process.env.PORT || 5000}`).replace(/\/+$/, '');
+// Number() first: an ambient PORT of "0" (or "") is not a target, and treating it as
+// one made this script report ECONNREFUSED instead of testing the running server.
+const API = (process.env.API || `http://127.0.0.1:${Number(process.env.PORT) || 5000}`).replace(/\/+$/, '');
 const BUYER = { name: 'Smoke Buyer', email: 'smoke-pay-buyer@example.test', password: 'SmokeTest!2345' };
 const ADMIN = { name: 'Smoke Admin', email: 'smoke-pay-admin@example.test', password: 'SmokeTest!2345' };
 const WALLET = '01712345678';
@@ -194,6 +196,11 @@ async function main() {
 
   // ─── cleanup ────────────────────────────────────────────────────────────
   await PaymentOrder.deleteMany({ userId: { $in: [buyer._id, otherBuyer._id] } });
+  // The approval/rejection paths now write to the admin audit trail, so the test
+  // has to take its own receipts back out — the owner's trail is not a log file.
+  await require('../src/models/AdminAction').deleteMany({
+    actorEmail: { $in: [ADMIN.email, BUYER.email, 'smoke-pay-other@example.test'] },
+  });
   await User.deleteMany({ email: { $in: [BUYER.email, ADMIN.email, 'smoke-pay-other@example.test'] } });
   await require('../src/services/appSettings').hydrate();
 

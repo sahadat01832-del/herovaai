@@ -17,17 +17,65 @@ let hydratedAt = null;
 let lastError = null;
 
 const NAGAD = 'payments.nagad';
+const PLATFORM = 'platform';
+
+/**
+ * Anything falsy/absent that is still a boolean switch — pulls the typed value
+ * out of a platform setting without the caller repeating the default.
+ */
+const isPlainObject = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+
+/** Deep merge for the nested `limits` block; scalars simply overwrite. */
+function deepMerge(base, patch) {
+  const out = isPlainObject(base) ? { ...base } : {};
+  for (const [key, value] of Object.entries(isPlainObject(patch) ? patch : {})) {
+    out[key] = isPlainObject(value) && isPlainObject(out[key]) ? deepMerge(out[key], value) : value;
+  }
+  return out;
+}
+
+/**
+ * Who may do what, per plan. Enforced where a session is created, not in the UI,
+ * because the UI is not a security boundary: the free plan gets one WhatsApp
+ * number, Pro two, Enterprise five, and channels are counted the same way.
+ */
+const TIER_LIMITS = {
+  free: { whatsapp: 1, channels: 3 },
+  pro: { whatsapp: 2, channels: 8 },
+  enterprise: { whatsapp: 5, channels: 20 },
+};
+
+/** Plan name to limit row, tolerant of a missing or unknown tier. */
+function limitsFor(tier) {
+  return TIER_LIMITS[String(tier || 'free').toLowerCase()] || TIER_LIMITS.free;
+}
 
 /** Defaults: what the app does before the owner has configured anything. */
 const DEFAULTS = {
   [NAGAD]: { wallet: '', holder: '', autoVerify: true, note: '' },
+  // Platform-wide switches. These are the "stop" buttons: when something is
+  // misbehaving at 3am, the owner turns off AI replies or auto-posting here
+  // without touching code, keys or the database.
+  [PLATFORM]: {
+    aiReplies: true,        // master switch for every automatic reply (WhatsApp + channels)
+    autoPosts: true,        // master switch for scheduled channel posts
+    whatsappEnabled: true,  // allow new WhatsApp sessions to be created
+    channelsEnabled: true,  // allow new channel connections
+    signupsOpen: true,      // allow new accounts to register
+    paymentsOpen: true,     // allow checkout
+    notice: '',             // shown as a banner in every dashboard; empty = hidden
+    maxActiveWhatsapp: 6,   // platform-wide ceiling on live WhatsApp browsers (RAM guard)
+    channelRepliesPerDay: 200,
+    defaultOwnerMuteMinutes: 5,
+    limits: TIER_LIMITS,
+  },
 };
 
 function withDefaults(key, value) {
   const base = DEFAULTS[key] || null;
   if (!base) return value == null ? null : value;
-  if (!value || typeof value !== 'object') return { ...base };
-  return { ...base, ...value };
+  if (!isPlainObject(value)) return { ...base };
+  return deepMerge(base, value);
 }
 
 /** Load every row into memory. Called once from startServer(). */
@@ -53,7 +101,7 @@ function get(key) {
 /** Write + refresh the cache. Returns the stored (merged) value. */
 async function set(key, patch, { userId = null, replace = false } = {}) {
   const current = replace ? {} : (cache.has(key) ? cache.get(key) || {} : {});
-  const merged = withDefaults(key, { ...current, ...(patch && typeof patch === 'object' ? patch : {}) });
+  const merged = withDefaults(key, deepMerge(current, patch));
   await AppSetting.findOneAndUpdate(
     { key },
     { $set: { value: merged, updatedBy: userId } },
@@ -67,4 +115,30 @@ function stats() {
   return { keys: cache.size, hydratedAt, lastError };
 }
 
-module.exports = { NAGAD, DEFAULTS, hydrate, get, set, stats };
+/* ───────────────────────── platform control shortcuts ─────────────────── */
+
+/** The whole platform switchboard, defaults filled in. */
+const platform = () => get(PLATFORM);
+
+/** One switch, e.g. `flag('aiReplies')`. */
+const flag = (name) => Boolean(platform()[name]);
+
+/**
+ * The session/channel ceiling for a plan, e.g. `limitFor('pro', 'whatsapp')`.
+ *
+ * Reads the OWNER'S configured limits first and only falls back to the shipped
+ * constants — the admin's number is the one that must be enforced, otherwise the
+ * screen would show 3 and the server would still refuse at 1.
+ */
+function limitFor(tier, kind) {
+  const configured = get(PLATFORM) || {};
+  const row = configured.limits?.[String(tier || 'free').toLowerCase()] || limitsFor(tier);
+  const value = Number(row?.[kind]);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+module.exports = {
+  NAGAD, PLATFORM, DEFAULTS, TIER_LIMITS,
+  hydrate, get, set, stats,
+  platform, flag, limitFor, limitsFor,
+};

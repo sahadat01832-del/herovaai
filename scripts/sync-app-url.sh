@@ -35,7 +35,8 @@ fi
 cd "$SITE" || exit 0
 
 find . -name '*.html' -print0 | xargs -0 sed -i -E \
-  "s#https://[a-z0-9-]+\.trycloudflare\.com#https://$HOST#g"
+  -e "s#https://[a-z0-9-]+\.trycloudflare\.com#https://$HOST#g" \
+  -e "s#https://[a-z0-9.-]+\.ts\.net#https://$HOST#g"
 
 if git diff --quiet; then
   log "already pointing at $HOST"

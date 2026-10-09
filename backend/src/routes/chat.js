@@ -11,6 +11,8 @@ const lmStudioService = require('../services/lmStudioService');
 const cloudAIService = require('../services/cloudAIService');
 const catalogService = require('../services/catalogService');
 const tokenQuotaService = require('../services/tokenQuotaService');
+const flowService = require('../services/flowService');
+const path = require('path');
 
 function classifyModel(modelId, source = 'local') {
   const lower = (modelId || '').toLowerCase();
@@ -77,7 +79,43 @@ const SKILLS = [
     description: 'Generates interactive dashboards and charts (Chart.js / SVG)',
     systemDirective: 'You are an expert in data visualization. Generate complete, responsive interactive dashboards using Chart.js CDN (<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>) or interactive SVGs. Include sample data and interactive filters. Enclose the ENTIRE code in a single ```html ... ``` block.',
   },
+  {
+    id: 'flow',
+    name: 'Google Flow Studio',
+    icon: 'Sparkles',
+    description: 'Generates ultra-high quality AI images & videos via Google Flow (Veo & Omni Flash)',
+  },
 ];
+
+function detectMediaGenerationIntent(text) {
+  if (!text || typeof text !== 'string') return null;
+  const t = text.trim();
+  // Bypass if this is a query asking for code, programming, or an explanation
+  if (/\b(how\s+(to|do|can)|code\s+to|python|javascript|script\s+to|explain\s+how|tutorial|api\s+to)\b/i.test(t)) {
+    return null;
+  }
+  // Video detection
+  const isVideo = /\b(generate|create|make|produce|render|animate)\s+(a\s+|an\s+)?(video|clip|short film|movie|animation|cinematic video)\b/i.test(t) ||
+    /^\s*\/(video|veo)\s+/i.test(t);
+
+  // Image detection
+  const isImage = /\b(generate|create|make|draw|paint|render|produce)\s+(a\s+|an\s+)?(image|picture|photo|illustration|wallpaper|artwork|portrait|landscape|graphic|visual)\b/i.test(t) ||
+    /^\s*\/(image|img|draw|flow)\s+/i.test(t);
+
+  if (isVideo) {
+    const prompt = t.replace(/^\s*\/(video|veo)\s+/i, '')
+                    .replace(/^(please\s+)?(can you\s+)?(generate|create|make|produce|render|animate)\s+(a\s+|an\s+)?(video|clip|short film|movie|animation|cinematic video)(\s+of|\s+showing|\s+about|\s*:)?\s*/i, '')
+                    .trim();
+    return { type: 'video', prompt: prompt || t };
+  }
+  if (isImage) {
+    const prompt = t.replace(/^\s*\/(image|img|draw|flow)\s+/i, '')
+                    .replace(/^(please\s+)?(can you\s+)?(generate|create|make|draw|paint|render|produce)\s+(a\s+|an\s+)?(image|picture|photo|illustration|wallpaper|artwork|portrait|landscape|graphic|visual)(\s+of|\s+showing|\s+about|\s*:)?\s*/i, '')
+                    .trim();
+    return { type: 'image', prompt: prompt || t };
+  }
+  return null;
+}
 
 // Helper: Extract code artifacts from AI output.
 // Hardened after the 2026-10-08 "Flappy Bird skeleton" incident: a model that
@@ -280,8 +318,58 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
     let failedOverFrom = null;
     let tokensUsed = 0;
 
+    // Detect auto-intent for image or video generation
+    const mediaIntent = detectMediaGenerationIntent(message);
+
+    // ── Skill: Google Flow Studio or Auto-Detected Media Intent ─────────────
+    if (chosenSkill === 'flow' || mediaIntent) {
+      const isVideo = mediaIntent
+        ? mediaIntent.type === 'video'
+        : /\b(video|clip|movie|animation|animate|motion|film|veo|omni)\b/i.test(message);
+      const mediaType = isVideo ? 'video' : 'image';
+      const promptToUse = (mediaIntent?.prompt || message || '').trim();
+
+      const userSettings = req.user?.chatSettings || {};
+      const defaultImageModel = userSettings.flowImageModel || 'nano-banana-2';
+      const defaultVideoModel = userSettings.flowVideoModel || 'omni-flash';
+      const defaultRatio = userSettings.flowAspectRatio || '16:9';
+      const chosenFlowModel = req.body.flowModel || (isVideo ? defaultVideoModel : defaultImageModel);
+      const chosenRatio = req.body.flowAspectRatio || defaultRatio;
+
+      try {
+        const flowStatus = await flowService.getStatus();
+        if (!flowStatus.ready) {
+          if (chosenSkill === 'flow') {
+            aiResponse = `⚠️ **Google Flow account is not verified yet.**\n\nTo connect Google Flow:\n1. Open **Brave** and navigate to \`chrome://extensions\` (Enable Developer mode).\n2. Click **Load unpacked** and select: \`${flowService.extensionDirectory}\`\n3. Click the **Flow Login Bridge** extension icon and click **Connect Flow**.\n4. Complete the account selection in the Google chooser.\n5. Then try your prompt again!`;
+          } else {
+            aiResponse = `🎨 **Google Flow Media Generation**\n\nI detected a request to generate a **${mediaType}**: *"${promptToUse}"* using **${chosenFlowModel}**.\n\nYour Google Flow MCP session is not linked yet. To enable direct image and video generation with zero API cost:\n1. Go to **Dashboard > Connections > Google Flow**\n2. Open **Brave** and load the unpacked extension from: \`${flowService.extensionDirectory}\`\n3. Click **Connect Flow** to link your Google session.\n\nOnce linked, I will generate high-fidelity images (Nano Banana) and videos (Omni Flash / Veo 3.1) instantly!`;
+          }
+          modelUsed = `Google Flow (${chosenFlowModel})`;
+        } else {
+          const genResult = await flowService.generateMedia({
+            prompt: promptToUse,
+            mediaType,
+            model: chosenFlowModel,
+            ratio: chosenRatio,
+          });
+          if (genResult.url) {
+            aiResponse = isVideo
+              ? `🎬 **Generated Video with Google Flow (${chosenFlowModel})**\n\nPrompt: *${promptToUse}*\n\n[▶ View / Download Video](${genResult.url})`
+              : `🖼️ **Generated Image with Google Flow (${chosenFlowModel})**\n\nPrompt: *${promptToUse}*\n\n![${promptToUse}](${genResult.url})`;
+          } else if (genResult.pending) {
+            aiResponse = `⏳ Google Flow is processing your ${mediaType} with model **${chosenFlowModel}** (Job ID: ${genResult.jobId || 'in progress'}). It will appear shortly!`;
+          } else {
+            aiResponse = `Flow generation did not return a file: ${genResult.error || 'Unknown error'}`;
+          }
+          modelUsed = `Google Flow (${chosenFlowModel})`;
+        }
+      } catch (flowErr) {
+        aiResponse = `Google Flow error: ${flowErr.message}`;
+        modelUsed = `Google Flow (${chosenFlowModel})`;
+      }
+
     // ── Mode: Cloud API Models (OpenRouter / Gemini+ / OpenAI) ───────────────
-    if (chatMode === 'api') {
+    } else if (chatMode === 'api') {
       const contextMessages = convo.messages.slice(-15).map(m => ({
         role: m.role,
         content: m.content,
@@ -338,27 +426,34 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
 
     // ── Mode: ContentBot Agent ─────────────────────────────────────────────
     } else if (chatMode === 'contentbot') {
-      const apiKey = req.user.contentbotApiKey || process.env.CONTENTBOT_API_KEY;
-      if (!apiKey) {
-        return res.status(400).json({
-          success: false,
-          message: 'No agent platform API key configured. Please enter your API key in Settings or switch to API Models.',
-        });
-      }
+      const apiKey = req.user.contentbotApiKey || process.env.CONTENTBOT_API_KEY || 'contentbot-key';
+      const gatewayUrl = process.env.CONTENTBOT_API_URL || 'http://127.0.0.1:8787';
 
-      const cbResponse = await axios.post(`${process.env.CONTENTBOT_API_URL || 'http://localhost:8000'}/chat`, {
+      const cbResponse = await axios.post(`${gatewayUrl}/chat`, {
         message,
         model: chosenModel,
         history: convo.messages.slice(-10).map(m => ({ role: m.role, content: m.content })),
         system_prompt: systemPrompt,
+        user: String(req.user._id),
       }, {
         headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-        timeout: 60000,
+        timeout: 90000,
         signal: genCtl.signal,
       });
 
-      aiResponse = cbResponse.data.response || cbResponse.data.message || 'No response from the agent platform';
-      modelUsed = chosenModel || 'Agent platform';
+      aiResponse = cbResponse.data.response || cbResponse.data.message || 'No response from ContentBot';
+      if (Array.isArray(cbResponse.data.deliver) && cbResponse.data.deliver.length > 0) {
+        for (const filePath of cbResponse.data.deliver) {
+          const fname = path.basename(filePath);
+          const ext = path.extname(filePath).toLowerCase();
+          if (['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext)) {
+            aiResponse += `\n\n![Generated Image](/api/media/${fname})`;
+          } else if (['.mp4', '.webm', '.mov'].includes(ext)) {
+            aiResponse += `\n\n[▶ View / Download Video](/api/media/${fname})`;
+          }
+        }
+      }
+      modelUsed = chosenModel || 'ContentBot';
     }
 
     if (typeof aiResponse !== 'string' || !aiResponse.trim()) {
@@ -627,8 +722,39 @@ router.post('/lm-studio/warm', async (req, res) => {
 // Called when the visitor leaves the local chat. Unloads the model, and stops
 // the server too when we were the ones who started it — unless the caller asks
 // to keep the daemon alive.
+// Unloading is a page-leave signal: the dashboard sends it with navigator.sendBeacon,
+// which cannot carry an Authorization header, so the route cannot demand a token
+// without breaking the RAM-release it exists for. What it can do is refuse to be
+// hammered — without this, anyone on the internet could keep pulling the local
+// model out of RAM between real visitors' messages.
+const unloadUsage = new Map();
+const UNLOAD_LIMIT_PER_WINDOW = Number(process.env.LM_UNLOAD_LIMIT_PER_WINDOW || 20);
+const UNLOAD_WINDOW_MS = Number(process.env.LM_UNLOAD_WINDOW_MS || 10 * 60 * 1000);
+
+function allowUnload(ip) {
+  const now = Date.now();
+  if (unloadUsage.size > 2000) {
+    for (const [key, value] of unloadUsage) if (now > value.resetAt) unloadUsage.delete(key);
+  }
+  const entry = unloadUsage.get(ip) || { count: 0, resetAt: now + UNLOAD_WINDOW_MS };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + UNLOAD_WINDOW_MS;
+  }
+  entry.count += 1;
+  unloadUsage.set(ip, entry);
+  return entry.count <= UNLOAD_LIMIT_PER_WINDOW;
+}
+
 router.post('/lm-studio/unload', async (req, res) => {
   const { model, stopServer = true, graceSeconds } = req.body || {};
+
+  if (!allowUnload(req.ip || 'unknown')) {
+    return res.status(429).json({
+      success: false,
+      message: 'Too many unload requests from this address. The private model is released between visits — no need to ask repeatedly.',
+    });
+  }
 
   if (!stopServer) {
     const unloaded = await lmStudioService.unloadModel(model);

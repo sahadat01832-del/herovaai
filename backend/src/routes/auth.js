@@ -7,6 +7,7 @@ const router = express.Router();
 const User = require('../models/User');
 const AIMemory = require('../models/AIMemory');
 const googleAuth = require('../services/googleAuth');
+const appSettings = require('../services/appSettings');
 const { authenticate } = require('../middleware/auth');
 
 const signToken = (userId) => jwt.sign(
@@ -29,6 +30,15 @@ const passwordLimiter = rateLimit({
 // ─── Register ─────────────────────────────────────────────────────────────
 router.post('/register', passwordLimiter, async (req, res) => {
   try {
+    // The owner can close registrations from the admin panel. Login and Google
+    // sign-in stay open for accounts that already exist.
+    if (!appSettings.flag('signupsOpen')) {
+      return res.status(403).json({
+        success: false,
+        message: appSettings.platform().notice || 'New sign-ups are paused right now. Please try again later.',
+      });
+    }
+
     const { name, email, password, phone } = req.body;
     if (!name || !email || !password) {
       return res.status(400).json({ success: false, message: 'Name, email, and password are required' });

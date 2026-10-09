@@ -13,6 +13,7 @@ interface WAMessage {
   from: string
   to: string
   body: string
+  mediaUrl?: string
   direction: 'incoming' | 'outgoing'
   aiGenerated?: boolean
   status?: string
@@ -776,6 +777,15 @@ export default function WhatsAppPage() {
                             </span>
                           )}
                         </div>
+                        {msg.mediaUrl && (
+                          <div className="mb-2 rounded-lg overflow-hidden max-w-xs border border-white/10">
+                            {msg.mediaUrl.match(/\.(mp4|webm|mov)$/i) ? (
+                              <video src={msg.mediaUrl} controls className="rounded-lg max-h-56 w-auto" />
+                            ) : (
+                              <img src={msg.mediaUrl} alt="WhatsApp media" className="rounded-lg max-h-56 w-auto object-cover" />
+                            )}
+                          </div>
+                        )}
                         <p className="whitespace-pre-wrap">{msg.body}</p>
                         {msg.timestamp && (
                           <span className="text-[10px] text-dark-400 block mt-1 text-right">

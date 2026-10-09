@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
 import {
   AlertTriangle, ArrowUpRight, BadgeCheck, Brain, Check, Chrome, ExternalLink, KeyRound, Layers,
-  Lock, RefreshCw, Save, Server, ShieldCheck, Trash2, User, Zap,
+  Lock, RefreshCw, Save, Server, ShieldCheck, Sparkles, ImageIcon, Video, Trash2, User, Zap,
 } from 'lucide-react'
 import { useAuth } from '@/contexts/AuthContext'
 import { adminApi, authApi, userApi } from '@/lib/api'
@@ -17,15 +17,10 @@ import { TabPanel, Tabs } from '@/components/ui/Tabs'
 import toast from 'react-hot-toast'
 
 /* ══════════════════════════════════════════════════════════════════════════
-   Settings — profile, API keys, security.
-
-   The API-key tab is the screen that used to be broken: it posted to a route
-   that did not exist, prefilled from a stale prop and showed a success toast
-   either way. It now reads the real status, refuses to invent one, and offers
-   the three operations a key actually needs — save, verify, revoke.
+   Settings — profile, API keys, security, and AI Media settings.
    ══════════════════════════════════════════════════════════════════════════ */
 
-type TabId = 'profile' | 'keys' | 'security'
+type TabId = 'profile' | 'media' | 'keys' | 'security'
 
 interface KeyStatus {
   configured: boolean
@@ -37,6 +32,7 @@ interface KeyStatus {
 
 const TABS = [
   { id: 'profile' as TabId, label: 'Profile', icon: <User className="h-3.5 w-3.5" /> },
+  { id: 'media' as TabId, label: 'AI Media (Flow)', icon: <Sparkles className="h-3.5 w-3.5 text-emerald-400" /> },
   { id: 'keys' as TabId, label: 'API keys', icon: <KeyRound className="h-3.5 w-3.5" /> },
   { id: 'security' as TabId, label: 'Security', icon: <Lock className="h-3.5 w-3.5" /> },
 ]
@@ -44,7 +40,7 @@ const TABS = [
 function readTab(): TabId {
   if (typeof window === 'undefined') return 'profile'
   const tab = new URLSearchParams(window.location.search).get('tab')
-  return tab === 'keys' || tab === 'security' ? tab : 'profile'
+  return tab === 'keys' || tab === 'security' || tab === 'media' ? (tab as TabId) : 'profile'
 }
 
 export default function SettingsPage() {
@@ -84,6 +80,9 @@ export default function SettingsPage() {
 
       <TabPanel id="profile" active={tab === 'profile'}>
         <ProfileTab onDone={refreshUser} />
+      </TabPanel>
+      <TabPanel id="media" active={tab === 'media'}>
+        <MediaTab onDone={refreshUser} />
       </TabPanel>
       <TabPanel id="keys" active={tab === 'keys'}>
         <KeysTab isAdmin={isAdmin} onChanged={refreshUser} />
@@ -214,6 +213,197 @@ function ProfileTab({ onDone }: { onDone: () => Promise<void> }) {
         </Card>
       </div>
     </div>
+  )
+}
+
+/* ─── AI Media (Google Flow) ────────────────────────────────────────────── */
+
+function MediaTab({ onDone }: { onDone: () => Promise<void> }) {
+  const { user } = useAuth()
+  const [imageModel, setImageModel] = useState('nano-banana-2')
+  const [videoModel, setVideoModel] = useState('omni-flash')
+  const [aspectRatio, setAspectRatio] = useState('16:9')
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    if (!user) return
+    const cs = (user as any).chatSettings || {}
+    setImageModel(cs.flowImageModel || 'nano-banana-2')
+    setVideoModel(cs.flowVideoModel || 'omni-flash')
+    setAspectRatio(cs.flowAspectRatio || '16:9')
+  }, [user])
+
+  const save = async () => {
+    setSaving(true)
+    try {
+      await userApi.updateProfile({
+        chatSettings: {
+          flowImageModel: imageModel,
+          flowVideoModel: videoModel,
+          flowAspectRatio: aspectRatio,
+        },
+      })
+      await onDone()
+      toast.success('Media generation settings saved!')
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to save settings')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Card className="max-w-2xl space-y-6 p-6">
+      <CardHeader
+        icon={<Sparkles className="h-4 w-4 text-emerald-400" />}
+        title="Google Flow Media Generation Defaults"
+        description="Choose your default models for AI image and video synthesis via Google Flow MCP. Zero API billing — operated via your linked Google Flow session."
+      />
+
+      <div className="space-y-5">
+        {/* Image Model Selection */}
+        <div>
+          <label className="block text-xs font-semibold text-white mb-2 flex items-center gap-1.5">
+            <ImageIcon className="w-3.5 h-3.5 text-emerald-400" />
+            Default Image Model
+          </label>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            {[
+              { id: 'nano-banana-2', name: 'Nano Banana 2 (2.1)', badge: 'Default', desc: 'Fastest high-detail photorealism, sharp textures & creative styling' },
+              { id: 'nano-banana-pro', name: 'Nano Banana Pro', badge: 'High Quality', desc: 'Maximum aesthetic fidelity, studio lighting & complex composition' },
+              { id: 'nano-banana-2-lite', name: 'Nano Banana 2 Lite', badge: 'Lightweight', desc: 'Low-latency generation for rapid ideation and previews' },
+              { id: 'ui-default', name: 'Workspace Default', badge: 'Auto', desc: 'Auto-select active image model in Flow workspace session' },
+            ].map(m => (
+              <button
+                type="button"
+                key={m.id}
+                onClick={() => setImageModel(m.id)}
+                className={cn(
+                  'text-left p-3 rounded-xl border transition-all',
+                  imageModel === m.id
+                    ? 'border-emerald-500/50 bg-emerald-500/10 text-white shadow-sm ring-1 ring-emerald-500/30'
+                    : 'border-white/8 bg-white/[0.02] text-dark-300 hover:border-white/20 hover:text-white'
+                )}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-xs text-white">{m.name}</span>
+                  <span className={cn('text-[9px] px-1.5 py-0.5 rounded-full font-mono', imageModel === m.id ? 'bg-emerald-500/20 text-emerald-300' : 'bg-white/5 text-dark-400')}>{m.badge}</span>
+                </div>
+                <p className="text-[11px] text-dark-400 mt-1 leading-snug">{m.desc}</p>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Video Model Selection */}
+        <div>
+          <label className="block text-xs font-semibold text-white mb-2 flex items-center gap-1.5">
+            <Video className="w-3.5 h-3.5 text-cyan-400" />
+            Default Video Model
+          </label>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            {[
+              { id: 'omni-flash', name: 'Omni Flash 1.1', badge: 'Default', desc: 'Multimodal fluid motion, video-from-prompt & fast turnarounds' },
+              { id: 'veo-3-1-quality', name: 'Veo 3.1 Quality', badge: 'Cinematic', desc: 'Cinematic Google Veo video with rich camera controls & high dynamic range' },
+              { id: 'veo-3-1-fast', name: 'Veo 3.1 Fast', badge: 'Quick Clips', desc: 'Rapid video generation with responsive prompt following' },
+              { id: 'ui-default', name: 'Workspace Default', badge: 'Auto', desc: 'Auto-select active video model in Flow workspace session' },
+            ].map(m => (
+              <button
+                type="button"
+                key={m.id}
+                onClick={() => setVideoModel(m.id)}
+                className={cn(
+                  'text-left p-3 rounded-xl border transition-all',
+                  videoModel === m.id
+                    ? 'border-cyan-500/50 bg-cyan-500/10 text-white shadow-sm ring-1 ring-cyan-500/30'
+                    : 'border-white/8 bg-white/[0.02] text-dark-300 hover:border-white/20 hover:text-white'
+                )}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-xs text-white">{m.name}</span>
+                  <span className={cn('text-[9px] px-1.5 py-0.5 rounded-full font-mono', videoModel === m.id ? 'bg-cyan-500/20 text-cyan-300' : 'bg-white/5 text-dark-400')}>{m.badge}</span>
+                </div>
+                <p className="text-[11px] text-dark-400 mt-1 leading-snug">{m.desc}</p>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Default Aspect Ratio */}
+        <div>
+          <label className="block text-xs font-semibold text-white mb-2">Default Aspect Ratio</label>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            {[
+              { id: '16:9', label: '16:9 Landscape', desc: 'YouTube & Desktop' },
+              { id: '9:16', label: '9:16 Vertical', desc: 'Reels, TikTok & Shorts' },
+              { id: '1:1',  label: '1:1 Square', desc: 'Feed & Social Media' },
+              { id: '4:3',  label: '4:3 Standard', desc: 'Classic Photo Format' },
+            ].map(r => (
+              <button
+                type="button"
+                key={r.id}
+                onClick={() => setAspectRatio(r.id)}
+                className={cn(
+                  'p-2.5 rounded-xl border text-center transition-all',
+                  aspectRatio === r.id
+                    ? 'border-brand-500/50 bg-brand-500/10 text-white ring-1 ring-brand-500/30'
+                    : 'border-white/8 bg-white/[0.02] text-dark-300 hover:border-white/20 hover:text-white'
+                )}
+              >
+                <p className="text-xs font-semibold">{r.label}</p>
+                <p className="text-[10px] text-dark-400 mt-0.5">{r.desc}</p>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Personal Google Flow Account & Quota Isolation */}
+        <div className="p-4 rounded-xl border border-white/10 bg-black/40 space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-white flex items-center gap-1.5">
+              <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+              Personal Google Flow Account & Quota
+            </span>
+            <Badge tone={(user as any)?.flowAccountStatus === 'connected' ? 'green' : 'amber'}>
+              {(user as any)?.flowAccountStatus === 'connected' ? 'Personal Quota Active' : 'Shared System Session'}
+            </Badge>
+          </div>
+          <p className="text-[12px] text-dark-300 leading-relaxed">
+            {(user as any)?.flowAccountStatus === 'connected' ? (
+              <>Linked as <strong className="text-white font-mono">{(user as any)?.flowAccountId}</strong> ({(user as any)?.flowAccountLabel || user?.name}). Media generations automatically consume your own Google subscription quota without sharing limits.</>
+            ) : (
+              <>Currently using the server's shared default session. Connect your personal Google account to consume your own Flow quota independently.</>
+            )}
+          </p>
+          <div className="pt-2 flex items-center justify-between">
+            <Link
+              href="/dashboard/connections"
+              className="text-xs text-brand-400 hover:text-brand-300 underline inline-flex items-center gap-1"
+            >
+              {(user as any)?.flowAccountStatus === 'connected' ? 'Manage Account in Connections' : 'Link Your Flow Account Now'} <ArrowUpRight className="w-3 h-3" />
+            </Link>
+          </div>
+        </div>
+
+        <div className="pt-4 border-t border-white/8 flex flex-wrap items-center justify-between gap-3">
+          <Link
+            href="/dashboard/connections"
+            className="text-xs text-emerald-400 hover:underline flex items-center gap-1"
+          >
+            Check Google Flow Bridge Status <ArrowUpRight className="w-3 h-3" />
+          </Link>
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={save}
+            loading={saving}
+            icon={<Save className="w-3.5 h-3.5" />}
+          >
+            Save Media Defaults
+          </Button>
+        </div>
+      </div>
+    </Card>
   )
 }
 

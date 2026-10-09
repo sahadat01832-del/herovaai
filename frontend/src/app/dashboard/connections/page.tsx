@@ -4,9 +4,10 @@ import { useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
 import {
   Activity, ArrowUpRight, Check, CircleSlash, Clock, Facebook, Globe, Info, Instagram,
-  MessageCircle, Plug, RefreshCw, Send, Smartphone, Upload, Youtube, X,
+  MessageCircle, Plug, RefreshCw, Send, Smartphone, Sparkles, Upload, Youtube, Video, X,
 } from 'lucide-react'
-import { channelApi } from '@/lib/api'
+import { channelApi, flowApi } from '@/lib/api'
+import { useAuth } from '@/contexts/AuthContext'
 import { cn } from '@/lib/cn'
 import { formatDateTime, relativeTime } from '@/lib/format'
 import { Badge, Button, CopyButton, EmptyState, InlineError, Skeleton } from '@/components/ui/primitives'
@@ -34,6 +35,7 @@ const ICONS: Record<string, any> = {
   instagram: Instagram,
   telegram: Send,
   youtube: Youtube,
+  tiktok: Video,
   google_business: Globe,
   imo: Smartphone,
   webhook: Upload,
@@ -46,7 +48,14 @@ const STATUS_BADGE: Record<string, { tone: 'green' | 'amber' | 'red' | 'slate'; 
 }
 
 export default function ConnectionsPage() {
+  const { user, refreshUser } = useAuth()
   const [channels, setChannels] = useState<any[]>([])
+  const [flowStatus, setFlowStatus] = useState<any>(null)
+  const [flowModalOpen, setFlowModalOpen] = useState(false)
+  const [flowConnecting, setFlowConnecting] = useState(false)
+  const [flowConnectionId, setFlowConnectionId] = useState<string>('')
+  const [flowTab, setFlowTab] = useState<'extension' | 'cookies'>('extension')
+  const [cookiesInput, setCookiesInput] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [open, setOpen] = useState<any>(null)
@@ -56,8 +65,15 @@ export default function ConnectionsPage() {
     setLoading(true)
     setError('')
     try {
-      const res: any = await channelApi.list()
-      if (res?.success) setChannels(res.channels || [])
+      const [chResult, flResult] = await Promise.allSettled([
+        channelApi.list(),
+        flowApi.getStatus(),
+      ])
+      const chRes: any = chResult.status === 'fulfilled' ? chResult.value : null
+      const flRes: any = flResult.status === 'fulfilled' ? flResult.value : null
+
+      if (chRes?.success) setChannels(chRes.channels || [])
+      if (flRes) setFlowStatus(flRes)
     } catch (err: any) {
       setError(err.message || 'Could not read your connections')
     } finally {
@@ -80,6 +96,8 @@ export default function ConnectionsPage() {
     setOpen(channel)
     setBusy('')
   }
+
+  const isPersonalFlowActive = user?.flowAccountStatus === 'connected'
 
   return (
     <div className="space-y-5">
@@ -106,6 +124,82 @@ export default function ConnectionsPage() {
       </div>
 
       {error ? <InlineError>{error}</InlineError> : null}
+
+      {!user && !loading ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 p-4 rounded-xl border border-brand-500/30 bg-brand-500/10 text-white">
+          <div>
+            <p className="font-semibold text-sm">Guest Mode / Not Logged In</p>
+            <p className="text-xs text-dark-300 mt-0.5">You can preview all platforms below. Log in to link your own personal accounts and post automatically.</p>
+          </div>
+          <Link href="/login" className="btn-primary btn-sm whitespace-nowrap">
+            Log In Now
+          </Link>
+        </div>
+      ) : null}
+
+      {/* ── Google Flow MCP Banner / Status ── */}
+      <div className="card relative overflow-hidden p-5 sm:p-6 border border-emerald-500/20 bg-gradient-to-r from-emerald-950/30 via-dark-900/60 to-dark-900/40">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="flex items-start gap-3.5">
+            <span className="flex h-11 w-11 items-center justify-center rounded-2xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-300">
+              <Sparkles className="h-5 w-5" />
+            </span>
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-base font-semibold text-white">Google Flow AI (MCP System)</h2>
+                <Badge tone={isPersonalFlowActive ? 'green' : (flowStatus?.ready ? 'green' : 'amber')}>
+                  {isPersonalFlowActive ? 'personal quota active' : (flowStatus?.ready ? 'ready for generation' : 'connection needed')}
+                </Badge>
+                {isPersonalFlowActive && (
+                  <span className="rounded-full bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 text-[10px] font-mono text-emerald-300">
+                    {user?.flowAccountLabel || user?.flowAccountId}
+                  </span>
+                )}
+              </div>
+              <p className="mt-1 max-w-2xl text-[13px] leading-relaxed text-dark-300">
+                Generate ultra high quality AI video (Veo 3.1 & Omni Flash) and images (Nano Banana) directly via your Google subscription without paid generation API keys. Operated smoothly with local MCP tool automation.
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-dark-400">
+                <span className="rounded-lg bg-white/[0.04] px-2.5 py-1 font-mono text-[11px] text-cyan-300 border border-white/[0.08]">
+                  ContentBot ↔ Google Flow MCP (Port 37421)
+                </span>
+                {flowStatus?.bridge?.running && (
+                  <span className="rounded-lg bg-emerald-500/10 px-2.5 py-1 text-emerald-400 text-[11px] font-medium border border-emerald-500/20">
+                    Bridge Online (port {flowStatus.bridge.port})
+                  </span>
+                )}
+                <span className="rounded-lg bg-emerald-500/10 px-2.5 py-1 text-emerald-300 text-[11px] font-medium border border-emerald-500/20">
+                  Image: Nano Banana 2 (2.1)
+                </span>
+                <span className="rounded-lg bg-cyan-500/10 px-2.5 py-1 text-cyan-300 text-[11px] font-medium border border-cyan-500/20">
+                  Video: Omni Flash 1.1
+                </span>
+                {isPersonalFlowActive && (
+                  <span className="rounded-lg bg-brand-500/15 px-2.5 py-1 text-brand-300 text-[11px] font-medium border border-brand-500/25">
+                    Account: {user?.flowAccountLabel || user?.flowAccountId}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Link
+              href="/dashboard/settings?tab=media"
+              className="btn-ghost btn-sm text-xs inline-flex items-center gap-1.5"
+            >
+              Model Settings <ArrowUpRight className="h-3 w-3" />
+            </Link>
+            <Button
+              variant={isPersonalFlowActive ? 'secondary' : (flowStatus?.ready ? 'secondary' : 'primary')}
+              size="sm"
+              onClick={() => setFlowModalOpen(true)}
+              icon={<Sparkles className="h-3.5 w-3.5" />}
+            >
+              {isPersonalFlowActive ? 'Manage Flow Account' : (flowStatus?.ready ? 'Manage Flow' : 'Connect Flow Account')}
+            </Button>
+          </div>
+        </div>
+      </div>
 
       {loading && channels.length === 0 ? (
         <div className="grid gap-4 lg:grid-cols-3">
@@ -175,8 +269,210 @@ export default function ConnectionsPage() {
           setBusy={setBusy}
           onClose={() => setOpen(null)}
           onChanged={load}
+          user={user}
         />
       ) : null}
+
+      {/* ── Google Flow MCP Connection Modal ── */}
+      <Modal
+        open={flowModalOpen}
+        onClose={() => setFlowModalOpen(false)}
+        size="lg"
+        title="Connect Google Flow AI (Personal Quota)"
+      >
+        <div className="space-y-4">
+          {/* Default Cloud Pool reassurance */}
+          <div className="rounded-xl border border-emerald-500/25 bg-emerald-500/[0.07] p-3.5 text-xs">
+            <div className="flex items-center gap-2 font-semibold text-emerald-300">
+              <Sparkles className="w-4 h-4 text-emerald-400" />
+              <span>Default Cloud Engine is Active &amp; Ready</span>
+            </div>
+            <p className="mt-1 text-dark-300 leading-relaxed text-[11.5px]">
+              You can generate images &amp; videos right now with <strong>Nano Banana 2</strong> and <strong>Omni Flash 1.1</strong> without connecting any personal account.
+              Connecting below is optional — only do this if you want generations to consume your <em>own personal Google account quota</em>.
+            </p>
+          </div>
+
+          {/* Connection Method Tabs */}
+          <div className="flex rounded-xl bg-white/[0.04] p-1 border border-white/5">
+            <button
+              type="button"
+              onClick={() => setFlowTab('extension')}
+              className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition-all ${
+                flowTab === 'extension' ? 'bg-brand-500 text-white shadow-md' : 'text-dark-400 hover:text-white'
+              }`}
+            >
+              📥 Method 1: Browser Extension (.zip)
+            </button>
+            <button
+              type="button"
+              onClick={() => setFlowTab('cookies')}
+              className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition-all ${
+                flowTab === 'cookies' ? 'bg-brand-500 text-white shadow-md' : 'text-dark-400 hover:text-white'
+              }`}
+            >
+              🍪 Method 2: Paste Session Cookies
+            </button>
+          </div>
+
+          {flowTab === 'extension' ? (
+            <div className="space-y-3 text-xs">
+              <div className="p-3 rounded-xl bg-white/[0.02] border border-white/5 flex items-center justify-between gap-3">
+                <div>
+                  <p className="font-semibold text-white">Flow Login Bridge Extension</p>
+                  <p className="text-[11px] text-dark-400">Works with Google Chrome, Brave, Edge &amp; Opera</p>
+                </div>
+                <a
+                  href="/flow-login-bridge.zip"
+                  download="flow-login-bridge.zip"
+                  className="px-3 py-1.5 rounded-lg bg-brand-500/20 hover:bg-brand-500/30 border border-brand-500/40 text-brand-200 font-semibold text-xs inline-flex items-center gap-1.5 transition-all"
+                >
+                  <Upload className="w-3.5 h-3.5 rotate-180" /> Download .zip
+                </a>
+              </div>
+
+              <ol className="space-y-2 text-dark-300 text-[11.5px]">
+                <li className="flex gap-2">
+                  <span className="flex h-5 w-5 flex-none items-center justify-center rounded-full bg-brand-500/20 text-brand-300 font-bold text-[10px]">1</span>
+                  <span>Download and unzip <strong>flow-login-bridge.zip</strong>.</span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="flex h-5 w-5 flex-none items-center justify-center rounded-full bg-brand-500/20 text-brand-300 font-bold text-[10px]">2</span>
+                  <span>In your browser, visit <code className="text-cyan-300 font-mono">chrome://extensions</code> and turn ON <strong>Developer mode</strong> (top right).</span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="flex h-5 w-5 flex-none items-center justify-center rounded-full bg-brand-500/20 text-brand-300 font-bold text-[10px]">3</span>
+                  <span>Click <strong>Load unpacked</strong> and select the unzipped extension folder.</span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="flex h-5 w-5 flex-none items-center justify-center rounded-full bg-brand-500/20 text-brand-300 font-bold text-[10px]">4</span>
+                  <span>Open your Google Flow tab &rarr; click the extension icon in your toolbar &rarr; click <strong>Connect Flow</strong> &rarr; then click &ldquo;Verify &amp; Complete&rdquo; below.</span>
+                </li>
+              </ol>
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-white/5">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  loading={flowConnecting}
+                  onClick={async () => {
+                    setFlowConnecting(true)
+                    try {
+                      toast.loading('Starting handshake...', { id: 'fl-conn' })
+                      const res: any = await flowApi.beginConnect()
+                      const cId = res?.result?.connectionId || res?.connectionId || ''
+                      if (cId) setFlowConnectionId(cId)
+                      toast.success('Handshake armed! Click Connect Flow in the extension, then press Verify.', { id: 'fl-conn' })
+                      await load()
+                    } catch (err: any) {
+                      toast.error(err.message || 'Handshake failed', { id: 'fl-conn' })
+                    } finally {
+                      setFlowConnecting(false)
+                    }
+                  }}
+                >
+                  1. Begin Handshake
+                </Button>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  loading={flowConnecting}
+                  onClick={async () => {
+                    setFlowConnecting(true)
+                    try {
+                      toast.loading('Verifying Flow session & binding personal quota...', { id: 'fl-conn' })
+                      await flowApi.completeConnect({ connectionId: flowConnectionId })
+                      toast.success('Google Flow connected! Personal quota is active.', { id: 'fl-conn' })
+                      if (refreshUser) await refreshUser()
+                      await load()
+                      setFlowModalOpen(false)
+                    } catch (err: any) {
+                      toast.error(err.message || 'Verification failed. Did you click Connect Flow in the extension?', { id: 'fl-conn' })
+                    } finally {
+                      setFlowConnecting(false)
+                    }
+                  }}
+                >
+                  2. Verify &amp; Complete
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-3 text-xs">
+              <p className="text-[11.5px] text-dark-300 leading-relaxed">
+                Export cookies from <a href="https://labs.google/fx" target="_blank" rel="noreferrer" className="text-brand-300 underline font-medium">labs.google/fx</a> using any cookie extension (like Cookie-Editor) or DevTools, and paste the JSON array or cookie string below:
+              </p>
+              <textarea
+                rows={4}
+                value={cookiesInput}
+                onChange={e => setCookiesInput(e.target.value)}
+                placeholder='[{"name":"SID","value":"...","domain":".google.com"},...] or SID=...; HSID=...'
+                className="w-full bg-black/60 border border-white/10 rounded-xl p-2.5 text-xs text-white placeholder-dark-600 focus:outline-none focus:border-brand-500 font-mono"
+              />
+              <div className="flex justify-end gap-2 pt-1 border-t border-white/5">
+                <Button
+                  variant="primary"
+                  size="sm"
+                  loading={flowConnecting}
+                  disabled={!cookiesInput.trim()}
+                  onClick={async () => {
+                    setFlowConnecting(true)
+                    try {
+                      toast.loading('Connecting session via cookies...', { id: 'fl-conn' })
+                      await flowApi.connectCookies(cookiesInput.trim())
+                      toast.success('Google Flow connected successfully! Personal quota is active.', { id: 'fl-conn' })
+                      setCookiesInput('')
+                      if (refreshUser) await refreshUser()
+                      await load()
+                      setFlowModalOpen(false)
+                    } catch (err: any) {
+                      toast.error(err.message || 'Failed to connect cookies', { id: 'fl-conn' })
+                    } finally {
+                      setFlowConnecting(false)
+                    }
+                  }}
+                >
+                  Verify &amp; Link Cookies
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {user?.flowAccountStatus === 'connected' && (
+            <div className="p-3.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold text-emerald-300 flex items-center gap-1.5">
+                  <Check className="w-4 h-4 text-emerald-400" /> Your Personal Google Flow Quota is Active
+                </p>
+                <p className="text-[11px] text-dark-300 mt-0.5">
+                  Linked Account: <code className="font-mono text-white">{user?.flowAccountId}</code> ({user?.flowAccountLabel || user?.name})
+                </p>
+              </div>
+              <Button
+                variant="danger"
+                size="sm"
+                loading={flowConnecting}
+                onClick={async () => {
+                  setFlowConnecting(true)
+                  try {
+                    toast.loading('Unlinking Flow account...', { id: 'fl-conn' })
+                    await flowApi.disconnect()
+                    toast.success('Your Flow account has been unlinked. Switched to shared pool.', { id: 'fl-conn' })
+                    if (refreshUser) await refreshUser()
+                    await load()
+                  } catch (err: any) {
+                    toast.error(err.message || 'Disconnect failed', { id: 'fl-conn' })
+                  } finally {
+                    setFlowConnecting(false)
+                  }
+                }}
+              >
+                Revert to Shared Pool
+              </Button>
+            </div>
+          )}
+        </div>
+      </Modal>
     </div>
   )
 }
@@ -184,16 +480,17 @@ export default function ConnectionsPage() {
 /* ────────────────────────────── the panel ──────────────────────────────── */
 
 function ChannelPanel({
-  channel, busy, setBusy, onClose, onChanged,
+  channel, busy, setBusy, onClose, onChanged, user,
 }: {
   channel: any
   busy: string
   setBusy: (value: string) => void
   onClose: () => void
   onChanged: () => Promise<void> | void
+  user?: any
 }) {
   const [tab, setTab] = useState<'steps' | 'access' | 'automations' | 'activity'>(
-    channel.connection?.status === 'connected' ? 'automations' : 'steps',
+    channel.connection?.status === 'connected' ? 'automations' : 'access',
   )
   const [values, setValues] = useState<Record<string, string>>({})
   const [automations, setAutomations] = useState<Record<string, any>>({
@@ -211,6 +508,10 @@ function ChannelPanel({
   const status = connection?.status || 'not_configured'
 
   const save = async () => {
+    if (!user) {
+      toast.error('Please log in first to connect and save personal channel credentials.')
+      return
+    }
     setBusy('save')
     try {
       const res: any = await channelApi.connect(channel.id, { credentials: values })
@@ -415,6 +716,81 @@ function ChannelPanel({
                 <EmptyState icon={<Info className="h-5 w-5" />} title="No credentials needed" description="Nothing to paste for this channel." />
               ) : (
                 <>
+                  {channel.id === 'youtube' && (
+                    <div className="p-3.5 rounded-xl bg-red-500/10 border border-red-500/20 text-xs text-red-200 space-y-2 mb-2">
+                      <div className="font-semibold text-white flex items-center gap-1.5">
+                        <Youtube className="w-4 h-4 text-red-400" />
+                        <span>Fast 60-Second YouTube Connection:</span>
+                      </div>
+                      <p className="text-[11.5px] text-dark-300 leading-relaxed">
+                        1. Open Google OAuth Playground with scopes <code className="text-cyan-300 font-mono">youtube.upload</code> and <code className="text-cyan-300 font-mono">youtube.force-ssl</code>.<br />
+                        2. Click Authorize APIs &amp; Exchange code for tokens.<br />
+                        3. Paste the generated Access Token below and click Save &amp; Test.
+                      </p>
+                      <a
+                        href="https://developers.google.com/oauthplayground"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1.5 text-xs font-semibold text-red-300 underline hover:text-white"
+                      >
+                        ⚡ 1-Click: Open Google OAuth Playground <ArrowUpRight className="w-3.5 h-3.5" />
+                      </a>
+                    </div>
+                  )}
+
+                  {channel.id === 'tiktok' && (
+                    <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-xs text-rose-200 space-y-2 mb-2">
+                      <div className="font-semibold text-white flex items-center gap-1.5">
+                        <Video className="w-4 h-4 text-rose-400" />
+                        <span>Connect TikTok in 1 Minute:</span>
+                      </div>
+                      <div className="space-y-1.5 text-[11.5px] text-dark-300">
+                        <p><strong>Method A (Easiest &amp; Instant):</strong> Create a free scenario in Make.com, Zapier, or n8n with a Custom Webhook connected to TikTok Video Upload. Paste your webhook URL in the box below!</p>
+                        <p><strong>Method B (TikTok Developers):</strong> Paste your TikTok Creator API Access Token.</p>
+                      </div>
+                    </div>
+                  )}
+
+                  {channel.id === 'facebook_page' && (
+                    <div className="p-3.5 rounded-xl bg-blue-500/10 border border-blue-500/20 text-xs text-blue-200 space-y-2 mb-2">
+                      <div className="font-semibold text-white flex items-center gap-1.5">
+                        <Facebook className="w-4 h-4 text-blue-400" />
+                        <span>Meta Graph API Helper:</span>
+                      </div>
+                      <p className="text-[11.5px] text-dark-300 leading-relaxed">
+                        Generate a Page Access Token with <code className="text-cyan-300">pages_manage_posts</code> and <code className="text-cyan-300">pages_read_engagement</code>.
+                      </p>
+                      <a
+                        href="https://developers.facebook.com/tools/explorer/"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-300 underline hover:text-white"
+                      >
+                        ⚡ Open Meta Graph API Explorer <ArrowUpRight className="w-3.5 h-3.5" />
+                      </a>
+                    </div>
+                  )}
+
+                  {channel.id === 'telegram' && (
+                    <div className="p-3.5 rounded-xl bg-cyan-500/10 border border-cyan-500/20 text-xs text-cyan-200 space-y-2 mb-2">
+                      <div className="font-semibold text-white flex items-center gap-1.5">
+                        <Send className="w-4 h-4 text-cyan-400" />
+                        <span>Telegram Bot Helper:</span>
+                      </div>
+                      <p className="text-[11.5px] text-dark-300 leading-relaxed">
+                        Send <code className="text-cyan-300">/newbot</code> to @BotFather, pick a name, and paste the token below.
+                      </p>
+                      <a
+                        href="https://t.me/BotFather"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1.5 text-xs font-semibold text-cyan-300 underline hover:text-white"
+                      >
+                        ⚡ Open @BotFather on Telegram <ArrowUpRight className="w-3.5 h-3.5" />
+                      </a>
+                    </div>
+                  )}
+
                   {channel.credentials.map((field: any) => (
                     <Field
                       key={field.key}

@@ -207,6 +207,10 @@ function availabilityOf(provider, catalogId) {
   if (!hasKey(provider)) return KEY_MISSING;
   const probed = state.providers[provider];
   if (!probed || !probed.ok) return UNVERIFIED;
+  // No id asked about: UNVERIFIED is the honest answer. (Callers that pass an
+  // unpinned model used to crash here on `undefined.startsWith` and report a
+  // confusing "cloud tier failed" instead of "no model was requested".)
+  if (!catalogId) return UNVERIFIED;
   return liveIdCandidates(provider, catalogId).some(id => probed.ids.has(id))
     ? AVAILABLE
     : OUT_OF_STOCK;
@@ -254,7 +258,9 @@ async function checkServable(provider, catalogId) {
   const availability = availabilityOf(provider, catalogId);
   const probed = state.providers[provider];
   let reason = null;
-  if (availability === OUT_OF_STOCK) {
+  if (!catalogId) {
+    reason = 'no model was requested';
+  } else if (availability === OUT_OF_STOCK) {
     reason = `${catalogId} is not in ${provider}'s live model list`;
   } else if (availability === KEY_MISSING) {
     reason = `no ${provider} API key is configured`;

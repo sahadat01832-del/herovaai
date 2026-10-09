@@ -4,6 +4,7 @@ const WhatsAppMessageSchema = new mongoose.Schema({
   from: { type: String, required: true },
   to: { type: String, required: true },
   body: { type: String, required: true },
+  mediaUrl: { type: String, default: null },
   direction: { type: String, enum: ['incoming', 'outgoing'], required: true },
   status: { type: String, enum: ['pending', 'sent', 'delivered', 'read', 'failed'], default: 'pending' },
   aiGenerated: { type: Boolean, default: false },
@@ -45,6 +46,9 @@ const WhatsAppSessionSchema = new mongoose.Schema({
   // Last connect/handshake failure, so the UI can say why instead of guessing
   lastError: { type: String, default: null },
   lastErrorAt: { type: Date, default: null },
+  // Place in the launch queue while the host is at its browser ceiling. Null unless
+  // this session is waiting for a slot; it starts by itself when one frees.
+  queuePosition: { type: Number, default: null },
   // Analytics
   totalMessagesReceived: { type: Number, default: 0 },
   totalMessagesSent: { type: Number, default: 0 },

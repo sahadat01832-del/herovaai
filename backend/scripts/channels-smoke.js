@@ -20,7 +20,9 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const axios = require('axios');
 
-const API = (process.env.API || `http://127.0.0.1:${process.env.PORT || 5000}`).replace(/\/+$/, '');
+// Number() first: an ambient PORT of "0" (or "") is not a target, and treating it as
+// one made this script report ECONNREFUSED instead of testing the running server.
+const API = (process.env.API || `http://127.0.0.1:${Number(process.env.PORT) || 5000}`).replace(/\/+$/, '');
 const USER = { name: 'Smoke Channels', email: 'smoke-channels@example.test', password: 'SmokeTest!2345' };
 const HOOK_PORT = Number(process.env.HOOK_PORT || 4712);
 const HOOK_PATH = '/hook';

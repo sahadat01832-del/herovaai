@@ -5,10 +5,14 @@ const Conversation = require('../models/Conversation');
 const WhatsAppSession = require('../models/WhatsAppSession');
 const AIMemory = require('../models/AIMemory');
 const bcrypt = require('bcryptjs');
+const appSettings = require('../services/appSettings');
 const keyVault = require('../services/keyVault');
 const googleAuth = require('../services/googleAuth');
 const PaymentOrder = require('../models/PaymentOrder');
+const ChannelConnection = require('../models/ChannelConnection');
 const subs = require('../services/subscriptionService');
+const adminAudit = require('../services/adminAudit');
+const wppConnect = require('../services/wppConnectService');
 const { authenticate, adminOnly } = require('../middleware/auth');
 
 /** Same rule as the user routes: trim, sanity-check, never echo back. */
@@ -27,12 +31,21 @@ router.use(authenticate, adminOnly);
 // ─── Dashboard Stats ───────────────────────────────────────────────────────
 router.get('/stats', async (req, res) => {
   try {
-    const [totalUsers, totalConvos, totalWaSessions, activeWaSessions] = await Promise.all([
+    const [totalUsers, totalConvos, totalWaSessions, activeWaSessions, awaitingReview, channelConnections, tierRows] = await Promise.all([
       User.countDocuments({ role: 'user' }),
       Conversation.countDocuments(),
       WhatsAppSession.countDocuments(),
       WhatsAppSession.countDocuments({ status: 'connected' }),
+      PaymentOrder.countDocuments({ gateway: 'nagad', status: 'awaiting_review' }),
+      ChannelConnection.countDocuments(),
+      // Plan mix, computed by the database rather than by loading every user.
+      User.aggregate([{ $group: { _id: '$subscription.tier', count: { $sum: 1 } } }]),
     ]);
+
+    const tierCounts = tierRows.reduce((acc, row) => {
+      acc[String(row._id || 'free')] = row.count;
+      return acc;
+    }, {});
 
     const recentUsers = await User.find({ role: 'user' })
       .select('name email createdAt lastSeen')
@@ -45,9 +58,19 @@ router.get('/stats', async (req, res) => {
       .sort({ updatedAt: -1 })
       .limit(10);
 
+    // `live` is what the process can actually serve right now — a stored "connected"
+    // status survives a restart, a browser does not. The admin view needs both.
+    const headroom = wppConnect.launchHeadroom();
+
     res.json({
       success: true,
-      stats: { totalUsers, totalConvos, totalWaSessions, activeWaSessions },
+      stats: {
+        totalUsers, totalConvos, totalWaSessions, activeWaSessions,
+        awaitingReview, channelConnections, tierCounts,
+        liveBrowsers: headroom.running,
+        browserCeiling: headroom.ceiling,
+        browserFor: wppConnect.liveSessionReport(),
+      },
       recentUsers,
       recentChats,
     });
@@ -143,6 +166,11 @@ router.put('/users/:id', async (req, res) => {
 
     const user = await User.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true });
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    const changed = [...Object.keys($set), ...Object.keys($unset)];
+    await adminAudit.record({
+      actor: req.user, action: 'user.update', target: user.email,
+      detail: `Changed ${changed.join(', ')}${$set.isActive !== undefined ? ` (now ${$set.isActive ? 'active' : 'suspended'})` : ''}`,
+    });
     res.json({ success: true, user });
   } catch (err) {
     if (err.code === 11000) {
@@ -157,7 +185,33 @@ router.delete('/users/:id', async (req, res) => {
     if (req.params.id === req.user._id.toString()) {
       return res.status(400).json({ success: false, message: 'Cannot delete your own admin account' });
     }
-    await User.findByIdAndDelete(req.params.id);
+    const doomed = await User.findByIdAndDelete(req.params.id).select('email name');
+    // Their WhatsApp sessions and channel links are useless without the account, so they go
+    // too. Leaving them would keep browsers running for a user nobody can log in as.
+    const [sessions, channels, memories, conversations] = await Promise.all([
+      WhatsAppSession.find({ userId: req.params.id }).select('sessionName'),
+      ChannelConnection.countDocuments({ userId: req.params.id }),
+      AIMemory.countDocuments({ userId: req.params.id }),
+      Conversation.countDocuments({ userId: req.params.id }),
+    ]);
+    for (const session of sessions) {
+      // closeSession, not stopSession: a session still waiting for its first scan
+      // has no client object to close, and stopSession would leave a real browser
+      // running for an account that no longer exists.
+      await wppConnect.closeSession(session.sessionName).catch(() => {});
+    }
+    // Everything the account owned goes with it. Leaving the business profile or
+    // past conversations behind left orphan rows nobody could ever open again.
+    await Promise.all([
+      WhatsAppSession.deleteMany({ userId: req.params.id }),
+      ChannelConnection.deleteMany({ userId: req.params.id }),
+      AIMemory.deleteMany({ userId: req.params.id }),
+      Conversation.deleteMany({ userId: req.params.id }),
+    ]);
+    await adminAudit.record({
+      actor: req.user, action: 'user.delete', target: doomed?.email || req.params.id,
+      detail: `Removed account with ${sessions.length} WhatsApp session(s), ${channels} channel(s), ${conversations} conversation(s) and ${memories} memory profile(s)`,
+    });
     res.json({ success: true, message: 'User deleted' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -487,7 +541,6 @@ router.get('/subscriptions', async (req, res) => {
 // validated hard: 11 digits starting 01, no spaces, or it is refused. The RSA
 // keys for automatic confirmation are NOT editable here — they are secrets and
 // belong in backend/.env or the key vault.
-const appSettings = require('../services/appSettings');
 const nagadService = require('../services/nagad');
 
 router.get('/nagad', async (_req, res) => {
@@ -604,6 +657,10 @@ router.post('/payments/:tranId/approve', async (req, res) => {
       reviewerId: req.user._id,
       note: note || `Confirmed by ${req.user.name || req.user.email}`,
     });
+    await adminAudit.record({
+      actor: req.user, action: 'payment.approve', target: order.tranId,
+      detail: `${order.tier} ৳${order.amount} for ${order.userId?._id || order.userId}${result.alreadyPaid ? ' (already paid — no change)' : ''}`,
+    });
     res.json({
       success: true,
       alreadyPaid: Boolean(result.alreadyPaid),
@@ -625,7 +682,377 @@ router.post('/payments/:tranId/reject', async (req, res) => {
     if (!result.ok) {
       return res.status(409).json({ success: false, message: 'That order is already paid — refusing it would not refund the plan. Refund in Nagad instead.' });
     }
+    await adminAudit.record({ actor: req.user, action: 'payment.reject', target: order.tranId, detail: note });
     res.json({ success: true, message: 'Order marked rejected. The customer can submit a new TrxID.' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Platform controls — the switchboard.
+
+   Six switches, four numbers and three plan limits, all live: changing one here
+   takes effect on the next request, with no restart and no .env edit. Every
+   change is written to the audit trail, because a stop button nobody can trace
+   is worse than no button.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const CONTROL_FLAGS = [
+  ['aiReplies', 'Answers customers automatically (WhatsApp + every channel)'],
+  ['autoPosts', 'Publishes the daily scheduled posts'],
+  ['whatsappEnabled', 'Lets owners connect new WhatsApp numbers'],
+  ['channelsEnabled', 'Lets owners connect new channels'],
+  ['signupsOpen', 'Lets new people create an account'],
+  ['paymentsOpen', 'Lets checkout open an order'],
+];
+const CONTROL_NUMBERS = [
+  ['maxActiveWhatsapp', 1, 50, 'Live WhatsApp browsers the server may run at once'],
+  ['channelRepliesPerDay', 1, 5000, 'Automatic channel replies per connection per day'],
+  ['defaultOwnerMuteMinutes', 1, 1440, 'Minutes the AI stays quiet after the owner replies'],
+];
+const PLAN_NAMES = ['free', 'pro', 'enterprise'];
+const PLAN_LIMIT_KEYS = ['whatsapp', 'channels'];
+
+/**
+ * Live browsers joined with their stored session and owner, so the screen can
+ * name who is running what — and offer a stop button that has something to
+ * point at. A browser whose row was deleted between the two reads is kept, with
+ * the owner marked unknown, rather than dropped from a diagnostic view.
+ */
+async function liveBrowsers() {
+  const live = wppConnect.liveSessionReport();
+  if (!live.length) return [];
+  const rows = await WhatsAppSession.find({ sessionName: { $in: live.map((row) => row.sessionName) } })
+    .select('sessionName status userId phoneNumber')
+    .populate('userId', 'name email')
+    .lean();
+  const byName = new Map(rows.map((row) => [row.sessionName, row]));
+  return live.map((entry) => {
+    const row = byName.get(entry.sessionName);
+    return {
+      ...entry,
+      sessionId: row ? String(row._id) : '',
+      storedStatus: row?.status || 'missing',
+      phoneNumber: row?.phoneNumber || '',
+      owner: row?.userId ? { name: row.userId.name, email: row.userId.email } : null,
+    };
+  });
+}
+
+async function controlsPayload() {
+  const controls = appSettings.platform();
+  const headroom = wppConnect.launchHeadroom();
+  const [sessions, channels, awaitingReview, browsers] = await Promise.all([
+    WhatsAppSession.countDocuments(),
+    ChannelConnection.countDocuments(),
+    PaymentOrder.countDocuments({ gateway: 'nagad', status: 'awaiting_review' }),
+    liveBrowsers(),
+  ]);
+  const queue = wppConnect.queueSnapshot();
+  return {
+    controls,
+    live: {
+      running: headroom.running,
+      ceiling: headroom.ceiling,
+      headroom: headroom.headroom,
+      browsers,
+      queue,
+      queued: queue.length,
+      sessions,
+      channels,
+      awaitingReview,
+    },
+    catalogue: {
+      flags: CONTROL_FLAGS.map(([key, label]) => ({ key, label })),
+      numbers: CONTROL_NUMBERS.map(([key, min, max, label]) => ({ key, min, max, label })),
+      plans: PLAN_NAMES.map((tier) => ({ tier, limits: appSettings.DEFAULTS[appSettings.PLATFORM].limits[tier] })),
+    },
+  };
+}
+
+router.get('/controls', async (_req, res) => {
+  try {
+    res.json({ success: true, ...(await controlsPayload()) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.put('/controls', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const patch = {};
+    const changes = [];
+
+    for (const [key] of CONTROL_FLAGS) {
+      if (body[key] === undefined) continue;
+      if (typeof body[key] !== 'boolean') {
+        return res.status(400).json({ success: false, message: `${key} must be true or false` });
+      }
+      patch[key] = body[key];
+      changes.push(`${key} → ${body[key] ? 'on' : 'off'}`);
+    }
+
+    for (const [key, min, max] of CONTROL_NUMBERS) {
+      if (body[key] === undefined) continue;
+      const value = Number(body[key]);
+      if (!Number.isInteger(value) || value < min || value > max) {
+        return res.status(400).json({ success: false, message: `${key} must be a whole number between ${min} and ${max}` });
+      }
+      patch[key] = value;
+      changes.push(`${key} → ${value}`);
+    }
+
+    if (body.notice !== undefined) {
+      if (typeof body.notice !== 'string') {
+        return res.status(400).json({ success: false, message: 'The notice must be text' });
+      }
+      if (body.notice.length > 240) {
+        return res.status(400).json({ success: false, message: 'Keep the notice under 240 characters so it stays readable in the banner.' });
+      }
+      const notice = body.notice.trim();
+      patch.notice = notice;
+      changes.push(notice ? `notice → “${notice.slice(0, 60)}${notice.length > 60 ? '…' : ''}”` : 'notice cleared');
+    }
+
+    if (body.limits !== undefined) {
+      const incoming = body.limits;
+      if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
+        return res.status(400).json({ success: false, message: 'Plan limits must be an object keyed by plan' });
+      }
+      const limits = {};
+      for (const tier of Object.keys(incoming)) {
+        if (!PLAN_NAMES.includes(tier)) {
+          return res.status(400).json({ success: false, message: `Unknown plan “${tier}” — use free, pro or enterprise` });
+        }
+        const row = incoming[tier];
+        if (!row || typeof row !== 'object' || Array.isArray(row)) {
+          return res.status(400).json({ success: false, message: `${tier} limits must be an object` });
+        }
+        const clean = {};
+        for (const key of Object.keys(row)) {
+          if (!PLAN_LIMIT_KEYS.includes(key)) {
+            return res.status(400).json({ success: false, message: `${tier}: “${key}” is not a limit you can set (use ${PLAN_LIMIT_KEYS.join(' or ')})` });
+          }
+          const value = Number(row[key]);
+          if (!Number.isInteger(value) || value < 1 || value > 50) {
+            return res.status(400).json({ success: false, message: `${tier}.${key} must be a whole number between 1 and 50` });
+          }
+          clean[key] = value;
+        }
+        if (Object.keys(clean).length) limits[tier] = clean;
+      }
+      if (Object.keys(limits).length) {
+        patch.limits = limits;
+        changes.push(`limits → ${Object.entries(limits).map(([tier, row]) => `${tier}: ${Object.entries(row).map(([k, v]) => `${k}=${v}`).join('/')}`).join(', ')}`);
+      }
+    }
+
+    if (!Object.keys(patch).length) {
+      return res.status(400).json({ success: false, message: 'Nothing to change' });
+    }
+
+    const saved = await appSettings.set(appSettings.PLATFORM, patch, { userId: req.user._id });
+    await adminAudit.record({
+      actor: req.user,
+      action: 'settings.update',
+      target: Object.keys(patch).join(','),
+      detail: changes.join(' · ').slice(0, 400),
+    });
+
+    // Raising the browser limit should start the owners who were waiting NOW,
+    // not at the next sweep — the queue is the promise that nobody has to ask twice.
+    if (patch.maxActiveWhatsapp !== undefined) {
+      void wppConnect.drainLaunchQueue().catch(() => {});
+    }
+
+    res.json({ success: true, controls: saved, changes, ...(await controlsPayload()), message: 'Saved — this is live now.' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/** The trail behind the buttons: who turned what off, stopped which session. */
+/* ─── Per-owner usage: who is actually being answered, and what is left ─── */
+// One row per account, built from counters the running system already keeps — no
+// scanning of message arrays, so this stays fast as conversations grow. "Sent"
+// includes AI replies; the channel columns are the assistant's own receipts.
+router.get('/usage', async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 500);
+
+    const [users, sessionRows, channelRows] = await Promise.all([
+      User.find({ role: { $in: ['user', 'admin'] } })
+        .select('name email role isActive subscription tokenQuota lastSeen createdAt')
+        .sort({ createdAt: -1 })
+        .limit(limit),
+      WhatsAppSession.aggregate([{
+        $group: {
+          _id: '$userId',
+          sessions: { $sum: 1 },
+          connected: { $sum: { $cond: [{ $eq: ['$status', 'connected'] }, 1, 0] } },
+          queued: { $sum: { $cond: [{ $gt: ['$queuePosition', null] }, 1, 0] } },
+          received: { $sum: '$totalMessagesReceived' },
+          sent: { $sum: '$totalMessagesSent' },
+          lastActiveAt: { $max: '$lastActive' },
+        },
+      }]),
+      ChannelConnection.aggregate([{
+        $group: {
+          _id: '$userId',
+          channels: { $sum: 1 },
+          connected: { $sum: { $cond: [{ $eq: ['$status', 'connected'] }, 1, 0] } },
+          replies: { $sum: '$stats.repliesSent' },
+          repliesToday: { $sum: '$stats.repliesToday' },
+          posts: { $sum: '$stats.postsSent' },
+          inbound: { $sum: { $cond: [{ $gt: ['$stats.lastInboundAt', null] }, 1, 0] } },
+          lastInboundAt: { $max: '$stats.lastInboundAt' },
+        },
+      }]),
+    ]);
+
+    const sessionsBy = new Map(sessionRows.map((row) => [String(row._id), row]));
+    const channelsBy = new Map(channelRows.map((row) => [String(row._id), row]));
+
+    const rows = users.map((user) => {
+      const id = String(user._id);
+      const tier = user.subscription?.tier || 'free';
+      const session = sessionsBy.get(id) || { sessions: 0, connected: 0, queued: 0, received: 0, sent: 0, lastActiveAt: null };
+      const channel = channelsBy.get(id) || { channels: 0, connected: 0, replies: 0, repliesToday: 0, posts: 0, inbound: 0, lastInboundAt: null };
+      const live = wppConnect.liveCountForUser(user._id);
+      const queuePosition = wppConnect.queueSnapshot()
+        .filter((entry) => entry.userId === id)
+        .map((entry) => entry.position)[0] || null;
+      const tokensUsed = user.tokenQuota?.tokensUsed7d || 0;
+      const tokensLimit = user.tokenQuota?.weeklyLimit || 0;
+      const whatsappLimit = appSettings.limitFor(tier, 'whatsapp');
+      const channelLimit = appSettings.limitFor(tier, 'channels');
+
+      return {
+        id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        active: user.isActive !== false,
+        tier,
+        createdAt: user.createdAt,
+        whatsapp: {
+          sessions: session.sessions,
+          connected: session.connected,
+          live,
+          queued: session.queued,
+          queuePosition,
+          received: session.received,
+          sent: session.sent,
+          lastActiveAt: session.lastActiveAt,
+          limit: whatsappLimit,
+          left: Math.max(0, whatsappLimit - session.sessions),
+        },
+        channels: {
+          total: channel.channels,
+          connected: channel.connected,
+          replies: channel.replies,
+          repliesToday: channel.repliesToday,
+          waiting: Math.max(0, channel.inbound - channel.replies),
+          posts: channel.posts,
+          lastInboundAt: channel.lastInboundAt,
+          limit: channelLimit,
+          left: Math.max(0, channelLimit - channel.channels),
+        },
+        tokens: { used: tokensUsed, limit: tokensLimit, percent: tokensLimit ? Math.round((tokensUsed / tokensLimit) * 100) : 0 },
+        lastSeen: user.lastSeen,
+      };
+    });
+
+    const totals = rows.reduce((acc, row) => ({
+      accounts: acc.accounts + 1,
+      whatsappSessions: acc.whatsappSessions + row.whatsapp.sessions,
+      whatsappLive: acc.whatsappLive + row.whatsapp.live,
+      whatsappQueued: acc.whatsappQueued + row.whatsapp.queued,
+      channels: acc.channels + row.channels.total,
+      received: acc.received + row.whatsapp.received,
+      sent: acc.sent + row.whatsapp.sent,
+      channelReplies: acc.channelReplies + row.channels.replies,
+      posts: acc.posts + row.channels.posts,
+      tokensUsed: acc.tokensUsed + row.tokens.used,
+    }), {
+      accounts: 0, whatsappSessions: 0, whatsappLive: 0, whatsappQueued: 0,
+      channels: 0, received: 0, sent: 0, channelReplies: 0, posts: 0, tokensUsed: 0,
+    });
+
+    res.json({
+      success: true,
+      generatedAt: new Date(),
+      totals: { ...totals, ceiling: wppConnect.launchHeadroom().ceiling },
+      queue: wppConnect.queueSnapshot(),
+      rows: rows.sort((a, b) => (
+        (b.whatsapp.received + b.channels.replies) - (a.whatsapp.received + a.channels.replies)
+      )),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.get('/audit', async (req, res) => {
+  try {
+    res.json({ success: true, actions: await adminAudit.list({ limit: req.query.limit }) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/** Which sessions have a browser behind them right now — per owner. */
+router.get('/whatsapp/live', async (_req, res) => {
+  try {
+    const headroom = wppConnect.launchHeadroom();
+    res.json({ success: true, ...headroom, sessions: await liveBrowsers() });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * Force-stop one owner's WhatsApp browser. The login is kept (the profile stays
+ * on disk), so reconnecting the session only means scanning again — and the
+ * owner is told a human did it, not that something broke.
+ */
+router.post('/whatsapp/sessions/:id/stop', async (req, res) => {
+  try {
+    const session = await WhatsAppSession.findById(req.params.id).populate('userId', 'name email');
+    if (!session) return res.status(404).json({ success: false, message: 'Session not found' });
+
+    const reason = String(req.body?.reason || '').slice(0, 200);
+    const ownerEmail = session.userId?.email || '';
+
+    // closeSession (profile kept) rather than stopSession: it also sweeps a browser
+    // that is still waiting for a scan, which has no client handle to close. The
+    // promise to the owner — "nothing was deleted, just scan again" — stays true.
+    await wppConnect.closeSession(session.sessionName);
+    session.status = 'disconnected';
+    session.qrCode = null;
+    session.lastError = `Stopped by an administrator${reason ? `: ${reason}` : ''}. Reconnect to scan the QR again — nothing was deleted.`;
+    session.lastErrorAt = new Date();
+    await session.save();
+
+    await adminAudit.record({
+      actor: req.user,
+      action: 'session.stop',
+      target: session.sessionName,
+      detail: `${ownerEmail || 'unknown owner'}${reason ? ` — ${reason}` : ''}`,
+    });
+
+    const ownerId = session.userId?._id || session.userId;
+    if (req.io && ownerId) {
+      req.io.to(`user-${ownerId}`).emit('whatsapp-status', {
+        sessionName: session.sessionName,
+        status: 'disconnected',
+        error: session.lastError,
+      });
+    }
+
+    res.json({ success: true, message: 'Browser stopped. The owner can reconnect when they are ready.', sessionId: String(session._id) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

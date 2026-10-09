@@ -8,6 +8,20 @@ const ssl = require('../services/sslcommerz');
 const nagad = require('../services/nagad');
 const plans = require('../config/plans');
 const subs = require('../services/subscriptionService');
+const appSettings = require('../services/appSettings');
+
+/**
+ * Checkout can be switched off from the admin panel (wrong wallet, Nagad outage,
+ * stock changes). Refusing to OPEN an order is the point — a live payment link
+ * that cannot complete is worse than a closed shop that says so.
+ */
+function paymentsOpenGuard(_req, res, next) {
+  if (appSettings.flag('paymentsOpen')) return next();
+  return res.status(503).json({
+    success: false,
+    message: 'Checkout is paused right now — your plan is unchanged. Please try again shortly.',
+  });
+}
 
 /**
  * Payments — three plans, priced in taka.
@@ -48,6 +62,7 @@ router.get('/plans', (_req, res) => {
     success: true,
     currency: plans.CURRENCY,
     plans: plans.publicPlans(),
+    checkoutOpen: appSettings.flag('paymentsOpen'),
     gateways: {
       nagad: nagad.mode().manual ? 'available' : 'unconfigured',
       nagadAuto: nagad.autoReady(),
@@ -78,7 +93,7 @@ router.get('/nagad/config', authenticate, (_req, res) => {
  * gateway page); without them the buyer is told where to send the money and the
  * order waits for the TrxID.
  */
-router.post('/nagad/order', authenticate, async (req, res) => {
+router.post('/nagad/order', authenticate, paymentsOpenGuard, async (req, res) => {
   try {
     const tier = String(req.body?.tier || '').trim();
     if (!paidTier(tier)) {
@@ -281,7 +296,7 @@ router.post('/nagad/verify/:tranId', authenticate, async (req, res) => {
 
 /* ─────────────────────────── SSLCommerz (cards) ────────────────────────── */
 
-router.post('/init', authenticate, async (req, res) => {
+router.post('/init', authenticate, paymentsOpenGuard, async (req, res) => {
   try {
     const { tier } = req.body || {};
     if (!paidTier(tier)) {

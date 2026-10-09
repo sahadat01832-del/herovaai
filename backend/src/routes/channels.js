@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { authenticate } = require('../middleware/auth');
+const { authenticate, optionalAuth } = require('../middleware/auth');
 const ChannelConnection = require('../models/ChannelConnection');
 const registry = require('../services/channels/registry');
 const adapters = require('../services/channels/adapters');
@@ -19,9 +19,10 @@ const channelService = require('../services/channelService');
 
 /* ───────────────────────────── owner surface ───────────────────────────── */
 
-router.get('/', authenticate, async (req, res) => {
+router.get('/', optionalAuth, async (req, res) => {
   try {
-    const channels = await channelService.listFor(req.user._id);
+    const userId = req.user?._id || null;
+    const channels = await channelService.listFor(userId);
     res.json({ success: true, channels, publicBase: channelService.publicBase(), replyCap: channelService.DAILY_REPLY_CAP });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

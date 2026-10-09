@@ -39,7 +39,18 @@ export interface User {
   hasContentbotApiKey?: boolean
   contentbotApiKeyMasked?: string
   businessInfo?: Record<string, string>
-  chatSettings?: { model: string; temperature: number; systemPrompt: string }
+  chatSettings?: {
+    model: string
+    temperature: number
+    systemPrompt: string
+    flowImageModel?: string
+    flowVideoModel?: string
+    flowAspectRatio?: string
+  }
+  flowAccountId?: string | null
+  flowAccountLabel?: string | null
+  flowAccountStatus?: 'unlinked' | 'connected' | 'needs_attention'
+  flowAccountConnectedAt?: string | null
   subscription?: {
     tier: string
     status: string

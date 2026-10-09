@@ -19,10 +19,10 @@ export const chatApi = {
     apiRequest<any>('/chat/conversations', { method: 'POST', body: JSON.stringify({ mode, model, skill }) }),
   deleteConversation: (id: string) =>
     apiRequest<any>(`/chat/conversations/${id}`, { method: 'DELETE' }),
-  sendMessage: (conversationId: string, message: string, mode?: string, model?: string, attachments?: any[], skill?: string, signal?: AbortSignal) =>
+  sendMessage: (conversationId: string, message: string, mode?: string, model?: string, attachments?: any[], skill?: string, signal?: AbortSignal, options?: { flowModel?: string; flowAspectRatio?: string }) =>
     apiRequest<any>(`/chat/conversations/${conversationId}/message`, {
       method: 'POST',
-      body: JSON.stringify({ message, mode, model, attachments, skill }),
+      body: JSON.stringify({ message, mode, model, attachments, skill, ...options }),
       signal,
     }),
   /** Stop an in-flight reply (backend aborts the upstream AI request too). */
@@ -201,6 +201,13 @@ export const whatsappApi = {
     apiRequest<any>(`/whatsapp/sessions/${id}/customers/${encodeURIComponent(customer)}/mute`),
 }
 
+// ─── Platform status (public switches) ─────────────────────────────────────
+// What the admin has switched off, so the UI can say so instead of letting a
+// button fail. Nothing here is private: a notice string and five booleans.
+export const platformApi = {
+  status: () => apiRequest<any>('/platform/status', { cache: 'no-store' }),
+}
+
 // ─── Admin ─────────────────────────────────────────────────────────────────
 export const adminApi = {
   getStats: () => apiRequest<any>('/admin/stats'),
@@ -244,6 +251,20 @@ export const adminApi = {
   resetUserTokens: (id: string) =>
     apiRequest<any>(`/admin/users/${id}/reset-tokens`, { method: 'POST' }),
 
+  // Platform switchboard: the stop buttons, the plan limits and the audit trail.
+  getControls: () => apiRequest<any>('/admin/controls', { cache: 'no-store' }),
+  updateControls: (data: Record<string, any>) =>
+    apiRequest<any>('/admin/controls', { method: 'PUT', body: JSON.stringify(data) }),
+  getAudit: (limit?: number) =>
+    apiRequest<any>(`/admin/audit${limit ? `?limit=${limit}` : ''}`, { cache: 'no-store' }),
+  /** Per-owner usage: sessions, messages answered, channel replies, plan headroom. */
+  getUsage: (limit?: number) =>
+    apiRequest<any>(`/admin/usage${limit ? `?limit=${limit}` : ''}`, { cache: 'no-store' }),
+  getLiveWhatsapp: () => apiRequest<any>('/admin/whatsapp/live', { cache: 'no-store' }),
+  /* Stop one owner's WhatsApp browser without touching their login. */
+  stopWhatsappSession: (id: string, reason?: string) =>
+    apiRequest<any>(`/admin/whatsapp/sessions/${id}/stop`, { method: 'POST', body: JSON.stringify({ reason }) }),
+
   /** Google sign-in readiness plus the two URLs to paste into Google Cloud Console. */
   getGoogleSignin: () => apiRequest<any>('/admin/google-signin'),
 
@@ -259,3 +280,31 @@ export const adminApi = {
   testApiKey: (data: { id?: string; envName?: string; value?: string }) =>
     apiRequest<any>('/admin/api-keys/test', { method: 'POST', body: JSON.stringify(data) }),
 }
+
+// ─── Google Flow MCP ───────────────────────────────────────────────────────
+export const flowApi = {
+  /** Get Flow MCP status, connection readiness, and model capabilities */
+  getStatus: () => apiRequest<any>('/flow/status', { cache: 'no-store' }),
+  /** Get available Flow models and aspect ratios */
+  getModels: () => apiRequest<any>('/flow/models', { cache: 'no-store' }),
+  /** Generate an image or video using Google Flow MCP */
+  generate: (data: { prompt: string; mediaType?: 'image' | 'video'; duration?: number; ratio?: string; model?: string }) =>
+    apiRequest<any>('/flow/generate', { method: 'POST', body: JSON.stringify(data) }),
+  /** Begin Google Flow account connection handshake */
+  beginConnect: () => apiRequest<any>('/flow/connect/begin', { method: 'POST' }),
+  /** Complete Google Flow account connection handshake */
+  completeConnect: (data?: { connectionId?: string }) =>
+    apiRequest<any>('/flow/connect/complete', { method: 'POST', body: JSON.stringify(data || {}) }),
+  /** Connect Google Flow via cookies / session */
+  connectCookies: (rawCookies: string | any[]) =>
+    apiRequest<any>('/flow/connect/cookies', { method: 'POST', body: JSON.stringify({ rawCookies }) }),
+  /** Disconnect Google Flow account */
+  disconnect: () => apiRequest<any>('/flow/connect/disconnect', { method: 'POST' }),
+  /** AI Auto-Generate Social Post (Hook, Caption, 10-15 #tags, CTA, Thumbnail recommendation) */
+  generatePost: (data: { mediaUrl: string; prompt: string; platform?: string; customTopic?: string }) =>
+    apiRequest<any>('/flow/generate-post', { method: 'POST', body: JSON.stringify(data) }),
+  /** Push/Publish post directly to connected channel */
+  publishPost: (data: { channelId: string; text: string; mediaUrl?: string }) =>
+    apiRequest<any>('/flow/publish-post', { method: 'POST', body: JSON.stringify(data) }),
+}
+

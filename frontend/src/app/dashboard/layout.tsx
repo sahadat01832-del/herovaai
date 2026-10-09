@@ -4,12 +4,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter, usePathname } from 'next/navigation'
 import Link from 'next/link'
 import {
-  Banknote, BarChart3, Brain, ChevronLeft, ChevronRight, CreditCard, KeyRound, LayoutDashboard,
-  LogOut, Menu, MessageSquare, Plug, Plus, Search, Settings, Shield, Smartphone, Sparkles,
-  Users, X, Zap,
+  Activity, Banknote, BarChart3, Brain, ChevronLeft, ChevronRight, CreditCard, KeyRound, LayoutDashboard,
+  LogOut, Megaphone, Menu, MessageSquare, Plug, Plus, Search, Settings, Shield, SlidersHorizontal,
+  Smartphone, Sparkles, Users, X, Zap,
 } from 'lucide-react'
 import { AuthProvider, useAuth } from '@/contexts/AuthContext'
-import { chatApi } from '@/lib/api'
+import { chatApi, platformApi } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { compactNumber, percent } from '@/lib/format'
 import { useHotkey, useMediaQuery, useScrollLock } from '@/lib/hooks'
@@ -48,6 +48,8 @@ const ACCOUNT: NavItem[] = [
 ]
 
 const ADMIN: NavItem[] = [
+  { href: '/dashboard/admin/controls', icon: SlidersHorizontal, label: 'Controls', hint: 'Switches, limits and the audit trail' },
+  { href: '/dashboard/admin/usage',    icon: Activity,     label: 'Usage',        hint: 'Who is being answered, and what is left' },
   { href: '/dashboard/admin/users',    icon: Users,       label: 'Users & Plans', hint: 'Accounts and tiers' },
   { href: '/dashboard/admin/payments', icon: Banknote,    label: 'Payments',      hint: 'Nagad orders and the wallet number' },
   { href: '/dashboard/admin/api-keys', icon: KeyRound,    label: 'API Keys',      hint: 'Provider key vault' },
@@ -67,7 +69,10 @@ const MOBILE_NAV = [
 function useBreadcrumb(pathname: string) {
   return useMemo(() => {
     if (pathname.startsWith('/dashboard/admin/api-keys')) return { section: 'Admin', page: 'API Keys' }
+    if (pathname.startsWith('/dashboard/admin/controls')) return { section: 'Admin', page: 'Controls' }
+    if (pathname.startsWith('/dashboard/admin/usage'))    return { section: 'Admin', page: 'Usage' }
     if (pathname.startsWith('/dashboard/admin/users'))    return { section: 'Admin', page: 'Users & Plans' }
+    if (pathname.startsWith('/dashboard/admin/payments')) return { section: 'Admin', page: 'Payments' }
     if (pathname.startsWith('/dashboard/admin'))          return { section: 'Admin', page: 'Overview' }
     const all = [...WORKSPACE, ...ACCOUNT]
     const match = all
@@ -79,7 +84,9 @@ function useBreadcrumb(pathname: string) {
 
 function isActive(pathname: string, href: string): boolean {
   if (href === '/dashboard') return pathname === '/dashboard'
-  if (href === '/dashboard/admin/users') return pathname.startsWith('/dashboard/admin/users') || pathname === '/dashboard/admin'
+  if (href === '/dashboard/admin/controls') return pathname.startsWith('/dashboard/admin/controls')
+  if (href === '/dashboard/admin/usage') return pathname.startsWith('/dashboard/admin/usage')
+  if (href === '/dashboard/admin/users') return pathname.startsWith('/dashboard/admin/users')
   return pathname === href || pathname.startsWith(`${href}/`)
 }
 
@@ -407,8 +414,21 @@ function Shell({ children }: { children: React.ReactNode }) {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [quota, setQuota] = useState<{ used: number; limit: number; tier: string } | null>(null)
+  const [notice, setNotice] = useState('')
+  const [noticeHidden, setNoticeHidden] = useState(false)
 
   useScrollLock(drawerOpen)
+
+  // The owner's notice banner, from the admin Controls screen. One fetch when the
+  // shell mounts is enough — it is a message, not a live feed.
+  useEffect(() => {
+    if (!user) return
+    let alive = true
+    platformApi.status()
+      .then((d: any) => { if (alive) setNotice(String(d?.status?.notice || '')) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [user])
 
   useEffect(() => {
     if (!loading && !user) router.push('/login')
@@ -521,6 +541,15 @@ function Shell({ children }: { children: React.ReactNode }) {
         )}
       >
         <div className="mx-auto w-full max-w-[1400px] px-4 py-5 sm:px-6 sm:py-6">
+          {notice && !noticeHidden ? (
+            <div className="mb-4 flex items-start gap-3 rounded-2xl border border-brand-400/25 bg-brand-400/[0.07] px-4 py-3">
+              <Megaphone className="mt-0.5 h-4 w-4 flex-none text-brand-300" aria-hidden />
+              <p className="flex-1 text-[12.5px] leading-relaxed text-dark-200">{notice}</p>
+              <IconButton label="Dismiss notice" onClick={() => setNoticeHidden(true)}>
+                <X className="h-3.5 w-3.5" />
+              </IconButton>
+            </div>
+          ) : null}
           <PageTransition>{children}</PageTransition>
         </div>
       </main>

@@ -12,6 +12,7 @@ import { useAuth } from '@/contexts/AuthContext'
 import toast from 'react-hot-toast'
 import ReactMarkdown from 'react-markdown'
 import Link from 'next/link'
+import { PushPostModal } from '@/components/PushPostModal'
 
 interface Attachment { name: string; mimeType: string; data: string; size: number }
 interface Artifact   { title: string; type: string; code: string; language: string }
@@ -30,6 +31,7 @@ interface AIModel {
 
 const SKILL_OPTIONS = [
   { id: 'general',    name: 'General AI',    icon: Bot,       desc: 'Conversational assistant',        color: 'text-cyan-400' },
+  { id: 'flow',       name: 'Google Flow',    icon: Sparkles,  desc: 'Veo videos & Nano images',       color: 'text-emerald-400' },
   { id: 'webapp',     name: 'Web App',        icon: Globe,     desc: 'Single-file HTML/Tailwind apps', color: 'text-blue-400' },
   { id: 'game',       name: 'HTML5 Game',     icon: Gamepad2,  desc: 'Playable canvas games',          color: 'text-purple-400' },
   { id: 'program',    name: 'Code Tool',      icon: Code2,     desc: 'Scripts & utilities',            color: 'text-green-400' },
@@ -62,6 +64,16 @@ export default function ChatPage() {
   const [skillPickerOpen, setSkillPickerOpen] = useState(false)
   const [modePickerOpen, setModePickerOpen] = useState(false)
 
+  // Google Flow Media Settings (Nano Banana 2 & Omni Flash 1.1 Defaults)
+  const [flowModel, setFlowModel] = useState<string>('nano-banana-2')
+  const [flowAspectRatio, setFlowAspectRatio] = useState<string>('16:9')
+  const [flowMediaType, setFlowMediaType] = useState<'image' | 'video'>('image')
+
+  // Push Post with AI (Auto-Publish to Social Channels)
+  const [pushPostOpen, setPushPostOpen] = useState(false)
+  const [pushPostMediaUrl, setPushPostMediaUrl] = useState('')
+  const [pushPostPrompt, setPushPostPrompt] = useState('')
+
   const bottomRef    = useRef<HTMLDivElement>(null)
   const textareaRef  = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -89,6 +101,14 @@ export default function ChatPage() {
     document.addEventListener('mousedown', h)
     return () => document.removeEventListener('mousedown', h)
   }, [])
+
+  useEffect(() => {
+    if ((user as any)?.chatSettings) {
+      const cs = (user as any).chatSettings
+      if (cs.flowImageModel) setFlowModel(cs.flowImageModel)
+      if (cs.flowAspectRatio) setFlowAspectRatio(cs.flowAspectRatio)
+    }
+  }, [user])
 
   const loadQuota = async () => { try { const r: any = await chatApi.getQuota(); if (r.success) setTokenQuota(r.quota) } catch {} }
 
@@ -164,7 +184,19 @@ export default function ChatPage() {
     const controller = new AbortController()
     abortRef.current = controller
     try {
-      const d: any = await chatApi.sendMessage(convId!, currentInput, mode, selectedModel, currentAttachments, selectedSkill, controller.signal)
+      const d: any = await chatApi.sendMessage(
+        convId!,
+        currentInput,
+        mode,
+        selectedModel,
+        currentAttachments,
+        selectedSkill,
+        controller.signal,
+        {
+          flowModel,
+          flowAspectRatio,
+        }
+      )
       setMessages(prev => [...prev, d.aiMessage]); loadQuota()
       if (d.artifacts?.length > 0) toast.success(`✨ ${d.artifacts.length} artifact generated! Tap Run to preview.`)
       setConversations(prev => prev.map(c => c._id === convId ? { ...c, title: (currentInput || 'File').slice(0, 40) } : c))
@@ -267,11 +299,11 @@ export default function ChatPage() {
     </div>
   )
 
+  // Fills the shell's content area instead of the whole viewport: the dashboard chrome owns
+  // the outer scroll, so a nested 100vh here produced a second scrollbar and a dead strip.
+  // `dvh` keeps the composer above the mobile browser chrome, and the shorter mobile height
+  // reserves room for the fixed bottom navigation.
   return (
-    // Fills the shell's content area instead of the whole viewport: the dashboard chrome owns
-    // the outer scroll, so a nested 100vh here produced a second scrollbar and a dead strip.
-    // `dvh` keeps the composer above the mobile browser chrome, and the shorter mobile height
-    // reserves room for the fixed bottom navigation.
     <div className="card chat-shell flex overflow-hidden p-0">
 
       {/* ── Desktop sidebar ── */}
@@ -338,8 +370,9 @@ export default function ChatPage() {
                 {mode === 'api' ? 'All models free · 1M tokens / 7 days' : 'Local models · No quota · Auto RAM-free'}
               </p>
               {/* Quick starters */}
-              <div className="grid grid-cols-2 gap-2 max-w-sm w-full text-left">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-w-lg w-full text-left">
                 {[
+                  { skill: 'flow', icon: Sparkles, text: 'Google Flow Video/Photo', color: 'text-emerald-400', bg: 'rgba(16,185,129,0.08)', border: 'rgba(16,185,129,0.22)' },
                   { skill: 'game', icon: Gamepad2, text: 'Build a Flappy Bird clone', color: 'text-purple-400', bg: 'rgba(124,58,237,0.07)', border: 'rgba(124,58,237,0.18)' },
                   { skill: 'webapp', icon: Globe, text: 'Create a web app UI', color: 'text-blue-400', bg: 'rgba(6,182,212,0.06)', border: 'rgba(6,182,212,0.18)' },
                   { skill: 'visualizer', icon: BarChart3, text: 'Build a data dashboard', color: 'text-amber-400', bg: 'rgba(245,158,11,0.06)', border: 'rgba(245,158,11,0.18)' },
@@ -378,7 +411,68 @@ export default function ChatPage() {
                   )}
 
                   {msg.role === 'assistant'
-                    ? <div className="prose prose-invert prose-sm max-w-none break-words leading-relaxed"><ReactMarkdown>{msg.content}</ReactMarkdown></div>
+                    ? (
+                      <div className="prose prose-invert prose-sm max-w-none break-words leading-relaxed space-y-2">
+                        <ReactMarkdown
+                          components={{
+                            img: ({ src, alt }) => {
+                              const s = String(src || '')
+                              return (
+                                <div className="my-2.5 space-y-2">
+                                  <img
+                                    src={s}
+                                    alt={alt || 'Generated Media'}
+                                    className="rounded-xl border border-white/10 max-h-96 object-cover shadow-lg"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setPushPostMediaUrl(s)
+                                      setPushPostPrompt(messages[i - 1]?.content || '')
+                                      setPushPostOpen(true)
+                                    }}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-black bg-gradient-to-r from-emerald-400 to-cyan-400 hover:opacity-90 shadow transition-all cursor-pointer"
+                                  >
+                                    <Send className="w-3.5 h-3.5" /> 🚀 Push Post with AI
+                                  </button>
+                                </div>
+                              )
+                            }
+                          }}
+                        >
+                          {msg.content}
+                        </ReactMarkdown>
+
+                        {/* Video detection if generated via Omni Flash or Veo */}
+                        {(() => {
+                          const vMatch = msg.content.match(/(?:https?:\/\/[^\s)]+|\/api\/media\/[^\s)]+)\.(mp4|webm|mov)/i)
+                          if (vMatch) {
+                            const vUrl = vMatch[0]
+                            return (
+                              <div className="my-2.5 space-y-2">
+                                <video
+                                  src={vUrl}
+                                  controls
+                                  className="rounded-xl border border-white/10 max-h-80 w-full object-cover shadow-lg bg-black"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setPushPostMediaUrl(vUrl)
+                                    setPushPostPrompt(messages[i - 1]?.content || '')
+                                    setPushPostOpen(true)
+                                  }}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-black bg-gradient-to-r from-cyan-400 to-emerald-400 hover:opacity-90 shadow transition-all cursor-pointer"
+                                >
+                                  <Send className="w-3.5 h-3.5" /> 🚀 Push Video Post with AI
+                                </button>
+                              </div>
+                            )
+                          }
+                          return null
+                        })()}
+                      </div>
+                    )
                     : <div className="whitespace-pre-wrap leading-relaxed">{msg.content}</div>
                   }
 
@@ -558,6 +652,90 @@ export default function ChatPage() {
             </div>
           </div>
 
+          {/* ── Google Flow Media Controls (active when Flow skill is chosen) ── */}
+          {selectedSkill === 'flow' && (
+            <div className="mx-3 mb-2 px-3 py-2 rounded-xl flex flex-wrap items-center justify-between gap-2 border border-emerald-500/25 bg-emerald-950/25 text-xs animate-fade-in shadow-inner">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <span className="flex items-center gap-1 font-semibold text-emerald-400">
+                  <Sparkles className="w-3.5 h-3.5" /> Google Flow
+                </span>
+
+                {/* Media Type Toggle */}
+                <div className="flex items-center bg-black/40 rounded-lg p-0.5 border border-white/10">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFlowMediaType('image')
+                      if (flowModel.includes('omni') || flowModel.includes('veo')) setFlowModel('nano-banana-2')
+                    }}
+                    className={`px-2 py-0.5 rounded text-[11px] font-medium transition-all ${
+                      flowMediaType === 'image' ? 'bg-emerald-500 text-black font-semibold shadow-sm' : 'text-dark-400 hover:text-white'
+                    }`}
+                  >
+                    Image
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFlowMediaType('video')
+                      if (flowModel.includes('banana')) setFlowModel('omni-flash')
+                    }}
+                    className={`px-2 py-0.5 rounded text-[11px] font-medium transition-all ${
+                      flowMediaType === 'video' ? 'bg-cyan-500 text-black font-semibold shadow-sm' : 'text-dark-400 hover:text-white'
+                    }`}
+                  >
+                    Video
+                  </button>
+                </div>
+
+                {/* Model Selector */}
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] text-dark-400">Model:</span>
+                  <select
+                    value={flowModel}
+                    onChange={e => setFlowModel(e.target.value)}
+                    className="bg-black/70 border border-emerald-500/30 rounded-lg px-2.5 py-1 text-xs text-white focus:outline-none focus:border-emerald-400"
+                  >
+                    {flowMediaType === 'image' ? (
+                      <>
+                        <option value="nano-banana-2">Nano Banana 2 (2.1) — Default</option>
+                        <option value="nano-banana-pro">Nano Banana Pro — Max Quality</option>
+                        <option value="nano-banana-2-lite">Nano Banana 2 Lite — Fast</option>
+                        <option value="ui-default">Workspace Default</option>
+                      </>
+                    ) : (
+                      <>
+                        <option value="omni-flash">Omni Flash 1.1 — Default Video</option>
+                        <option value="veo-3-1-quality">Veo 3.1 Quality — Cinematic</option>
+                        <option value="veo-3-1-fast">Veo 3.1 Fast — Quick Clips</option>
+                        <option value="ui-default">Workspace Default</option>
+                      </>
+                    )}
+                  </select>
+                </div>
+
+                {/* Ratio Selector */}
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] text-dark-400">Ratio:</span>
+                  <select
+                    value={flowAspectRatio}
+                    onChange={e => setFlowAspectRatio(e.target.value)}
+                    className="bg-black/70 border border-white/10 rounded-lg px-2 py-1 text-xs text-white focus:outline-none focus:border-emerald-400"
+                  >
+                    <option value="16:9">16:9 Landscape</option>
+                    <option value="9:16">9:16 Vertical (Reels)</option>
+                    <option value="1:1">1:1 Square (Feed)</option>
+                    <option value="4:3">4:3 Standard</option>
+                  </select>
+                </div>
+              </div>
+
+              <span className="text-[10px] text-emerald-400/80 font-mono hidden md:inline">
+                Zero API Cost · Linked via Google Flow Bridge
+              </span>
+            </div>
+          )}
+
           {/* ── Input + attach + send ── */}
           <div className="flex gap-2 px-3 pb-3 pt-1">
             <input ref={fileInputRef as any} type="file" multiple onChange={handleFileUpload} className="hidden" accept="image/*,video/*,.pdf,.doc,.docx,.txt,.json,.csv,.js,.py,.html" />
@@ -572,7 +750,13 @@ export default function ChatPage() {
 
             {/* Text input */}
             <textarea ref={textareaRef} value={input} onChange={e => setInput(e.target.value)} onKeyDown={handleKeyDown}
-              placeholder="Type your message... (Enter to send)"
+              placeholder={
+                selectedSkill === 'flow'
+                  ? flowMediaType === 'image'
+                    ? "Describe the image to generate with Nano Banana 2 (e.g. 'cyberpunk street in rain, 4k photorealistic')..."
+                    : "Describe the video clip to generate with Omni Flash 1.1 (e.g. 'cinematic aerial drone shot of waterfall')..."
+                  : "Type your message... (Enter to send)"
+              }
               rows={1} style={{ resize: 'none' }}
               className="input-dark flex-1 py-3 min-h-[46px] max-h-32 text-sm leading-relaxed" />
 
@@ -625,6 +809,14 @@ export default function ChatPage() {
           </div>
         </div>
       )}
+
+      {/* ── Push Post with AI Modal ── */}
+      <PushPostModal
+        open={pushPostOpen}
+        onClose={() => setPushPostOpen(false)}
+        mediaUrl={pushPostMediaUrl}
+        prompt={pushPostPrompt}
+      />
     </div>
   )
 }

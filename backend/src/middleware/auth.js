@@ -27,6 +27,28 @@ const authenticate = async (req, res, next) => {
   }
 };
 
+// ─── Optional Authenticate (JWT) ───────────────────────────────────────────
+const optionalAuth = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return next();
+    }
+
+    const token = authHeader.split(' ')[1];
+    if (!token) return next();
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
+    const user = await User.findById(decoded.id);
+    if (user && user.isActive) {
+      req.user = user;
+    }
+  } catch (_err) {
+    // Gracefully ignore expired or invalid token for public/catalogue endpoints
+  }
+  next();
+};
+
 // ─── Admin Only ────────────────────────────────────────────────────────────
 const adminOnly = (req, res, next) => {
   if (req.user?.role !== 'admin') {
@@ -35,4 +57,4 @@ const adminOnly = (req, res, next) => {
   next();
 };
 
-module.exports = { authenticate, adminOnly };
+module.exports = { authenticate, optionalAuth, adminOnly };

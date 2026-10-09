@@ -18,6 +18,8 @@ const memoryRoutes = require('./routes/memory');
 const userRoutes = require('./routes/user');
 const paymentRoutes = require('./routes/payments');
 const channelRoutes = require('./routes/channels');
+const flowRoutes = require('./routes/flow');
+const platformRoutes = require('./routes/platform');
 
 // Import passport config
 require('./config/passport');
@@ -32,7 +34,24 @@ const warmCatalog = () => require('./services/catalogService').warm();
 const app = express();
 // Behind the gateway/tunnel every request arrives from 127.0.0.1, so trust the
 // proxy headers to keep real client IPs in the logs and in rate limits.
-app.set('trust proxy', true);
+//
+// A hop COUNT, not `true`: `true` trusts every hop, so Express takes the leftmost
+// X-Forwarded-For entry — a value the caller writes themselves — and anyone could
+// rotate it to reset the login rate-limit bucket (express-rate-limit flags exactly
+// this as ERR_ERL_PERMISSIVE_TRUST_PROXY). Two hops is this deployment's real
+// chain: cloudflared → gateway → here. The gateway appends its own view of the
+// peer, so the forged entries a client sends are pushed left of the trusted pair
+// and ignored, while the genuine client address survives.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS || 2));
+
+// A WhatsApp library that closes a browser mid-scan can reject a promise nobody
+// is holding any more. An unhandled rejection kills the whole process by default,
+// which would take every owner's auto-replies down with it — so log it and keep
+// serving. Real crashes (uncaught exceptions, boot failures) still stop the app.
+process.on('unhandledRejection', (reason) => {
+  const message = reason && reason.message ? reason.message : String(reason);
+  console.error(`⚠️  Unhandled rejection (kept running): ${message}`);
+});
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
@@ -77,6 +96,13 @@ app.use('/api/user', userRoutes);
 app.use('/api/payments', paymentRoutes);
 // Channel connections + the platform webhooks (Meta, Telegram) that call home.
 app.use('/api/channels', channelRoutes);
+app.use('/api/flow', flowRoutes);
+// Public switches only (notice banner, is checkout open) — safe without a login.
+app.use('/api/platform', platformRoutes);
+app.use('/api/media', (req, res, next) => {
+  req.url = '/media' + req.url;
+  flowRoutes(req, res, next);
+});
 
 // Health check
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date() }));
@@ -169,6 +195,9 @@ async function startServer() {
 
   // No WhatsApp client survives a restart, so reconcile the stored states before serving.
   await require('./services/wppConnectService').reconcileOnBoot(io);
+  // Then keep the waiting list moving: a queued session starts by itself as soon
+  // as a slot frees, including when a browser died without telling anyone.
+  require('./services/wppConnectService').startQueueDrain();
 
   // Seed admin on first run
   const { seedAdmin } = require('./utils/seed');

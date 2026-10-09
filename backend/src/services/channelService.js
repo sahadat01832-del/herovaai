@@ -14,6 +14,7 @@ const ChannelConnection = require('../models/ChannelConnection');
 const registry = require('./channels/registry');
 const adapters = require('./channels/adapters');
 const aiReply = require('./channels/aiReply');
+const appSettings = require('./appSettings');
 const fs = require('fs');
 const path = require('path');
 
@@ -35,7 +36,7 @@ function publicBase() {
 
 /** The catalogue joined with this owner's connections — what the page renders. */
 async function listFor(userId) {
-  const rows = await ChannelConnection.find({ userId }).sort({ createdAt: 1 });
+  const rows = userId ? await ChannelConnection.find({ userId }).sort({ createdAt: 1 }) : [];
   const byChannel = new Map(rows.map((row) => [row.channel, row]));
   return registry.catalogue().map((entry) => {
     const connection = byChannel.get(entry.id) || null;
@@ -66,6 +67,25 @@ async function connect(userId, channelId, { credentials = {}, automations = {}, 
   if (!definition.apiAvailable) {
     throw new ChannelError(definition.availableReason || 'This platform cannot be automated from a server.', 409);
   }
+  if (!appSettings.flag('channelsEnabled')) {
+    throw new ChannelError('Connecting new channels is paused by the administrator. Nothing already connected was touched.', 503);
+  }
+
+  // Plan limit, checked against the row that actually exists: reconnecting a
+  // channel the owner already has must never be blocked by its own count.
+  const existing = await ChannelConnection.findOne({ userId, channel: channelId });
+  if (!existing) {
+    const user = await require('../models/User').findById(userId).select('subscription').lean();
+    const tier = user?.subscription?.tier || 'free';
+    const limit = appSettings.limitFor(tier, 'channels');
+    const used = await ChannelConnection.countDocuments({ userId });
+    if (limit && used >= limit) {
+      throw new ChannelError(
+        `Your ${tier} plan connects ${limit} channel${limit === 1 ? '' : 's'}. Disconnect one, or upgrade to add more — your existing connections keep working.`,
+        409,
+      );
+    }
+  }
 
   const allowed = new Set(registry.credentialKeys(channelId));
   const stored = {};
@@ -74,7 +94,7 @@ async function connect(userId, channelId, { credentials = {}, automations = {}, 
     stored[key] = String(value ?? '').trim().slice(0, 4000);
   }
 
-  let connection = await ChannelConnection.findOne({ userId, channel: channelId });
+  let connection = existing;
   if (!connection) {
     connection = new ChannelConnection({ userId, channel: channelId });
   }
@@ -148,7 +168,7 @@ async function testConnection(connection) {
 /* ─────────────────────────────── posting ───────────────────────────────── */
 
 /** Compose a post and publish it now. Used by the scheduler and "Post now". */
-async function publishToConnection(connection, { text } = {}) {
+async function publishToConnection(connection, { text, mediaUrl } = {}) {
   const publisher = adapters.publisherFor(connection.channel);
   if (!publisher) {
     connection.pushActivity('post', false, 'This channel cannot post.');
@@ -157,6 +177,13 @@ async function publishToConnection(connection, { text } = {}) {
   }
   if (!connection.automations?.autoPost && !text) {
     return { ok: false, message: 'Auto-posting is off for this channel.' };
+  }
+  // Scheduled posts stop when the owner flips the platform switch; a person
+  // pressing "Post now" is an explicit instruction and still goes out.
+  if (!text && !appSettings.flag('autoPosts')) {
+    connection.pushActivity('post', false, 'Scheduled posting is switched off platform-wide — nothing was sent.');
+    await connection.save();
+    return { ok: false, message: 'Scheduled posting is switched off platform-wide.' };
   }
 
   let body = String(text || '').trim();
@@ -172,7 +199,10 @@ async function publishToConnection(connection, { text } = {}) {
 
   let result;
   try {
-    result = await publisher(connection, body, { imageUrl: connection.credentials?.imageUrl });
+    const fullMediaUrl = mediaUrl
+      ? (mediaUrl.startsWith('http') ? mediaUrl : `${publicBase()}${mediaUrl}`)
+      : (connection.credentials?.imageUrl || '');
+    result = await publisher(connection, body, { imageUrl: fullMediaUrl, mediaUrl: fullMediaUrl });
   } catch (err) {
     result = { ok: false, message: String(err.message || 'publish failed').slice(0, 300) };
   }
@@ -195,12 +225,13 @@ async function publishToConnection(connection, { text } = {}) {
 
 /** Reply budget per connection per day, so a loop cannot empty a quota. */
 function repliesAllowedToday(connection) {
+  const cap = Number(appSettings.platform().channelRepliesPerDay) || DAILY_REPLY_CAP;
   const today = new Date().toISOString().slice(0, 10);
   if (connection.stats.repliesDay !== today) {
     connection.stats.repliesDay = today;
     connection.stats.repliesToday = 0;
   }
-  return (connection.stats.repliesToday || 0) < DAILY_REPLY_CAP;
+  return (connection.stats.repliesToday || 0) < cap;
 }
 
 /**
@@ -210,13 +241,22 @@ function repliesAllowedToday(connection) {
 async function handleInbound(connection, { senderId, text, history = [], replyTo = {} }) {
   connection.stats.lastInboundAt = new Date();
 
+  // Master switch: the owner can silence every automatic reply from the admin
+  // panel while leaving the connections themselves untouched.
+  if (!appSettings.flag('aiReplies')) {
+    connection.pushActivity('inbound', false, 'AI replies are switched off platform-wide — message left for you.');
+    await connection.save();
+    return { replied: false, reason: 'ai-off' };
+  }
+
   if (!connection.automations?.autoReply) {
     connection.pushActivity('inbound', true, 'Message received; auto-reply is off, so it waits for you.');
     await connection.save();
     return { replied: false, reason: 'auto-reply-off' };
   }
   if (!repliesAllowedToday(connection)) {
-    connection.pushActivity('inbound', false, `Daily reply limit (${DAILY_REPLY_CAP}) reached — messages are being left for you.`);
+    const cap = Number(appSettings.platform().channelRepliesPerDay) || DAILY_REPLY_CAP;
+    connection.pushActivity('inbound', false, `Daily reply limit (${cap}) reached — messages are being left for you.`);
     await connection.save();
     return { replied: false, reason: 'daily-cap' };
   }
