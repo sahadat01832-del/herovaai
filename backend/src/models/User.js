@@ -52,4 +52,24 @@ const UserSchema = new mongoose.Schema({
 UserSchema.index({ role: 1 });
 UserSchema.index({ createdAt: -1 });
 
+/**
+ * Secrets never leave the API.
+ *
+ * `contentbotApiKey` used to travel in every login/`/me`/admin payload and land in
+ * localStorage, so any XSS or screen-share leaked a live key. Serialisation now swaps it for a
+ * masked preview plus a boolean, and the raw value is only reachable by the server-side callers
+ * that read the document itself (chat.js sends it upstream).
+ */
+UserSchema.methods.toJSON = function toJSON() {
+  const obj = this.toObject({ virtuals: false });
+  const raw = String(obj.contentbotApiKey || '').trim();
+  obj.hasContentbotApiKey = Boolean(raw);
+  obj.contentbotApiKeyMasked = raw
+    ? (raw.length <= 12 ? '•'.repeat(raw.length) : `${raw.slice(0, 6)}…${raw.slice(-4)}`)
+    : '';
+  delete obj.contentbotApiKey;
+  delete obj.password;
+  return obj;
+};
+
 module.exports = mongoose.model('User', UserSchema);

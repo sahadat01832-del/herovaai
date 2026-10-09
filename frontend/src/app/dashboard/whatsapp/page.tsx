@@ -1,8 +1,8 @@
 'use client'
 import { useState, useEffect, useRef } from 'react'
 import {
-  Smartphone, Plus, WifiOff, Trash2, Send, Bot,
-  RefreshCw, User, MessageSquare, Clock, CheckCircle2, AlertTriangle, Save,
+  Smartphone, Plus, WifiOff, Send, Bot, CheckCircle2, Settings2, Trash2,
+  RefreshCw, User, MessageSquare, Clock, Save, X, Mic, MicOff, Server
 } from 'lucide-react'
 import { whatsappApi } from '@/lib/api'
 import { io, Socket } from 'socket.io-client'
@@ -54,8 +54,15 @@ export default function WhatsAppPage() {
   const [showNewSession, setShowNewSession] = useState(false)
   const [sendMsg, setSendMsg] = useState('')
   const [manualPhone, setManualPhone] = useState('')
-  const [toneDraft, setToneDraft] = useState<Record<string, string>>({})
+  const [muteFlag, setMuteFlag] = useState<Record<string, { muted: boolean; until: string | null; reason: string }>>({})
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [handoffMsgDraft, setHandoffMsgDraft] = useState('')
+  const [muteWindowDraft, setMuteWindowDraft] = useState('5')
+  const [muteState, setMuteState] = useState<{ muted: boolean; until: string | null; reason: string } | null>(null)
   const [promptDraft, setPromptDraft] = useState<Record<string, string>>({})
+  // Reply tone is edited per session and only sent when the owner saves, so it needs the same
+  // draft buffer as the custom prompt.
+  const [toneDraft, setToneDraft] = useState<Record<string, string>>({})
   const [loading, setLoading] = useState(false)
   const socketRef = useRef<Socket | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -75,12 +82,19 @@ export default function WhatsAppPage() {
       )
     })
 
-    socket.on('whatsapp-status', ({ sessionName, status }: any) => {
+    socket.on('whatsapp-status', ({ sessionName, status, error }: any) => {
       setSessions(prev =>
-        prev.map(s => (s.sessionName === sessionName ? { ...s, status, ...(status === 'connected' ? { qrCode: null } : {}) } : s))
+        prev.map(s => (s.sessionName === sessionName ? {
+          ...s,
+          status,
+          ...(status === 'connected' ? { qrCode: null, lastError: null } : {}),
+          ...(error ? { lastError: error } : {}),
+        } : s))
       )
       if (status === 'connected') {
         toast.success('WhatsApp connected successfully!')
+      } else if (status === 'error') {
+        toast.error(error || 'WhatsApp could not connect. Check the session error for details.')
       }
     })
 
@@ -91,6 +105,19 @@ export default function WhatsAppPage() {
         setCustomers(prev => Array.from(new Set([...prev, message.from])))
       }
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    })
+    socket.on('whatsapp-mute', (data: any) => {
+      const { customer, mutedUntil, reason } = data
+      if (customer === selectedCustomer) {
+        setMuteFlag(prev => ({ ...prev, [customer]: { muted: true, until: mutedUntil, reason } }))
+      }
+    })
+    socket.on('whatsapp-handoff', (data: any) => {
+      const { customer, mutedUntil } = data
+      if (customer === selectedCustomer) {
+        setMuteFlag(prev => ({ ...prev, [customer]: { muted: true, until: mutedUntil, reason: 'handoff_request' } }))
+      }
+      toast.success(`🙋 ${customer.replace('@c.us','')} wants to talk to the owner — AI muted, waiting for you to respond`)
     })
 
     return () => {
@@ -152,6 +179,7 @@ export default function WhatsAppPage() {
       loadSessions(false)
     } catch (err: any) {
       toast.error(err.message)
+      await loadSessions(false)
     } finally {
       setLoading(false)
     }
@@ -203,8 +231,18 @@ export default function WhatsAppPage() {
     try {
       const d: any = await whatsappApi.getMessages(session._id, contact)
       setMessages(d.messages || [])
+      await loadMuteState(session._id, contact)
     } catch (err: any) {
       toast.error(err.message)
+    }
+  }
+
+  const loadMuteState = async (sessionId: string, customer: string) => {
+    try {
+      const d: any = await whatsappApi.getMuteState(sessionId, customer)
+      if (d?.success) setMuteFlag(prev => ({ ...prev, [customer]: { muted: d.muted, until: d.until, reason: d.reason } }))
+    } catch {
+      // session never written to the database yet (fresh session) — ignore
     }
   }
 
@@ -265,47 +303,51 @@ export default function WhatsAppPage() {
     : messages
 
   return (
-    <div className="p-3 sm:p-6 space-y-4 sm:space-y-6 animate-fade-in">
+    <div className="space-y-5">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-green-500 to-emerald-600 flex items-center justify-center glow-green">
-            <Smartphone className="w-5 h-5 text-white" />
-          </div>
-          <div>
-            <h1 className="text-2xl font-bold text-white">WhatsApp Business Automation</h1>
-            <p className="text-dark-300 text-sm">
-              Connect accounts, let AI reply to customers with your Business Memory, and inspect chats live
-            </p>
-          </div>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <p className="mb-1 text-[10.5px] font-bold uppercase tracking-[0.22em] text-brand-400/80">Channels</p>
+          <h1 className="flex items-center gap-2 text-[22px] font-semibold tracking-tight text-white">
+            WhatsApp automation
+            <span className="badge badge-green">{sessions.filter(s => s.status === 'connected').length} live</span>
+          </h1>
+          <p className="mt-1 max-w-2xl text-[13px] text-dark-400">
+            Pair a number, let the assistant answer customers from your business memory, and read
+            every thread as it happens.
+          </p>
         </div>
-        <div className="flex gap-2">
-          <button onClick={() => loadSessions()} className="btn-ghost text-xs">
-            <RefreshCw className="w-3.5 h-3.5" /> Refresh
+        <div className="flex items-center gap-2">
+          <button onClick={() => loadSessions()} className="btn-ghost btn-sm">
+            <RefreshCw className="h-3.5 w-3.5" /> Refresh
           </button>
-          <button onClick={() => setShowNewSession(true)} className="btn-primary">
-            <Plus className="w-4 h-4" /> Connect Account
+          <button onClick={() => setShowNewSession(true)} className="btn-primary btn-sm btn-sheen">
+            <Plus className="h-3.5 w-3.5" /> Connect account
           </button>
         </div>
       </div>
 
       {/* Connect Form */}
       {showNewSession && (
-        <div className="glass-strong rounded-2xl p-6 border border-brand-500/30">
-          <h3 className="text-lg font-semibold text-white mb-2">Connect WhatsApp Account</h3>
-          <p className="text-dark-300 text-sm mb-4">
-            Enter a label for this number. A dynamic QR code will be generated to scan with WhatsApp (Linked Devices).
+        <div className="card animate-fade-up p-5 border-brand-400/25">
+          <h3 className="flex items-center gap-2 text-[15px] font-semibold text-white">
+            <Smartphone className="h-4 w-4 text-brand-300" />
+            Connect a WhatsApp account
+          </h3>
+          <p className="mt-1 text-[12.5px] text-dark-400">
+            Give this number a label. A QR code is generated next — scan it from WhatsApp →
+            Linked Devices → Link a Device.
           </p>
-          <div className="flex gap-3">
+          <div className="mt-4 flex flex-col gap-2 sm:flex-row">
             <input
               value={newSessionName}
               onChange={e => setNewSessionName(e.target.value)}
-              placeholder="Account name (e.g. Sales Desk, Business WhatsApp)"
+              placeholder="Account name (e.g. Sales desk)"
               className="input-dark flex-1"
               onKeyDown={e => e.key === 'Enter' && createSession()}
             />
             <button onClick={createSession} disabled={loading} className="btn-primary">
-              {loading ? 'Initializing Browser...' : 'Generate QR Code'}
+              {loading ? 'Starting browser…' : 'Generate QR code'}
             </button>
             <button onClick={() => setShowNewSession(false)} className="btn-ghost">
               Cancel
@@ -316,136 +358,143 @@ export default function WhatsAppPage() {
 
       {/* Sessions list */}
       {sessions.length === 0 ? (
-        <div className="glass rounded-2xl p-12 text-center">
-          <Smartphone className="w-12 h-12 text-dark-500 mx-auto mb-3" />
-          <h3 className="text-lg font-semibold text-white mb-2">No WhatsApp Accounts Connected</h3>
-          <p className="text-dark-400 text-sm mb-4">
-            Connect your WhatsApp number to let ContentBot manage incoming customer DMs with AI.
-          </p>
-          <button onClick={() => setShowNewSession(true)} className="btn-primary">
-            <Plus className="w-4 h-4" /> Connect WhatsApp Account
-          </button>
+        <div className="card">
+          <div className="empty">
+            <span className="empty-icon"><Smartphone className="h-5 w-5" /></span>
+            <div>
+              <p className="text-[14px] font-medium text-dark-100">No WhatsApp account connected</p>
+              <p className="mx-auto mt-1 max-w-md text-[12.5px] leading-relaxed text-dark-500">
+                Pair a number to let HerovaAi answer customer DMs with your business memory. Replies
+                keep going while you are away, and you can pause any customer from the thread view.
+              </p>
+            </div>
+            <button onClick={() => setShowNewSession(true)} className="btn-primary btn-sm">
+              <Plus className="h-3.5 w-3.5" /> Connect a number
+            </button>
+          </div>
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+        <div className="stagger grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {sessions.map(session => {
             const statusCfg =
               STATUS_CONFIG[session.status as keyof typeof STATUS_CONFIG] ||
               STATUS_CONFIG.disconnected
             const qr = qrCodes[session.sessionName] || session.qrCode
+            const dotTone = session.status === 'connected'
+              ? 'dot-live'
+              : session.status === 'error'
+                ? 'dot-error'
+                : session.status === 'qr_pending'
+                  ? 'dot-warn'
+                  : 'dot-idle'
 
             return (
               <div
                 key={session._id}
-                className={`glass rounded-2xl p-5 space-y-4 border transition-all ${
-                  selectedSession?._id === session._id ? 'border-brand-500/50 glow-brand' : 'border-white/5'
-                }`}
+                className={`card space-y-4 p-5 ${selectedSession?._id === session._id ? 'card-gold' : ''}`}
               >
                 {/* Session Header */}
-                <div className="flex items-start justify-between">
-                  <div>
-                    <h3 className="font-semibold text-white">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <h3 className="truncate font-semibold text-white">
                       {session.sessionName.includes('_')
                         ? session.sessionName.split('_').slice(1).join('_')
                         : session.sessionName}
                     </h3>
-                    <div className="flex items-center gap-1.5 mt-1">
-                      <div className={`w-2 h-2 rounded-full ${statusCfg.dot} animate-pulse`} />
+                    <div className="mt-1 flex items-center gap-1.5">
+                      <span className={`dot ${dotTone}`} aria-hidden />
                       <span className={`text-xs ${statusCfg.color}`}>{statusCfg.label}</span>
                     </div>
                     {session.lastError && (
-                      <p className="text-[10px] text-red-300/80 mt-1 max-w-[240px]">
+                      <p className="mt-1 max-w-[240px] text-[10.5px] text-red-300/85">
                         {session.lastError}
                       </p>
                     )}
                   </div>
                   <button
                     onClick={() => deleteSession(session._id)}
-                    className="p-1.5 text-dark-400 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-all"
+                    aria-label="Delete session"
+                    className="icon-btn icon-btn-danger flex-none h-7 w-7"
                   >
-                    <Trash2 className="w-4 h-4" />
+                    <Trash2 className="h-3.5 w-3.5" />
                   </button>
                 </div>
 
                 {/* QR Code Display */}
                 {session.status === 'qr_pending' && (
-                  <div className="flex flex-col items-center p-3 glass-strong rounded-xl border border-yellow-500/30">
-                    <p className="text-xs text-yellow-300 font-medium mb-2 flex items-center gap-1">
-                      <Clock className="w-3.5 h-3.5" /> Scan QR code with WhatsApp
+                  <div className="flex flex-col items-center rounded-xl border border-brand-400/25 bg-brand-400/[0.04] p-3">
+                    <p className="mb-2 flex items-center gap-1 text-xs font-medium text-brand-200">
+                      <Clock className="h-3.5 w-3.5" aria-hidden /> Scan with WhatsApp
                     </p>
                     {qr ? (
                       // eslint-disable-next-line @next/next/no-img-element
                       <img
                         src={qr}
-                        alt="WhatsApp QR Code"
-                        className="w-48 h-48 rounded-xl bg-white p-2 border-2 border-yellow-400/50 shadow-lg"
+                        alt="WhatsApp QR code"
+                        className="h-48 w-48 rounded-xl border border-brand-400/40 bg-white p-2 shadow-lift"
                       />
                     ) : (
-                      <div className="w-48 h-48 rounded-xl bg-black/40 flex flex-col items-center justify-center gap-2 border border-white/10">
-                        <div className="w-6 h-6 border-2 border-yellow-400 border-t-transparent rounded-full animate-spin" />
-                        <span className="text-[11px] text-dark-300">Generating QR...</span>
+                      <div className="flex h-48 w-48 flex-col items-center justify-center gap-2 rounded-xl border border-white/10 bg-black/40">
+                        <span className="skeleton h-6 w-6 rounded-full" />
+                        <span className="text-[11px] text-dark-300">Generating QR…</span>
                       </div>
                     )}
-                    <p className="text-[10px] text-dark-400 mt-2 text-center">
-                      Open WhatsApp → Settings → Linked Devices → Link a Device
+                    <p className="mt-2 text-center text-[10.5px] text-dark-500">
+                      The code refreshes itself; scan the newest one.
                     </p>
                   </div>
                 )}
 
                 {/* Connected Badge */}
                 {session.status === 'connected' && (
-                  <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-green-500/10 border border-green-500/20 text-green-400 text-xs">
-                    <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
-                    <span>WhatsApp Connected & Listening for DMs</span>
+                  <div className="flex items-center gap-2 rounded-xl border border-emerald-500/20 bg-emerald-500/[0.07] px-3 py-2 text-xs text-emerald-300">
+                    <CheckCircle2 className="h-4 w-4 flex-none" aria-hidden />
+                    <span>Connected — listening for customer DMs</span>
                   </div>
                 )}
 
                 {/* Counters */}
                 <div className="grid grid-cols-2 gap-2 text-center">
-                  <div className="glass-strong rounded-lg p-2">
-                    <p className="text-lg font-bold text-white">{session.totalMessagesReceived || 0}</p>
-                    <p className="text-xs text-dark-400">Incoming DMs</p>
+                  <div className="rounded-xl border border-white/[0.05] bg-white/[0.02] p-2">
+                    <p className="mono-num text-[17px] font-semibold text-white">{session.totalMessagesReceived || 0}</p>
+                    <p className="text-[11px] text-dark-500">incoming</p>
                   </div>
-                  <div className="glass-strong rounded-lg p-2">
-                    <p className="text-lg font-bold text-white">{session.totalMessagesSent || 0}</p>
-                    <p className="text-xs text-dark-400">AI / Sent DMs</p>
+                  <div className="rounded-xl border border-white/[0.05] bg-white/[0.02] p-2">
+                    <p className="mono-num text-[17px] font-semibold text-white">{session.totalMessagesSent || 0}</p>
+                    <p className="text-[11px] text-dark-500">AI / sent</p>
                   </div>
                 </div>
 
                 {/* AI Auto-reply Toggle */}
-                <div className="flex items-center justify-between p-3 rounded-xl bg-white/5">
+                <div className="flex items-center justify-between gap-3 rounded-xl bg-white/[0.03] p-3">
                   <div className="flex items-center gap-2">
-                    <Bot className="w-4 h-4 text-brand-400" />
+                    <Bot className="h-4 w-4 text-brand-400" aria-hidden />
                     <div>
-                      <span className="text-xs font-semibold text-white block">AI Auto-Reply</span>
-                      <span className="text-[10px] text-dark-400">Uses AI Memory & Profile</span>
+                      <span className="block text-xs font-semibold text-white">AI auto-reply</span>
+                      <span className="text-[10.5px] text-dark-500">uses your memory &amp; persona</span>
                     </div>
                   </div>
                   <button
+                    type="button"
+                    role="switch"
+                    aria-checked={session.autoReply}
+                    aria-label={`AI auto-reply for ${session.sessionName}`}
                     onClick={() => toggleAutoReply(session)}
-                    className={`w-11 h-6 rounded-full transition-all relative ${
-                      session.autoReply ? 'bg-green-500' : 'bg-dark-600'
-                    }`}
-                  >
-                    <div
-                      className={`w-4 h-4 bg-white rounded-full transition-transform absolute top-1 ${
-                        session.autoReply ? 'left-6' : 'left-1'
-                      }`}
-                    />
-                  </button>
+                    className={`switch ${session.autoReply ? 'switch-on' : ''}`}
+                  />
                 </div>
 
                 {/* AI Reply Tone & Owner Instructions */}
                 <div className="p-3 rounded-xl bg-white/5 space-y-2">
                   <span className="text-xs font-semibold text-white block">Reply Tone &amp; Instructions</span>
                   <input
-                    className="input text-xs"
+                    className="input-dark text-xs"
                     placeholder="Tone (e.g. warm, formal, short replies)"
                     defaultValue={session.tone || ''}
                     onChange={e => setToneDraft(prev => ({ ...prev, [session._id]: e.target.value }))}
                   />
                   <textarea
-                    className="input text-xs min-h-[60px]"
+                    className="input-dark text-xs min-h-[60px]"
                     placeholder="Extra instructions for the AI (business rules, offers, what never to promise)"
                     defaultValue={session.customPrompt || ''}
                     onChange={e => setPromptDraft(prev => ({ ...prev, [session._id]: e.target.value }))}
@@ -483,16 +532,16 @@ export default function WhatsAppPage() {
 
       {/* Customer Chats & AI Replies Live Viewer */}
       {selectedSession && (
-        <div className="glass-strong rounded-2xl overflow-hidden border border-white/10 mt-6 animate-slide-up">
+        <div className="card mt-1 animate-fade-up overflow-hidden p-0">
           {/* Header */}
-          <div className="p-4 border-b border-white/8 flex items-center justify-between bg-black/20">
+          <div className="flex items-center justify-between border-b border-white/[0.06] bg-black/20 p-4">
             <div className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-lg bg-brand-600/30 flex items-center justify-center text-brand-300">
-                <MessageSquare className="w-4 h-4" />
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-brand-500/15 text-brand-300">
+                <MessageSquare className="h-4 w-4" aria-hidden />
               </div>
               <div>
-                <h3 className="font-semibold text-white text-sm">
-                  Customer Chats & AI Replies —{' '}
+                <h3 className="text-[13.5px] font-semibold text-white">
+                  Customer chats &amp; AI replies —{' '}
                   <span className="text-brand-400">
                     {selectedSession.sessionName.includes('_')
                       ? selectedSession.sessionName.split('_').slice(1).join('_')
@@ -577,10 +626,119 @@ export default function WhatsAppPage() {
                 </span>
               </div>
 
+               {selectedCustomer && selectedSession && selectedSession.autoReply && (
+                 <div className="px-4 pb-1 flex items-center gap-2">
+                   {muteFlag[selectedCustomer]?.muted ? (
+                     <>
+                       <span className="text-[11px] text-red-300 flex items-center gap-1.5">
+                         <MicOff className="w-3.5 h-3.5" /> AI muted
+                         {muteFlag[selectedCustomer]?.until && (
+                           <Clock className="w-3 h-3" />
+                         )}
+                       </span>
+                       <div className="flex items-center gap-1.5">
+                         <button
+                           onClick={() => setSettingsOpen(true)}
+                           className="p-1.5 rounded-lg text-dark-400 hover:bg-white/10 hover:text-white transition-all"
+                           title="Change the owner-pause time or who gets the owner response"
+                         >
+                           <Settings2 className="w-3.5 h-3.5" />
+                         </button>
+                         <button
+                           onClick={async () => {
+                             try {
+                               await whatsappApi.unmuteMessage(selectedSession!._id, selectedCustomer)
+                               setMuteFlag(prev => ({ ...prev, [selectedCustomer]: { muted: false, until: null, reason: '' } }))
+                               toast.success('AI resumed — you can reply again now')
+                             } catch (err: any) {
+                               toast.error(err.message)
+                             }
+                           }}
+                           className="btn-ghost text-xs py-1 px-3 text-white"
+                         >
+                           ▶ Resume AI
+                         </button>
+                       </div>
+                     </>
+                   ) : (
+                     <>
+                       <span className="text-[11px] text-dark-400 flex items-center gap-1.5">
+                         <Mic className="w-3.5 h-3.5" /> AI answering
+                       </span>
+                       <button
+                         onClick={async () => {
+                           try {
+                             await whatsappApi.muteMessage(selectedSession!._id, selectedCustomer, 'manual')
+                             setMuteFlag(prev => ({ ...prev, [selectedCustomer]: { muted: true, until: null, reason: 'manual' } }))
+                             toast.success('Owner is writing — AI paused (5 min default)')
+                           } catch (err: any) {
+                             toast.error(err.message)
+                           }
+                         }}
+                         className="btn-ghost text-xs py-1 px-3 text-white"
+                       >
+                         🔇 Take over
+                       </button>
+                     </>
+                   )}
+                 </div>
+               )}
+
               {/* Messages Scroll Area */}
               <div className="flex-1 overflow-y-auto p-3 sm:p-4 space-y-3">
                 {activeMessages.length === 0 ? (
                   <div className="flex flex-col items-center justify-center h-full text-center">
+
+  {/* ── Reply + owner-pause settings dialog ── */}
+  {settingsOpen && (
+    <div className="fixed inset-0 z-[70] flex animate-fade-in items-center justify-center bg-black/70 p-4 backdrop-blur-md" onClick={() => setSettingsOpen(false)}>
+      <div className="w-[560px] max-w-full animate-scale-in rounded-2xl border border-white/[0.09] bg-dark-900/97 p-6 shadow-[0_40px_120px_-40px_rgba(0,0,0,1)]" onClick={e => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Owner and AI controls">
+        <div className="mb-4 flex items-center gap-2">
+          <Server className="h-4 w-4 text-brand-300" aria-hidden />
+          <h3 className="text-[15px] font-semibold text-white">Owner + AI controls</h3>
+          <button onClick={() => setSettingsOpen(false)} className="icon-btn ml-auto" aria-label="Close settings"><X className="h-4 w-4" /></button>
+        </div>
+        <div className="space-y-4 text-xs text-dark-300">
+          <div>
+            <label className="text-[11px] font-semibold text-dark-200">How long the AI stays silent after the owner speaks</label>
+            <input
+              className="input-dark mt-1 text-sm"
+              type="number" min={1} max={1440} value={muteWindowDraft}
+              onChange={e => setMuteWindowDraft(e.target.value)}
+              placeholder="5 min default"
+            />
+            <p className="text-[10px] text-dark-500 mt-1">Owner speaks → AI pauses that conversation for this many minutes. Every owner message re-arms the timer.</p>
+          </div>
+          <div className="border-t border-white/10 pt-3">
+            <label className="text-[11px] font-semibold text-dark-200">What the AI says when a customer asks for the real owner</label>
+            <textarea
+              className="input-dark min-h-[56px] text-sm"
+              value={handoffMsgDraft}
+              onChange={e => setHandoffMsgDraft(e.target.value)}
+              placeholder="e.g. Sure! 🙏 I've alerted {ownerName} at {bizName} — you'll hear from the owner personally here very soon."
+            />
+            <p className="text-[10px] text-dark-500 mt-1">Leave empty to skip the alert to the owner; the AI still pauses and the owner gets a dashboard alert either way.</p>
+          </div>
+          <div className="flex gap-2 pt-1">
+            <button onClick={() => setSettingsOpen(false)} className="btn-ghost text-xs py-2 flex-1">Cancel</button>
+            <button onClick={async () => {
+              try {
+                await whatsappApi.updateSettings(selectedSession!._id, {
+                  ownerMuteMinutes: Number(muteWindowDraft) || 5,
+                  handoffMessage: handoffMsgDraft,
+                })
+                setSettingsOpen(false)
+                toast.success('Owner + AI controls saved')
+              } catch (err: any) {
+                toast.error(err.message)
+              }
+            }} className="btn-primary text-xs py-2 flex-1">Save settings</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )}
+
                     <MessageSquare className="w-10 h-10 text-dark-500 mb-2" />
                     <p className="text-dark-300 text-sm">No messages with this contact yet</p>
                   </div>

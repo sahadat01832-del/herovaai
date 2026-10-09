@@ -3,7 +3,10 @@ const axios = require('axios');
 const router = express.Router();
 const Conversation = require('../models/Conversation');
 const AIMemory = require('../models/AIMemory');
+const memoryProfile = require('../services/memoryProfile');
 const { authenticate } = require('../middleware/auth');
+const jwt = require('jsonwebtoken');
+const User = require('../models/User');
 const lmStudioService = require('../services/lmStudioService');
 const cloudAIService = require('../services/cloudAIService');
 const catalogService = require('../services/catalogService');
@@ -76,33 +79,85 @@ const SKILLS = [
   },
 ];
 
-// Helper: Extract code artifacts from AI output
+// Helper: Extract code artifacts from AI output.
+// Hardened after the 2026-10-08 "Flappy Bird skeleton" incident: a model that
+// burns its output budget on planning hands back (1) a tiny placeholder sketch
+// — which used to get a Run button that ran nothing — or (2) an unclosed fence
+// when it runs out mid-block, which used to make the whole artifact vanish.
+function isPlaceholderSkeleton(code) {
+  // Classic "sketch instead of code" markers.
+  if (/\/\/\s*(all\s*js|js\s+here|code\s+here|your\s+(code|game)\s+here|game\s+(code|logic)\s+(goes|here))/i.test(code)) return true;
+  if (/\/\*\s*(center|styles?|css|game\s+logic|all\s*js)[^*]{0,80}\*\//i.test(code)) return true;
+  // Every INLINE <script> body is comments/whitespace only → nothing can run.
+  const inlineScripts = [...code.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
+  if (inlineScripts.length > 0) {
+    const stripped = inlineScripts.join('')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/.*$/gm, '')
+      .trim();
+    if (stripped.length < 20) return true;
+  }
+  return false;
+}
+
 function extractArtifacts(text, skill) {
-  const artifacts = [];
+  const blocks = [];
   const htmlBlockRegex = /```(?:html|game|app|svg)\s*([\s\S]*?)```/gi;
   let match;
-  let count = 1;
   while ((match = htmlBlockRegex.exec(text)) !== null) {
     const code = match[1].trim();
-    if (code.length > 50) {
-      let type = 'html';
-      let title = `Interactive App ${count}`;
-      if (skill === 'game' || code.includes('<canvas') || code.includes('game') || code.includes('score')) {
-        type = 'game';
-        title = `Playable HTML5 Game ${count}`;
-      } else if (skill === 'webapp' || code.includes('Tailwind') || code.includes('container')) {
-        type = 'webapp';
-        title = `Web Application ${count}`;
-      } else if (skill === 'visualizer' || code.includes('Chart(') || code.includes('<svg')) {
-        type = 'visualizer';
-        title = `Interactive Visualization ${count}`;
-      }
-      artifacts.push({ title, type, code, language: 'html' });
-      count++;
+    if (code.length > 50) blocks.push(code);
+  }
+
+  // Salvage an unclosed trailing block (model forgot the closing ``` or the
+  // output cap hit right before it) — but only when nothing closed after it.
+  const opens = [...text.matchAll(/```(?:html|game|app|svg)/gi)];
+  const lastOpen = opens[opens.length - 1];
+  if (lastOpen) {
+    const after = text.slice(lastOpen.index + lastOpen[0].length);
+    if (!after.includes('```') && after.trim().length > 50) blocks.push(after.trim());
+  }
+
+  const artifacts = [];
+  let count = 1;
+  for (const code of blocks) {
+    if (isPlaceholderSkeleton(code)) continue; // never offer a Run button that runs nothing
+    let type = 'html';
+    let title = `Interactive App ${count}`;
+    if (skill === 'game' || code.includes('<canvas') || code.includes('game') || code.includes('score')) {
+      type = 'game';
+      title = `Playable HTML5 Game ${count}`;
+    } else if (skill === 'webapp' || code.includes('Tailwind') || code.includes('container')) {
+      type = 'webapp';
+      title = `Web Application ${count}`;
+    } else if (skill === 'visualizer' || code.includes('Chart(') || code.includes('<svg')) {
+      type = 'visualizer';
+      title = `Interactive Visualization ${count}`;
     }
+    artifacts.push({ title, type, code, language: 'html' });
+    count++;
   }
   return artifacts;
 }
+
+// Shared tail appended to every code-producing skill directive. The 2026-10-08
+// Flappy Bird test came back as a 655-char placeholder because the free default
+// model wrote a "thinking process" first and ran out of tokens — these rules
+// (plus maxTokens 8192 in the route) are the fix.
+const ARTIFACT_OUTPUT_RULES = [
+  'OUTPUT RULES (strict):',
+  '1. Your ENTIRE reply must be exactly ONE fenced code block: it starts with ```html and ends with ```.',
+  '2. Begin the reply with ```html immediately — NO thinking process, plan, outline, checklist or explanation before it.',
+  '3. Write the COMPLETE, ready-to-run file with every line of real code. NEVER use placeholder comments such as "// All JS here", "// game logic here" or "/* styles */" — if you cannot finish the code, do not emit a skeleton: keep writing real code instead.',
+  '4. Nothing after the closing ``` either.',
+].join('\n');
+
+// ─── In-flight generations (Stop button) ────────────────────────────────────
+// key `${userId}:${conversationId}` → AbortController wired into the upstream
+// AI call, so POST /conversations/:id/stop can actually cancel a stuck request.
+const pendingGenerations = new Map();
+const genKey = (userId, convId) => `${userId}:${convId}`;
+const ARTIFACT_SKILLS = new Set(['webapp', 'game', 'program', 'visualizer']);
 
 // ─── Get all conversations for current user ────────────────────────────────
 router.get('/conversations', authenticate, async (req, res) => {
@@ -151,13 +206,18 @@ router.delete('/conversations/:id', authenticate, async (req, res) => {
 
 // ─── Send message & get AI response ────────────────────────────────────────
 router.post('/conversations/:id/message', authenticate, async (req, res) => {
+  // Registered before ANY await so a Stop press always finds the controller.
+  const genCtl = new AbortController();
+  const pendingKey = genKey(String(req.user._id), String(req.params.id));
+  pendingGenerations.set(pendingKey, genCtl);
+  let convo = null;
   try {
     const { message, mode, model, attachments = [], skill = 'general' } = req.body;
     if (!message?.trim() && (!attachments || attachments.length === 0)) {
       return res.status(400).json({ success: false, message: 'Message or attachment is required' });
     }
 
-    const convo = await Conversation.findOne({ _id: req.params.id, userId: req.user._id });
+    convo = await Conversation.findOne({ _id: req.params.id, userId: req.user._id });
     if (!convo) return res.status(404).json({ success: false, message: 'Conversation not found' });
 
     const chatMode = mode || convo.mode || 'api';
@@ -199,7 +259,7 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
 
     const activeSkillObj = SKILLS.find(s => s.id === chosenSkill);
     if (activeSkillObj?.systemDirective) {
-      systemPrompt = `${activeSkillObj.systemDirective}\n\n${systemPrompt}`;
+      systemPrompt = `${activeSkillObj.systemDirective}\n\n${ARTIFACT_OUTPUT_RULES}\n\n${systemPrompt}`;
     }
 
     // Add user message to conversation
@@ -236,6 +296,10 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
         attachments,
         temperature: req.user.chatSettings?.temperature || 0.7,
         allowFailover: req.body.allowFailover === true,
+        // Games/apps need a real budget: the old 1500-token OpenRouter default
+        // is what turned "Build a Flappy Bird clone" into a placeholder sketch.
+        maxTokens: ARTIFACT_SKILLS.has(chosenSkill) ? 8192 : null,
+        signal: genCtl.signal,
       });
 
       aiResponse = apiResult.text;
@@ -266,10 +330,10 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
         model: chosenModel && chosenModel !== 'local' ? chosenModel : undefined,
         temperature: req.user.chatSettings?.temperature || 0.7,
         stream: false,
-      }, { timeout: 60000 });
+      }, { timeout: 60000, signal: genCtl.signal });
 
-      aiResponse = lmResponse.data.choices?.[0]?.message?.content || 'No response from LM Studio model';
-      modelUsed = lmResponse.data.model || chosenModel || 'LM Studio Local';
+      aiResponse = lmResponse.data.choices?.[0]?.message?.content || 'No response from the on-device model.';
+      modelUsed = lmResponse.data.model || chosenModel || 'on-device';
       tokensUsed = lmResponse.data.usage?.total_tokens || 0;
 
     // ── Mode: ContentBot Agent ─────────────────────────────────────────────
@@ -278,7 +342,7 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
       if (!apiKey) {
         return res.status(400).json({
           success: false,
-          message: 'No ContentBot Agent Key configured. Please enter your API key in Settings or switch to API Models.',
+          message: 'No agent platform API key configured. Please enter your API key in Settings or switch to API Models.',
         });
       }
 
@@ -290,10 +354,19 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
       }, {
         headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
         timeout: 60000,
+        signal: genCtl.signal,
       });
 
-      aiResponse = cbResponse.data.response || cbResponse.data.message || 'No response from ContentBot';
-      modelUsed = chosenModel || 'ContentBot Agent';
+      aiResponse = cbResponse.data.response || cbResponse.data.message || 'No response from the agent platform';
+      modelUsed = chosenModel || 'Agent platform';
+    }
+
+    if (typeof aiResponse !== 'string' || !aiResponse.trim()) {
+      return res.status(502).json({
+        success: false,
+        code: 'EMPTY_AI_RESPONSE',
+        message: 'The selected AI model returned an empty response. Retry or choose another available model.',
+      });
     }
 
     // Extract artifacts (HTML, games, apps, visualizers)
@@ -344,6 +417,13 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
       failedOverFrom,
     });
   } catch (err) {
+    const cancelled = err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError'
+      || err?.name === 'AbortError' || genCtl.signal.aborted;
+    if (cancelled) {
+      // Stop button: keep the user's message, never a ghost AI reply later.
+      try { if (convo) await convo.save(); } catch { /* already unwound */ }
+      return res.status(499).json({ success: false, stopped: true, message: 'Generation stopped' });
+    }
     console.error('Chat error:', err.message);
     if (err.code === 'MODEL_UNAVAILABLE') {
       return res.status(409).json({
@@ -358,11 +438,23 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
     if (err.code === 'ECONNREFUSED') {
       return res.status(503).json({
         success: false,
-        message: 'LM Studio is offline on port 1234. Please switch to "API Models" tab to chat immediately!',
+        message: 'The on-device model is offline right now — a free cloud model works immediately.',
       });
     }
     res.status(500).json({ success: false, message: err.message });
+  } finally {
+    pendingGenerations.delete(pendingKey);
   }
+});
+
+// ─── Stop an in-flight generation (Stop button) ─────────────────────────────
+// Aborts the upstream AI request so a stuck/thinking reply frees the UI and no
+// half-finished message gets saved behind the user's back.
+router.post('/conversations/:id/stop', authenticate, (req, res) => {
+  const pendingKey = genKey(String(req.user._id), String(req.params.id));
+  const ctl = pendingGenerations.get(pendingKey);
+  if (ctl) { ctl.abort(); pendingGenerations.delete(pendingKey); }
+  res.json({ success: true, stopped: Boolean(ctl) });
 });
 
 // Composed model list, kept warm for a minute: the probe runs against ten providers and
@@ -372,11 +464,16 @@ let modelsCache = { at: 0, payload: null };
 
 // ─── List available models (Local + API Models + ContentBot) ───────────────
 router.get('/models', async (req, res) => {
+  // Anonymous callers get a stripped view (see anonymousModelsView) — the full
+  // catalog, loaded-model ids and provider snapshot stay behind the dashboard JWT.
+  const maySeeDetail = await callerMaySeeDetail(req);
+
   // Composed from a probe of every provider, so the compose cost is paid once per minute
   // instead of on every keystroke-driven refetch.
   const wantsFresh = Boolean(req.query.refresh);
   if (!wantsFresh && modelsCache.payload && Date.now() - modelsCache.at < MODELS_CACHE_TTL_MS) {
-    return res.json({ ...modelsCache.payload, cached: true });
+    const cached = modelsCache.payload;
+    return res.json(maySeeDetail ? { ...cached, cached: true } : { ...anonymousModelsView(cached), cached: true });
   }
 
   const lmUrl = process.env.LM_STUDIO_BASE_URL || 'http://localhost:1234/v1';
@@ -385,13 +482,9 @@ router.get('/models', async (req, res) => {
   let isLmOnline = false;
 
   try {
-    let response;
-    try {
-      response = await axios.get(`${lmUrl}/models`, { timeout: 1500 });
-    } catch {
-      await lmStudioService.ensureServerRunning();
-      response = await axios.get(`${lmUrl}/models`, { timeout: 2500 });
-    }
+    // Listing models must never boot a daemon: starting LM Studio is the visitor's
+    // explicit action (POST /lm-studio/warm), not a side effect of opening a menu.
+    const response = await axios.get(`${lmUrl}/models`, { timeout: 2000 });
     isLmOnline = true;
     const raw = response.data?.data || [];
     lmModels = raw.map(m => classifyModel(m.id || m.name, 'local'));
@@ -401,8 +494,10 @@ router.get('/models', async (req, res) => {
 
   // No invented stand-ins: if LM Studio serves nothing, the list says so and stays empty.
   // An offline local server is a fact about this machine, not a model menu.
+  // Only ask the CLI what is loaded when the server is actually up: `lms ps`
+  // wakes a sleeping daemon, and listing a menu must not cost the host RAM.
   try {
-    lmLoadedIds = (await lmStudioService.getLoadedModels()) || [];
+    lmLoadedIds = isLmOnline ? (await lmStudioService.getLoadedModels()) || [] : [];
   } catch {
     lmLoadedIds = [];
   }
@@ -428,17 +523,29 @@ router.get('/models', async (req, res) => {
     }));
 
   const contentbotModels = [
-    { id: 'contentbot-standard', name: 'ContentBot Standard Agent', source: 'contentbot', tier: 'free', isPaid: false, badge: 'ContentBot Free' },
-    { id: 'contentbot-pro', name: 'ContentBot Pro Multi-Agent', source: 'contentbot', tier: 'paid', isPaid: true, badge: 'ContentBot Pro' },
+    { id: 'contentbot-standard', name: 'HerovaAi Standard Agent', source: 'contentbot', tier: 'free', isPaid: false, badge: 'HerovaAi Free' },
+    { id: 'contentbot-pro', name: 'HerovaAi Pro Multi-Agent', source: 'contentbot', tier: 'paid', isPaid: true, badge: 'HerovaAi Pro' },
   ];
+
+  // ── What a signed-out visitor may actually use ───────────────────────────
+  // Mirrors the gate in POST /public/message exactly: free cloud models that the
+  // provider really serves, plus local models that fit the public RAM budget.
+  // Anything else is not offered, so the menu cannot promise what the API refuses.
+  const publicCloudModels = apiModels.filter(m => m.servable && m.isPaid === false);
+  const publicLocalModels = lmModels
+    .filter(m => !m.isPaid)
+    .map(m => ({ ...m, availability: 'available', servable: true, ramHint: 'runs on this PC' }));
 
   const payload = {
     success: true,
     lmStudioOnline: isLmOnline,
     lmStudioLoaded: lmLoadedIds,
+    publicModels: [...publicLocalModels, ...publicCloudModels],
+    publicLocalModels,
+    publicCloudModels,
     lmStudioNote: isLmOnline
       ? (lmLoadedIds.length ? `${lmLoadedIds.length} model(s) loaded` : 'server up, nothing loaded')
-      : 'LM Studio is not reachable on port 1234',
+      : 'Model catalog could not be listed',
     models: [...apiModels, ...lmModels, ...contentbotModels],
     apiModels,
     localModels: lmModels,
@@ -449,7 +556,7 @@ router.get('/models', async (req, res) => {
     cached: false,
   };
   modelsCache = { at: Date.now(), payload };
-  res.json(payload);
+  return res.json(maySeeDetail ? payload : anonymousModelsView(payload));
 });
 
 // ─── Get User 7-Day Token Quota Status ────────────────────────────────────
@@ -480,34 +587,256 @@ router.get('/skills', (req, res) => {
   res.json({ success: true, skills: SKILLS });
 });
 
+// ─── Warm Up Local AI (non-blocking) ─────────────────────────────────────
+// The visitor picked a local model: wake LM Studio and load the smallest chat
+// model, in the background. Progress is read back from /lm-studio/status so no
+// browser request ever sits open while a daemon boots.
+router.post('/lm-studio/warm', async (req, res) => {
+  const { model, ttlSeconds } = req.body || {};
+  // Only a signed-in dashboard user may pin a specific model or TTL. Anonymous
+  // callers always warm the smallest model with the service default TTL, so a
+  // crafted request can never pull a 27B model into this machine's RAM.
+  const mayPin = await callerMaySeeDetail(req);
+  const requestedModel = mayPin ? model : undefined;
+  const requestedTtl = mayPin ? ttlSeconds : undefined;
+  const status = await lmStudioService.getStatus({ prune: false });
+
+  if (status.isOnline) {
+    // Already up: load the model (bounded), but never block the response on it.
+    lmStudioService.ensureModelLoaded(requestedModel, requestedTtl).catch(() => {});
+    return res.json({ success: true, state: 'online', warmed: false, isOnline: true, message: 'Private model ready' });
+  }
+
+  lmStudioService
+    .ensureModelLoaded(requestedModel, requestedTtl)
+    .then(result => {
+      if (!result.ok) console.warn(`⚠️  warm-up finished without a ready model: ${result.error}`);
+    })
+    .catch(err => console.warn(`⚠️  warm-up failed: ${err.message}`));
+
+  res.json({
+    success: true,
+    state: 'starting',
+    warmed: false,
+    isOnline: false,
+    message: 'Waking the private on-device model — the first start can take a minute',
+  });
+});
+
 // ─── Free RAM / Unload Endpoint ──────────────────────────────────────────
+// Called when the visitor leaves the local chat. Unloads the model, and stops
+// the server too when we were the ones who started it — unless the caller asks
+// to keep the daemon alive.
 router.post('/lm-studio/unload', async (req, res) => {
-  const { model } = req.body || {};
-  const ok = await lmStudioService.unloadModel(model);
-  res.json({ success: ok, message: 'Model unloaded from RAM to free memory' });
+  const { model, stopServer = true, graceSeconds } = req.body || {};
+
+  if (!stopServer) {
+    const unloaded = await lmStudioService.unloadModel(model);
+    return res.json({
+      success: true,
+      unloaded,
+      serverStopped: false,
+      message: 'Local model unloaded from RAM',
+    });
+  }
+
+  // A page unload is also what a reload looks like, so the caller may pass a
+  // grace window: model RAM is freed at once, the server stops if nobody
+  // touches it again within that window.
+  const grace = graceSeconds === undefined ? 90 : Number(graceSeconds);
+  const released = await lmStudioService.releaseLocalAi({ graceSeconds: grace });
+  res.json({
+    success: true,
+    unloaded: released.unloaded,
+    serverStopped: released.serverStopped,
+    serverStopsInSeconds: released.serverStopsInSeconds ?? null,
+    message: released.serverStopped
+      ? 'Private model unloaded — RAM released'
+      : released.serverStopsInSeconds
+        ? `Private model unloaded. It stops again in ${released.serverStopsInSeconds}s unless it is used.`
+        : 'Private model unloaded from RAM',
+  });
 });
 
 // ─── LM Studio Lifecycle Status ──────────────────────────────────────────
+// Signed-in dashboard users get the operational detail. Anyone else (public
+// visitors, network scanners hitting :5000 directly) gets only a boolean —
+// never the daemon's model list, ports or error messages.
 router.get('/lm-studio/status', async (req, res) => {
-  const isOnline = await lmStudioService.isServerRunning();
-  const loaded = await lmStudioService.getLoadedModels();
-  res.json({ success: true, isOnline, loadedModels: loaded });
+  const bearer = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
+  let maySeeDetail = false;
+  try {
+    const decoded = jwt.verify(
+      bearer.startsWith('Bearer ') ? bearer.slice(7) : '',
+      process.env.JWT_SECRET || 'fallback-secret'
+    );
+    const user = await User.findById(decoded.id || decoded._id);
+    maySeeDetail = !!user?.isActive;
+  } catch { /* anonymous or invalid token → minimal payload */ }
+
+  const status = await lmStudioService.getStatus();
+  const chatModels = status.isOnline ? await lmStudioService.listChatModels() : [];
+
+  if (!maySeeDetail) {
+    // Anonymous: only a boolean plus how many public-size models could serve.
+    const publicSized = chatModels.filter(m => (m.paramsB || Infinity) <= (lmStudioService.MAX_PUBLIC_PARAMS_B || 3));
+    return res.json({
+      success: true,
+      isOnline: status.isOnline,
+      starting: status.starting,
+      availablePublicModels: publicSized.length,
+      availablePublicParamsB: publicSized.length ? Math.max(...publicSized.map(m => m.paramsB)) : 0,
+    });
+  }
+
+  res.json({
+    success: true,
+    isOnline: status.isOnline,
+    state: status.state,
+    starting: status.starting,
+    loadedModels: status.loadedModels,
+    activeModel: status.activeModel,
+    startedByService: status.startedByService,
+    lastError: status.lastError,
+    idleStopInMs: status.idleStopInMs,
+    chatModels,
+  });
 });
+
+// ─── Public model routing ──────────────────────────────────────────────────
+// Cloud ids carry their provider as a prefix (groq/…, nvidia/…), the Gemini and
+// Cohere families do not. Everything else is treated as a local LM Studio id.
+const CLOUD_ID_PATTERN = /^(groq|agnes|unorouter|llm7|ollama|nvidia|google|liquid|cohere|thinkingmachines|deepseek|openai)\//;
+const CLOUD_BARE_ID_PATTERN = /^(gemini|command-r)/i;
+
+/** True when the caller carries a valid JWT for an active user (dashboard owner). */
+async function callerMaySeeDetail(req) {
+  const bearer = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
+  try {
+    const decoded = jwt.verify(
+      bearer.startsWith('Bearer ') ? bearer.slice(7) : '',
+      process.env.JWT_SECRET || 'fallback-secret'
+    );
+    const user = await User.findById(decoded.id || decoded._id);
+    return !!user?.isActive;
+  } catch {
+    return false; // anonymous or invalid token
+  }
+}
+
+/** The only model-catalog fields an anonymous caller may see: no local ids,
+ *  no loaded list, no provider catalog snapshot. The public chat injects its
+ *  own generic "private on-device" option client-side. */
+function anonymousModelsView(full) {
+  return {
+    success: true,
+    onDeviceAvailable: Boolean(full.lmStudioOnline),
+    publicModels: full.publicCloudModels || [],
+    publicLocalModels: [],
+    publicCloudModels: full.publicCloudModels || [],
+  };
+}
+
+/**
+ * Decide what a signed-out visitor is allowed to run, and say why when they are not.
+ * One function so the model menu and this endpoint can never disagree.
+ */
+function pickDefaultPublicCloudModel() {
+  const free = catalogService
+    .annotate(cloudAIService.getAvailableModels())
+    .filter(m => m.isPaid === false && m.servable && m.availability !== catalogService.OUT_OF_STOCK);
+  return free[0]?.id || null;
+}
+
+function resolvePublicRoute(model) {
+  if (!model) {
+    // No model named: use a free cloud model so an anonymous request can never
+    // pull a model into the host's RAM as a side effect. Local-only machines
+    // still work, but then the local path is not "explicit" and will not boot.
+    const fallbackCloud = pickDefaultPublicCloudModel();
+    if (fallbackCloud) return { ok: true, kind: 'cloud', model: fallbackCloud };
+    return { ok: true, kind: 'local', model: null, explicit: false };
+  }
+
+  if (model === 'local') {
+    return { ok: true, kind: 'local', model: null, explicit: true };
+  }
+
+  if (CLOUD_ID_PATTERN.test(model) || CLOUD_BARE_ID_PATTERN.test(model)) {
+    const annotation = catalogService
+      .annotate(cloudAIService.getAvailableModels())
+      .find(m => m.id === model);
+
+    if (!annotation) {
+      return {
+        ok: false,
+        code: 'MODEL_NOT_OFFERED',
+        message: `"${model}" is not available to public visitors. Sign in to unlock every provider.`,
+      };
+    }
+    if (annotation.isPaid) {
+      return {
+        ok: false,
+        code: 'MODEL_PAID',
+        message: `"${annotation.name || model}" is a paid model. Choose a free model or sign in.`,
+      };
+    }
+    if (!annotation.servable || annotation.availability === catalogService.OUT_OF_STOCK) {
+      return {
+        ok: false,
+        code: 'MODEL_UNAVAILABLE',
+        message: `"${annotation.name || model}" is ${annotation.availability || 'unavailable'} right now.`,
+      };
+    }
+    return { ok: true, kind: 'cloud', model };
+  }
+
+  const info = classifyModel(model, 'local');
+  if (info.isPaid) {
+    return {
+      ok: false,
+      code: 'MODEL_TOO_LARGE',
+      message: `"${model}" needs more RAM than the free public tier allows. Pick a small local model or a free cloud model.`,
+    };
+  }
+  return { ok: true, kind: 'local', model, explicit: true };
+}
+
+// Gentle guest guard: public cloud replies spend the owner's free provider keys.
+const GUEST_CLOUD_LIMIT_PER_HOUR = Number(process.env.PUBLIC_CLOUD_LIMIT_PER_HOUR || 20);
+const guestCloudUsage = new Map();
+
+function checkGuestCloudQuota(ip) {
+  const now = Date.now();
+  if (guestCloudUsage.size > 5000) {
+    for (const [key, value] of guestCloudUsage) {
+      if (now > value.resetAt) guestCloudUsage.delete(key);
+    }
+  }
+  const entry = guestCloudUsage.get(ip) || { count: 0, resetAt: now + 3600000 };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + 3600000;
+  }
+  if (entry.count >= GUEST_CLOUD_LIMIT_PER_HOUR) {
+    return { ok: false, retryInMinutes: Math.ceil((entry.resetAt - now) / 60000) };
+  }
+  entry.count += 1;
+  guestCloudUsage.set(ip, entry);
+  return { ok: true, remaining: GUEST_CLOUD_LIMIT_PER_HOUR - entry.count };
+}
 
 // ─── Public Chat Message Endpoint (No Login Required) ──────────────────────
 router.post('/public/message', async (req, res) => {
   try {
-    const { message, conversationId, model = 'qwen2-0.5b-uncensored' } = req.body;
+    const { message, conversationId, model } = req.body;
     if (!message?.trim()) {
       return res.status(400).json({ success: false, message: 'Message cannot be empty' });
     }
 
-    const modelInfo = classifyModel(model, 'local');
-    if (modelInfo.isPaid) {
-      return res.status(403).json({
-        success: false,
-        message: `🔒 "${model}" is a PRO/Paid model (3B+). Public chat is limited to 0.5B - 1B models. Please select a Free model or log in!`,
-      });
+    const route = resolvePublicRoute(model);
+    if (!route.ok) {
+      return res.status(403).json({ success: false, code: route.code, message: route.message });
     }
 
     let convo;
@@ -526,35 +855,103 @@ router.post('/public/message', async (req, res) => {
 
     convo.messages.push({ role: 'user', content: message, timestamp: new Date() });
 
-    await lmStudioService.ensureModelLoaded(model || 'qwen2-0.5b-uncensored', 20);
-
-    const lmUrl = process.env.LM_STUDIO_BASE_URL || 'http://localhost:1234/v1';
-    const systemPrompt = 'You are ContentBot AI, a helpful, fast and professional assistant running locally.';
+    const systemPrompt = 'You are HerovaAi, a helpful, fast and professional assistant.';
     const messages = [
       { role: 'system', content: systemPrompt },
       ...convo.messages.slice(-15).map(m => ({ role: m.role, content: m.content })),
     ];
 
     let aiResponse = '';
-    let modelUsed = model;
+    let modelUsed = route.model;
 
-    try {
-      const lmResponse = await axios.post(`${lmUrl}/chat/completions`, {
-        messages,
-        model: model !== 'local' ? model : undefined,
-        temperature: 0.7,
-      }, { timeout: 60000 });
-
-      aiResponse = lmResponse.data.choices?.[0]?.message?.content || 'No response from local LM Studio model.';
-      modelUsed = lmResponse.data.model || model;
-    } catch (lmErr) {
-      if (lmErr.code === 'ECONNREFUSED') {
-        return res.status(503).json({
+    if (route.kind === 'cloud') {
+      // ── Free cloud model, no local RAM involved ──────────────────────────
+      const quota = checkGuestCloudQuota(req.ip || 'unknown');
+      if (!quota.ok) {
+        return res.status(429).json({
           success: false,
-          message: 'LM Studio is not running on port 1234. Please launch LM Studio on your PC, start the Local Server, and load a model.',
+          code: 'GUEST_QUOTA',
+          message: `Free cloud chat is limited for guests. Try again in ${quota.retryInMinutes} min, or sign in for a higher quota.`,
         });
       }
-      throw lmErr;
+
+      try {
+        const apiResult = await cloudAIService.generateCompletion({
+          model: route.model,
+          messages: convo.messages.slice(-15).map(m => ({ role: m.role, content: m.content })),
+          systemPrompt,
+          temperature: 0.7,
+        });
+        aiResponse = apiResult.text || '';
+        modelUsed = apiResult.modelUsed || route.model;
+      } catch (cloudErr) {
+        return res.status(503).json({
+          success: false,
+          code: 'CLOUD_FAILED',
+          message: cloudErr.message || 'The cloud provider did not answer. Try another model.',
+        });
+      }
+    } else {
+      // ── Local LM Studio: wake it on demand, never hang the browser ───────
+      const status = await lmStudioService.getStatus({ prune: false });
+      if (!status.isOnline) {
+        if (!route.explicit) {
+          // Not asked for explicitly: report instead of booting a model server.
+          return res.status(503).json({
+            success: false,
+            code: 'NO_MODEL',
+            message: 'No free cloud model is configured right now. Pick a local model to run it on this PC.',
+          });
+        }
+        lmStudioService.ensureModelLoaded(route.model, 20).catch(() => {});
+        return res.status(503).json({
+          success: false,
+          code: 'LM_STARTING',
+          message: 'Waking the private on-device model (first start can take a minute). This message will go through once it is ready.',
+        });
+      }
+
+      const ready = await lmStudioService.ensureModelLoaded(route.model, 20);
+      if (!ready.ok) {
+        return res.status(503).json({
+          success: false,
+          code: 'LM_UNAVAILABLE',
+          message: ready.error || 'No local model is available right now.',
+        });
+      }
+      if (route.model) modelUsed = ready.model || route.model;
+      else modelUsed = ready.model || 'local';
+
+      const lmUrl = process.env.LM_STUDIO_BASE_URL || 'http://localhost:1234/v1';
+      try {
+        const lmResponse = await axios.post(`${lmUrl}/chat/completions`, {
+          messages,
+          model: modelUsed && modelUsed !== 'local' ? modelUsed : undefined,
+          temperature: 0.7,
+        }, { timeout: 120000 });
+
+        aiResponse = lmResponse.data.choices?.[0]?.message?.content || 'No response from the local model.';
+        // Public replies never advertise the concrete model id living on this machine.
+        modelUsed = 'on-device';
+      } catch (lmErr) {
+        const offline = lmErr.code === 'ECONNREFUSED' || lmErr.code === 'ECONNABORTED';
+        const fallback = String(lmErr.message || '').replace(/[Ll][Mm] ?[Ss]tudio|bionic/g, 'the model engine').slice(0, 140);
+        return res.status(offline ? 503 : 500).json({
+          success: false,
+          code: offline ? 'LM_OFFLINE' : 'LM_FAILED',
+          message: offline
+            ? 'The private on-device model went away. Retry from the chat and it will restart.'
+            : (fallback || 'The on-device model could not answer — try again or pick a cloud model.'),
+        });
+      }
+    }
+
+    if (typeof aiResponse !== 'string' || !aiResponse.trim()) {
+      return res.status(502).json({
+        success: false,
+        code: 'EMPTY_AI_RESPONSE',
+        message: 'The selected AI model returned an empty response. Retry or choose another available model.',
+      });
     }
 
     convo.messages.push({
@@ -580,7 +977,12 @@ router.post('/public/message', async (req, res) => {
       success: true,
       conversationId: convo._id,
       userMessage: { role: 'user', content: message },
-      aiMessage: { role: 'assistant', content: aiResponse, model: modelUsed },
+      aiMessage: {
+        role: 'assistant',
+        content: aiResponse,
+        // Never disclose which key in the owner's pool answered.
+        model: String(modelUsed || '').replace(/\s*\(key #\d+\)\s*$/, ''),
+      },
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -588,29 +990,19 @@ router.post('/public/message', async (req, res) => {
 });
 
 // ─── Helper: Build system prompt from memory ───────────────────────────────
+// The business-profile block lives in services/memoryProfile so the web chat and
+// the WhatsApp auto-reply describe the same shop in the same words.
 function buildSystemPrompt(memory, basePrompt) {
-  let prompt = '';
-  
-  if (memory.ownerName || memory.businessName) {
-    prompt += `You are an AI assistant representing ${memory.ownerName || 'the owner'}`;
-    if (memory.businessName) prompt += ` at ${memory.businessName}`;
-    prompt += '.\n';
-  }
-  if (memory.businessType) prompt += `Business type: ${memory.businessType}.\n`;
-  if (memory.businessDescription) prompt += `Business details: ${memory.businessDescription}.\n`;
-  if (memory.tone) prompt += `Tone: ${memory.tone}.\n`;
-  if (memory.language) prompt += `Primary language: ${memory.language}.\n`;
+  const profile = memoryProfile.promptBlock(memory);
+  let prompt = profile;
 
-  if (memory.entries?.length > 0) {
-    prompt += '\nBusiness Knowledge Base:\n';
-    memory.entries.forEach(e => {
-      prompt += `- ${e.key}: ${e.value}\n`;
-    });
+  if (basePrompt) {
+    prompt += `${prompt ? '\n\n' : ''}Additional guidelines: ${basePrompt}`;
   }
 
-  if (basePrompt) prompt += `\nAdditional guidelines: ${basePrompt}`;
-  
   return prompt.trim() || 'You are a helpful AI assistant.';
 }
 
 module.exports = router;
+// Exposed for the extraction unit test (scripts-style check, no server needed).
+module.exports.extractArtifacts = extractArtifacts;

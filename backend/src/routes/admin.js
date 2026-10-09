@@ -5,7 +5,19 @@ const Conversation = require('../models/Conversation');
 const WhatsAppSession = require('../models/WhatsAppSession');
 const AIMemory = require('../models/AIMemory');
 const bcrypt = require('bcryptjs');
+const keyVault = require('../services/keyVault');
+const googleAuth = require('../services/googleAuth');
 const { authenticate, adminOnly } = require('../middleware/auth');
+
+/** Same rule as the user routes: trim, sanity-check, never echo back. */
+function cleanKey(raw) {
+  const value = String(raw || '').trim();
+  if (!value) return { error: 'Paste an API key first' };
+  if (value.length < 8) return { error: 'That key is too short to be valid' };
+  if (value.length > 512) return { error: 'API keys are at most 512 characters' };
+  if (/\s/.test(value)) return { error: 'The key contains whitespace — it may have been copied with a line break' };
+  return { value };
+}
 
 // All admin routes require authentication + admin role
 router.use(authenticate, adminOnly);
@@ -66,27 +78,74 @@ router.get('/users', async (req, res) => {
 
 router.post('/users', async (req, res) => {
   try {
-    const { name, email, password, role, phone } = req.body;
+    const { name, email, password, role, phone, contentbotApiKey } = req.body || {};
+    if (!name || !email) {
+      return res.status(400).json({ success: false, message: 'Name and email are required' });
+    }
+
+    const $set = {};
+    if (contentbotApiKey !== undefined && contentbotApiKey !== null && String(contentbotApiKey).trim()) {
+      const cleaned = cleanKey(contentbotApiKey);
+      if (cleaned.error) return res.status(400).json({ success: false, message: cleaned.error });
+      $set.contentbotApiKey = cleaned.value;
+    }
+
     const hashedPassword = await bcrypt.hash(password || 'Password@123', 12);
-    const user = await User.create({ name, email: email.toLowerCase(), password: hashedPassword, role: role || 'user', phone });
+    const user = await User.create({
+      name,
+      email: email.toLowerCase(),
+      password: hashedPassword,
+      role: role || 'user',
+      phone,
+      ...$set,
+    });
     await AIMemory.create({ userId: user._id });
     res.status(201).json({ success: true, user });
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ success: false, message: 'That email is already registered' });
+    }
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
+// Partial update: only keys present in the body are written. An `undefined` field used to be
+// harmless, but an explicitly empty API-key box must mean "revoke", not "ignore".
 router.put('/users/:id', async (req, res) => {
   try {
-    const { name, email, role, isActive, contentbotApiKey, phone } = req.body;
-    const user = await User.findByIdAndUpdate(
-      req.params.id,
-      { $set: { name, email, role, isActive, contentbotApiKey, phone } },
-      { new: true }
-    );
+    const allowed = ['name', 'email', 'role', 'isActive', 'phone'];
+    const $set = {};
+    const $unset = {};
+    for (const field of allowed) {
+      if (req.body[field] !== undefined) $set[field] = field === 'email' ? String(req.body[field]).toLowerCase() : req.body[field];
+    }
+
+    if (req.body.contentbotApiKey !== undefined) {
+      const raw = req.body.contentbotApiKey;
+      if (raw === null || String(raw).trim() === '') {
+        $unset.contentbotApiKey = 1;
+      } else {
+        const cleaned = cleanKey(raw);
+        if (cleaned.error) return res.status(400).json({ success: false, message: cleaned.error });
+        $set.contentbotApiKey = cleaned.value;
+      }
+    }
+
+    if (Object.keys($set).length === 0 && Object.keys($unset).length === 0) {
+      return res.status(400).json({ success: false, message: 'Nothing to update' });
+    }
+
+    const update = {};
+    if (Object.keys($set).length) update.$set = $set;
+    if (Object.keys($unset).length) update.$unset = $unset;
+
+    const user = await User.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true });
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
     res.json({ success: true, user });
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ success: false, message: 'That email is already taken' });
+    }
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -219,14 +278,136 @@ router.get('/whatsapp/sessions/:id/messages', async (req, res) => {
 
 // ─── Settings (LM Studio URL, ContentBot key, etc.) ───────────────────────
 router.get('/settings', async (req, res) => {
+  const stats = keyVault.stats();
   res.json({
     success: true,
     settings: {
       lmStudioUrl: process.env.LM_STUDIO_BASE_URL || 'http://localhost:1234/v1',
       contentbotApiUrl: process.env.CONTENTBOT_API_URL || '',
       contentbotApiKey: process.env.CONTENTBOT_API_KEY ? '***configured***' : '',
+      vault: { runtimeSlots: stats.slots, hydratedAt: stats.hydratedAt || null, error: stats.hydrationError || null },
     }
   });
+});
+
+// ─── API key vault (provider keys: list / add / rotate / test / revoke) ───
+// Keys added here take effect on the next AI call — no .env edit, no restart. The .env value
+// stays as the fallback for that slot, so a revoked saved key degrades instead of breaking.
+router.get('/api-keys', async (req, res) => {
+  try {
+    const [keys, inventory] = await Promise.all([keyVault.savedKeys(), Promise.resolve(keyVault.inventory())]);
+
+    const configuredProviders = inventory.filter(p => p.configured > 0);
+    res.json({
+      success: true,
+      providers: keyVault.PROVIDERS,
+      inventory,
+      keys,
+      summary: {
+        providersConfigured: configuredProviders.length,
+        providersTotal: inventory.length,
+        savedKeys: keys.length,
+        enabledKeys: keys.filter(k => k.enabled).length,
+        failingKeys: keys.filter(k => k.lastTestStatus === 'failed').length,
+        runtimeSlots: keyVault.stats().slots,
+        hydratedAt: keyVault.stats().hydratedAt || null,
+        hydrationError: keyVault.stats().hydrationError || null,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── Google sign-in setup ──────────────────────────────────────────────────
+// The client ID and secret are ordinary vault slots (so they are saved, rotated
+// and tested like every other key); this route adds the two URLs that have to be
+// pasted into Google Cloud Console and the current readiness of the button.
+router.get('/google-signin', async (req, res) => {
+  try {
+    // Passing the request means the URLs below are the ones for the hostname the
+    // administrator is actually looking at.
+    res.json({ success: true, ...googleAuth.status(req) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/api-keys', async (req, res) => {
+  try {
+    const { envName, value, label } = req.body || {};
+    const cleaned = cleanKey(value);
+    if (cleaned.error) return res.status(400).json({ success: false, message: cleaned.error });
+
+    const doc = await keyVault.saveKey({ envName, value: cleaned.value, label, userId: req.user._id });
+    res.status(201).json({
+      success: true,
+      message: `Key saved for ${envName}`,
+      key: {
+        _id: String(doc._id),
+        provider: doc.provider,
+        envName: doc.envName,
+        label: doc.label,
+        enabled: doc.enabled,
+        masked: keyVault.mask(cleaned.value),
+      },
+    });
+  } catch (err) {
+    res.status(err.status || 500).json({ success: false, message: err.message });
+  }
+});
+
+router.put('/api-keys/:id', async (req, res) => {
+  try {
+    const { label, value, enabled } = req.body || {};
+    if (value !== undefined) {
+      const cleaned = cleanKey(value);
+      if (cleaned.error) return res.status(400).json({ success: false, message: cleaned.error });
+      req.body.value = cleaned.value;
+    }
+    const doc = await keyVault.updateKey(req.params.id, { label, value: req.body.value, enabled });
+    res.json({
+      success: true,
+      message: 'Key updated',
+      key: {
+        _id: String(doc._id),
+        provider: doc.provider,
+        envName: doc.envName,
+        label: doc.label,
+        enabled: doc.enabled,
+        masked: keyVault.mask(doc.value),
+      },
+    });
+  } catch (err) {
+    res.status(err.status || 500).json({ success: false, message: err.message });
+  }
+});
+
+router.delete('/api-keys/:id', async (req, res) => {
+  try {
+    const doc = await keyVault.deleteKey(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, message: 'Key not found' });
+    res.json({ success: true, message: 'Key revoked and removed', envName: doc.envName });
+  } catch (err) {
+    res.status(err.status || 500).json({ success: false, message: err.message });
+  }
+});
+
+/** Live probe. With no body it tests a saved key; with { envName, value } it tests a draft. */
+router.post('/api-keys/test', async (req, res) => {
+  try {
+    const { id, envName, value } = req.body || {};
+    if (value !== undefined && value !== '') {
+      const cleaned = cleanKey(value);
+      if (cleaned.error) return res.status(400).json({ success: false, message: cleaned.error });
+      const result = await keyVault.testKey({ envName, value: cleaned.value });
+      return res.json({ success: true, result });
+    }
+    const result = await keyVault.testKey({ id, envName });
+    res.json({ success: true, result });
+  } catch (err) {
+    res.status(err.status || 500).json({ success: false, message: err.message });
+  }
 });
 
 // ─── Subscription & Token Quota Management (Admin) ─────────────────────────
@@ -274,8 +455,10 @@ router.post('/users/:id/reset-tokens', async (req, res) => {
 
 router.get('/subscriptions', async (req, res) => {
   try {
+    // contentbotApiKey is selected so the serializer can report hasContentbotApiKey accurately;
+    // its value is stripped on the way out (see User.toJSON).
     const users = await User.find()
-      .select('name email role subscription tokenQuota createdAt lastSeen')
+      .select('name email role subscription tokenQuota createdAt lastSeen contentbotApiKey updatedAt')
       .sort({ createdAt: -1 });
 
     const totalTokensUsed = users.reduce((acc, u) => acc + (u.tokenQuota?.tokensUsed7d || 0), 0);

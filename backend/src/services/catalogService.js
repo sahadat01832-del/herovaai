@@ -15,6 +15,7 @@
  *                  once and reported truthfully if it fails
  */
 const axios = require('axios');
+const keyVault = require('./keyVault');
 
 const AVAILABLE = 'available';
 const OUT_OF_STOCK = 'out_of_stock';
@@ -52,20 +53,33 @@ const PROVIDERS = {
     url: 'https://api.llm7.io/v1/models' },
   ollama_cloud: { keys: ['OLLAMA_CLOUD_API_KEY', 'OLLAMA_API_KEY'], strip: 'ollama/', style: 'openai',
     url: 'https://ollama.com/v1/models' },
-  deepseek: { keys: ['DEEPSEEK_API_KEY'], strip: 'deepseek/', style: 'openai',
+  deepseek: { keys: ['DEEPSEEK_API_KEY', 'DEEPSEEK_API_KEY_2'], strip: 'deepseek/', style: 'openai',
     url: 'https://api.deepseek.com/models' },
   cohere: { keys: ['COHERE_API_KEY', 'CB_COHERE_API_KEY'], strip: '', style: 'cohere',
     url: 'https://api.cohere.com/v1/models' },
   openai: { keys: ['OPENAI_API_KEY'], strip: 'openai/', style: 'openai',
     url: 'https://api.openai.com/v1/models' },
+  // Registered for dashboard probes/snapshot only — no catalog models while
+  // chat is account-gated (verified 2026-10-08, see docs/MODELS.md).
+  apertis: { keys: ['APERTIS_API_KEY'], strip: '', style: 'openai',
+    url: 'https://api.apertis.ai/v1/models' },
+  apinex: { keys: ['APINEX_API_KEY'], strip: '', style: 'openai',
+    url: 'https://api.apinex.bond/v1/models' },
+  orcarouter: { keys: ['ORCAROUTER_API_KEY'], strip: '', style: 'openai',
+    url: 'https://api.orcarouter.ai/v1/models' },
+  airforce: { keys: ['AIRFORCE_API_KEY'], strip: '', style: 'openai',
+    url: 'https://api.airforce/v1/models' },
+  apmix: { keys: ['APMIX_API_KEY', 'APMIX_API_KEY_2'], strip: '', style: 'openai',
+    url: 'https://api.apmix.ai/v1/models' },
 };
 
 function firstKey(names) {
   return configuredKeys(names)[0] || '';
 }
 
+/** Slots resolve through the vault so a key rotated in the dashboard counts immediately. */
 function configuredKeys(names) {
-  return names.map(name => (process.env[name] || '').trim()).filter(Boolean);
+  return keyVault.resolveMany(names);
 }
 
 function hasKey(provider) {

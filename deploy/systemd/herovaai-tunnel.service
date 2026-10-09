@@ -1,0 +1,18 @@
+[Unit]
+Description=HerovaAi Public Tunnel (Cloudflare quick tunnel to the gateway)
+After=network-online.target herovaai-gateway.service
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=8
+
+[Service]
+Type=simple
+WorkingDirectory=/home/sahadat/herovaai
+ExecStart=/bin/bash /home/sahadat/herovaai/scripts/tunnel-unit.sh
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/sahadat/herovaai/logs/tunnel-unit.log
+StandardError=append:/home/sahadat/herovaai/logs/tunnel-unit.log
+
+[Install]
+WantedBy=default.target

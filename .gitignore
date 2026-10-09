@@ -2,4 +2,15 @@ node_modules/
 .next/
 tokens/
 .env
+.env.local
+.env.*.local
 *.log
+
+# OpenCode API key custody
+/home/sahadat/.config/opencode/.env
+
+# LM Studio daemon ownership marker
+.lmstudio-daemon.json
+
+# Runtime logs, pidfiles and audit output (see docs/DEPLOY.md)
+/logs/

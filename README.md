@@ -1,131 +1,106 @@
-# 🤖 ContentBot Dashboard
+# HerovaAi — Premium AI & WhatsApp Dashboard
 
-> Premium AI Control Panel & WhatsApp Business Automation Platform.  
-> Built with **Next.js 14**, **Tailwind CSS**, **Node.js/Express**, **Socket.IO**, and **MongoDB**.
+> Obsidian-and-champagne control panel for a private AI assistant and WhatsApp Business
+> automation. Built with **Next.js 14**, **Tailwind CSS**, **Node.js/Express**,
+> **Socket.IO**, and **MongoDB**.
 
----
+## Highlights
 
-## ✨ Features Overview
+- **Public chat with on-demand local AI** — visiting the chat can wake LM Studio ("Bionic"),
+  load a small model, and everything is unloaded again when the visitor leaves. Nothing
+  boots implicitly, and RAM on the 5.8 GB host stays free otherwise.
+- **Free cloud fallback** — guests are routed to free servable cloud models (20 requests/hour
+  per IP) and never touch the local machine.
+- **WhatsApp DM automation** — QR pairing via `@wppconnect-team/wppconnect`, AI auto-reply,
+  live message log.
+- **Business AI memory** — owner profile, persona/tone, custom knowledge base auto-injected
+  into chats and WhatsApp replies.
+- **Admin control center** — users, API keys, global chat inspection.
 
-### 1. 🔐 Admin Control Center
-- **Full System Visibility**: Monitor total registered clients, active WhatsApp bots, and conversation statistics.
-- **User Management**: Add, update, disable, or delete client accounts. Assign custom **ContentBot Agent API Keys** to users.
-- **Global Chat Inspection**: View and monitor all conversations happening in real time between clients/public users and the AI.
-
-### 2. 💬 Dual-Mode Chat (Local LLM & ContentBot API)
-- **Local LLM via LM Studio**: Run local models hosted on your PC (`http://localhost:1234/v1`).
-- **ContentBot API Key Integration**: Switch anytime to your existing ContentBot service using your agent keys.
-- **LAN & Wi-Fi Ready**: Both you and devices on the same Wi-Fi network can access the web application.
-
-### 3. 📱 WhatsApp DM Automation
-- **Free & Open-Source Engine**: Powered by `@wppconnect-team/wppconnect`.
-- **Instant QR Pairing**: Connect any WhatsApp number by scanning the live dynamic QR code directly in the dashboard.
-- **AI Auto-Reply**: Incoming WhatsApp messages can be automatically answered by the AI on behalf of the owner.
-- **Live Message Log & Manual DM**: View incoming messages and send manual replies straight from the browser.
-
-### 4. 🧠 Business AI Memory & Context
-- **Owner & Business Profile**: Define Owner Name, Company Name, Industry, and Services.
-- **Persona & Tone Controls**: Set the AI's communication style (Professional, Friendly, Casual, Formal, Enthusiastic).
-- **Custom Knowledge Base**: Add, edit, and delete specific memory items (e.g., pricing, opening hours, return policies, FAQs).
-- **Auto-Injection**: The AI automatically uses this memory in both the dashboard chat and WhatsApp auto-replies.
-
----
-
-## 🚀 Quick Start
-
-### 1. Prerequisites
-- **Node.js** (v18+)
-- **LM Studio** installed on your PC (start the local server on port `1234`)
-- Optional: MongoDB (if not running, the backend includes an automated In-Memory MongoDB fallback)
-
-### 2. One-Command Launch
-In the root directory, simply run:
+## Quick start
 
 ```bash
-chmod +x start.sh
-./start.sh
+npm run install:all     # backend + frontend dependencies
+npm start               # backend :5000 + frontend dev :3000
 ```
 
-Or run services independently:
+Production (as deployed on this machine via systemd user units):
 
-#### Backend:
-```bash
-cd backend
-npm start
-# Runs on http://0.0.0.0:5000
-```
-
-#### Frontend:
 ```bash
 cd frontend
-npm run dev
-# Runs on http://0.0.0.0:3000
+NODE_OPTIONS="--max-old-space-size=1536" ./node_modules/.bin/next build
+npm run start           # next start -H 0.0.0.0 -p 3001
 ```
 
----
+MongoDB on `localhost:27017` (database `contentbot`). If it is down, the backend falls back
+to an in-memory Mongo labeled as such (chats will not persist).
 
-## 🔑 Default Admin Account
+## Hosting on this machine (public, zero cost)
 
-When you start the server for the first time, an administrator account is seeded automatically:
+Four systemd user units serve the app: `contentbot-backend`, `contentbot-frontend`,
+`herovaai-gateway` (one origin for pages, `/api` and `/socket.io`) and
+`herovaai-tunnel` (Cloudflare tunnel to the gateway). The current public address is
+always in `logs/public-url.txt`:
 
-- **Email**: `admin@contentbot.local`
-- **Password**: `Admin@123456`
+```bash
+systemctl --user status contentbot-backend contentbot-frontend herovaai-gateway herovaai-tunnel
+cat logs/public-url.txt
+```
 
-*(You can change your password anytime under Settings).*
+Full runbook, including Google sign-in setup, search-engine visibility and the
+limits of a quick-tunnel hostname: [docs/DEPLOY.md](docs/DEPLOY.md).
 
----
+An admin account is seeded on first start from `backend/.env` (`ADMIN_EMAIL` /
+`ADMIN_PASSWORD`) — rotate the password in Settings after first login.
 
-## 🌐 Local & LAN Wi-Fi Access
-
-To access the dashboard from other devices (phones, laptops) on the same Wi-Fi network:
-
-1. Find your PC's local IP address:
-   ```bash
-   hostname -I
-   # Example: 192.168.1.15
-   ```
-2. Open on any device on the same Wi-Fi:
-   ```
-   http://192.168.1.15:3000
-   ```
-
----
-
-## 📁 Project Structure
+## Project tree
 
 ```
-contentbot-dashboard/
+herovaai/
 ├── backend/
-│   ├── src/
-│   │   ├── config/passport.js       # JWT & Google OAuth auth strategies
-│   │   ├── middleware/auth.js       # Token validation & Admin guard
-│   │   ├── models/                  # User, Conversation, AIMemory, WhatsAppSession
-│   │   ├── routes/                  # auth, admin, chat, memory, whatsapp, user
-│   │   ├── services/
-│   │   │   ├── socketService.js     # Real-time WebSocket events & rooms
-│   │   │   └── wppConnectService.js # WhatsApp session management & AI replies
-│   │   ├── utils/seed.js            # Initial admin seeder
-│   │   └── index.js                 # Express server & MongoDB lifecycle
-│   ├── .env.example
-│   └── package.json
+│   └── src/
+│       ├── config/         # passport & auth strategies
+│       ├── middleware/     # JWT auth, admin guard
+│       ├── models/         # User, Conversation, AIMemory, WhatsAppSession
+│       ├── routes/         # auth, admin, chat, memory, whatsapp, user
+│       ├── services/       # lmStudioService, socketService, wppConnectService
+│       ├── utils/          # seed.js, mongoMemory helper
+│       └── index.js        # Express server & Mongo lifecycle
 ├── frontend/
-│   ├── src/
-│   │   ├── app/
-│   │   │   ├── dashboard/
-│   │   │   │   ├── admin/           # Users overview & chat inspector
-│   │   │   │   ├── chat/            # Public chat with LM Studio / ContentBot
-│   │   │   │   ├── memory/          # Business AI Memory manager
-│   │   │   │   ├── whatsapp/        # WhatsApp QR & automation controls
-│   │   │   │   ├── settings/        # API key & profile controls
-│   │   │   │   ├── layout.tsx       # Glassmorphism sidebar & topbar
-│   │   │   │   └── page.tsx         # Dashboard analytics & cards
-│   │   │   ├── login/page.tsx       # Auth login (Email/PW + Google)
-│   │   │   ├── register/page.tsx    # User registration
-│   │   │   └── globals.css          # Dark glassmorphism styles & animations
-│   │   ├── contexts/AuthContext.tsx # Global Auth context
-│   │   └── lib/                     # api.ts, auth.ts
-│   ├── tailwind.config.ts
-│   └── package.json
-├── start.sh                         # Master launch script
-└── README.md
+│   └── src/
+│       ├── app/            # landing, login, register, dashboard/*
+│       ├── contexts/       # AuthContext
+│       └── lib/            # api.ts, auth.ts
+├── scripts/
+│   ├── start.sh            # dev launcher (Mongo check, LM Studio check, both services)
+│   ├── gateway.js          # one public origin: pages + /api + /socket.io (+ WebSocket)
+│   ├── tunnel-unit.sh      # public tunnel for systemd; records the URL it gets
+│   ├── public.sh           # open/close the tunnel, write the URL into backend/.env
+│   ├── stack.sh            # manual start/stop/status of the three app processes
+│   ├── oauth-check.sh      # Google sign-in wiring self-test (no real client needed)
+│   ├── make-og.py          # draws public/og.png (1200×630 social card)
+│   └── self-host-fonts.py  # downloads the fonts into public/fonts + fonts.css
+├── deploy/systemd/         # gateway + tunnel user units (symlinked into ~/.config)
+├── docs/
+│   ├── DEPLOY.md           # hosting, OAuth, SEO, operations
+│   ├── OPS.md              # runbook: services, paths, LM Studio lifecycle
+│   └── MODELS.md           # local model inventory & public-safe rule
+└── package.json            # root helpers (install:all, dev, build)
 ```
+
+## Environment
+
+- `backend/.env` — `MONGODB_URI`, `JWT_SECRET`, admin seed creds, LM Studio / Groq / Gemini /
+  OpenRouter keys. Never commit.
+- `frontend/.env.local` — nothing required. The app talks to its own origin
+  (`/api`, `/socket.io`) and the gateway forwards both; set
+  `NEXT_PUBLIC_API_URL` / `NEXT_PUBLIC_SOCKET_URL` only to point the frontend at a
+  *different* backend (they are compiled in, so a rebuild is needed).
+- LM Studio server config lives outside the repo: `~/.lmstudio/.internal/http-server-config.json`
+  (`autoStartOnLaunch: false`, port 1234). Ops details: [docs/OPS.md](docs/OPS.md).
+
+## Internal naming note
+
+Public branding is **HerovaAi**. Internal identifiers (`contentbot-standard`,
+`contentbot-pro`, `CONTENTBOT_API_KEY`, systemd unit names `contentbot-*`) are intentionally
+unchanged — renaming them would break running integrations. See [docs/OPS.md](docs/OPS.md).

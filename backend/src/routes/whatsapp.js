@@ -47,7 +47,7 @@ router.post('/sessions', authenticate, async (req, res) => {
     const fullSessionName = `${req.user._id}_${cleanName}`;
 
     let session = await WhatsAppSession.findOne({ userId: req.user._id, sessionName: fullSessionName });
-    const live = wppConnectService.getSessionState(fullSessionName);
+    const live = await wppConnectService.getSessionState(fullSessionName);
 
     if (!session) {
       session = await WhatsAppSession.create({
@@ -66,9 +66,9 @@ router.post('/sessions', authenticate, async (req, res) => {
 
     // Start WPPConnect session. A failure to even start (missing library, unwritable profile)
     // is reported now; the scan-dependent outcome arrives later over the session record.
-    const started = wppConnectService.startSession(fullSessionName, req.user._id, req.io);
+    const started = await wppConnectService.startSession(fullSessionName, req.user._id, req.io);
     if (!started.ok) {
-      return res.status(503).json({ success: false, message: started.error, session });
+      return res.status(503).json({ success: false, message: started.error, session: forOwner(session) });
     }
 
     if (started.alreadyRunning) {
@@ -126,7 +126,7 @@ router.delete('/sessions/:id', authenticate, async (req, res) => {
 // ─── Update session settings ───────────────────────────────────────────────
 router.put('/sessions/:id/settings', authenticate, async (req, res) => {
   try {
-    const { autoReply, autoReplyMode, useMemory, customPrompt, tone } = req.body;
+    const { autoReply, autoReplyMode, useMemory, customPrompt, tone, ownerMuteMinutes, handoffMessage } = req.body;
     const update = {};
 
     // Only the fields actually sent are written, and each is checked here so a bad value is
@@ -170,6 +170,25 @@ router.put('/sessions/:id/settings', authenticate, async (req, res) => {
       }
       update.tone = tone.trim();
     }
+    // How long the AI stays silent after the owner speaks in a conversation
+    // (single-speaker rule, default 5 min, hard cap 24 h).
+    if (ownerMuteMinutes !== undefined) {
+      const mins = Number(ownerMuteMinutes);
+      if (!Number.isFinite(mins) || mins <= 0 || mins > 1440) {
+        return res.status(400).json({ success: false, message: 'ownerMuteMinutes must be a number between 1 and 1440' });
+      }
+      update.ownerMuteMinutes = mins;
+    }
+    // Deterministic acknowledgment when a customer asks for the real owner.
+    if (handoffMessage !== undefined) {
+      if (typeof handoffMessage !== 'string') {
+        return res.status(400).json({ success: false, message: 'handoffMessage must be text' });
+      }
+      if (handoffMessage.length > 500) {
+        return res.status(400).json({ success: false, message: 'handoffMessage must be at most 500 characters' });
+      }
+      update.handoffMessage = handoffMessage.trim();
+    }
 
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ success: false, message: 'No settings were provided' });
@@ -201,7 +220,7 @@ router.post('/sessions/:id/send', authenticate, async (req, res) => {
 
     // The record saying "connected" and a live client existing in this process are two
     // different facts; sending needs the second one.
-    const live = wppConnectService.getSessionState(session.sessionName);
+    const live = await wppConnectService.getSessionState(session.sessionName);
     if (!live.active) {
       return res.status(409).json({
         success: false,
@@ -222,15 +241,60 @@ router.post('/sessions/:id/send', authenticate, async (req, res) => {
     };
     session.messages.push(outgoing);
     session.totalMessagesSent++;
+
+    // Owner stepped into this conversation → mute the AI for it (single-speaker
+    // rule). The timer re-arms on every further owner message.
+    const { mute } = await wppConnectService.ownerTookOver(session._id, req.user._id, to).catch(() => ({ mute: null }));
     await session.save();
 
-    res.json({ success: true, message: 'Message sent successfully', data: outgoing });
+    res.json({
+      success: true,
+      message: 'Message sent successfully',
+      data: outgoing,
+      singleSpeaker: { muted: Boolean(mute), mutedUntil: mute ? mute.until : null },
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ─── Get messages for a session (with customer grouping) ───────────────────
+// ─── Single-speaker: per-customer AI pause / resume / state ──────────────────
+router.post('/sessions/:id/customers/:customer/mute', authenticate, async (req, res) => {
+  try {
+    const customer = String(req.params.customer || '').split('@')[0];
+    if (!customer) return res.status(400).json({ success: false, message: 'Customer phone number is required' });
+    const reason = ['manual', 'owner_reply', 'handoff_request'].includes(req.body?.reason) ? req.body.reason : 'manual';
+    const { mute, windowMin } = await wppConnectService.ownerTookOver(req.params.id, req.user._id, customer, reason);
+    res.json({ success: true, muted: Boolean(mute), mutedUntil: mute ? mute.until : null, reason, windowMin });
+  } catch (err) {
+    const status = err.message === 'Session not found' ? 404 : 500;
+    res.status(status).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/sessions/:id/customers/:customer/unmute', authenticate, async (req, res) => {
+  try {
+    const customer = String(req.params.customer || '').split('@')[0];
+    if (!customer) return res.status(400).json({ success: false, message: 'Customer phone number is required' });
+    const resumed = await wppConnectService.resumeAi(req.params.id, req.user._id, customer);
+    res.json({ success: true, resumed });
+  } catch (err) {
+    const status = err.message === 'Session not found' ? 404 : 500;
+    res.status(status).json({ success: false, message: err.message });
+  }
+});
+
+router.get('/sessions/:id/customers/:customer/mute', authenticate, async (req, res) => {
+  try {
+    const customer = String(req.params.customer || '').split('@')[0];
+    if (!customer) return res.status(400).json({ success: false, message: 'Customer phone number is required' });
+    const state = await wppConnectService.muteState(req.params.id, req.user._id, customer);
+    res.json({ success: true, ...state });
+  } catch (err) {
+    const status = err.message === 'Session not found' ? 404 : 500;
+    res.status(status).json({ success: false, message: err.message });
+  }
+});
 router.get('/sessions/:id/messages', authenticate, async (req, res) => {
   try {
     const { contact } = req.query;

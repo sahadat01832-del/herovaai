@@ -25,6 +25,9 @@ require('./config/passport');
 require('./services/catalogService').warm();
 
 const app = express();
+// Behind the gateway/tunnel every request arrives from 127.0.0.1, so trust the
+// proxy headers to keep real client IPs in the logs and in rate limits.
+app.set('trust proxy', true);
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
@@ -83,9 +86,17 @@ app.use((err, _req, res, _next) => {
 const PORT = process.env.PORT || 5000;
 
 async function startServer() {
-  let uri = process.env.MONGODB_URI || 'mongodb://localhost:27017/contentbot';
+  // A short selection timeout used to drop the app onto a throwaway in-memory
+  // database whenever the host was busy (e.g. right after another service boot),
+  // which looked exactly like "my saved chats disappeared". Give the real
+  // database a fair chance before falling back.
+  let uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/contentbot';
+  const connectOptions = {
+    serverSelectionTimeoutMS: Number(process.env.MONGODB_SELECTION_TIMEOUT_MS || 15000),
+    connectTimeoutMS: Number(process.env.MONGODB_CONNECT_TIMEOUT_MS || 15000),
+  };
   try {
-    await mongoose.connect(uri, { serverSelectionTimeoutMS: 2000 });
+    await mongoose.connect(uri, connectOptions);
     console.log(`✅ MongoDB connected: ${uri}`);
   } catch (err) {
     console.warn(`⚠️  External MongoDB connection failed (${err.message}). Starting local In-Memory MongoDB...`);
@@ -95,16 +106,24 @@ async function startServer() {
         instance: { dbName: 'contentbot' }
       });
       uri = mongod.getUri();
-      await mongoose.connect(uri);
-      console.log(`✅ In-Memory MongoDB connected: ${uri}`);
+      await mongoose.connect(uri, connectOptions);
+      console.log(`✅ In-Memory MongoDB connected: ${uri} (data will not survive a restart)`);
     } catch (memErr) {
       console.error('❌ Failed to start in-memory MongoDB:', memErr.message);
       process.exit(1);
     }
   }
 
+  // Load runtime-rotated API keys before anything answers a request, then re-probe the model
+  // catalog because availability depends on which keys exist.
+  const keyVault = require('./services/keyVault');
+  await keyVault.hydrate();
+  const vaultStats = keyVault.stats();
+  console.log(`🔐 Key vault ready: ${vaultStats.slots} slot(s) with runtime keys${vaultStats.hydrationError ? ` (warning: ${vaultStats.hydrationError})` : ''}`);
+  if (vaultStats.slots > 0) require('./services/catalogService').refresh();
+
   // No WhatsApp client survives a restart, so reconcile the stored states before serving.
-  await require('./services/wppConnectService').reconcileOnBoot();
+  await require('./services/wppConnectService').reconcileOnBoot(io);
 
   // Seed admin on first run
   const { seedAdmin } = require('./utils/seed');

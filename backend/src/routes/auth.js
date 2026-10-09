@@ -5,6 +5,7 @@ const passport = require('passport');
 const router = express.Router();
 const User = require('../models/User');
 const AIMemory = require('../models/AIMemory');
+const googleAuth = require('../services/googleAuth');
 const { authenticate } = require('../middleware/auth');
 
 const signToken = (userId) => jwt.sign(
@@ -33,10 +34,9 @@ router.post('/register', async (req, res) => {
     await AIMemory.create({ userId: user._id });
 
     const token = signToken(user._id);
-    const userObj = user.toObject();
-    delete userObj.password;
-
-    res.status(201).json({ success: true, token, user: userObj });
+    // toJSON() (not toObject()) so the schema's redaction runs: no password hash and no raw
+    // agent-platform key in the login payload.
+    res.status(201).json({ success: true, token, user: user.toJSON() });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -69,35 +69,51 @@ router.post('/login', async (req, res) => {
     await user.save();
 
     const token = signToken(user._id);
-    const userObj = user.toObject();
-    delete userObj.password;
-
-    res.json({ success: true, token, user: userObj });
+    res.json({ success: true, token, user: user.toJSON() });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
 // ─── Google OAuth ─────────────────────────────────────────────────────────
-router.get('/google', (req, res, next) => {
-  const isConfigured = process.env.GOOGLE_CLIENT_ID &&
-    !process.env.GOOGLE_CLIENT_ID.startsWith('your_') &&
-    process.env.GOOGLE_CLIENT_SECRET &&
-    !process.env.GOOGLE_CLIENT_SECRET.startsWith('your_');
+// Credentials live in the key vault (falling back to .env), so an owner can paste
+// a client ID and secret into the dashboard and the button starts working on the
+// next click — no restart, no shell access.
 
-  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
-  if (!isConfigured) {
+/** Public: lets the sign-in screen explain what is missing instead of guessing. */
+router.get('/google/status', (req, res) => {
+  res.json({ success: true, ...googleAuth.status(req) });
+});
+
+/** The strategy, the redirect URI and the return URL are all read from the request. */
+router.get('/google', (req, res, next) => {
+  const frontendUrl = googleAuth.frontendUrl(req);
+  const strategy = googleAuth.strategyFor(req);
+  if (!strategy) {
     return res.redirect(`${frontendUrl}/login?error=google_not_configured`);
   }
-
-  passport.authenticate('google', { scope: ['profile', 'email'] })(req, res, next);
+  passport.authenticate(strategy, {
+    scope: ['profile', 'email'],
+    session: false,
+    // Signed and expiring: a forged callback fails the check below instead of
+    // handing a session to whoever crafted the URL.
+    state: googleAuth.issueState(),
+  })(req, res, next);
 });
 
 router.get('/google/callback', (req, res, next) => {
-  passport.authenticate('google', { session: false, failureRedirect: '/login?error=google' }, (err, user) => {
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
+  const frontendUrl = googleAuth.frontendUrl(req);
+  const strategy = googleAuth.strategyFor(req);
+  if (!strategy) {
+    return res.redirect(`${frontendUrl}/login?error=google_not_configured`);
+  }
+  if (!googleAuth.checkState(req.query.state)) {
+    return res.redirect(`${frontendUrl}/login?error=oauth_state`);
+  }
+  passport.authenticate(strategy, { session: false }, (err, user) => {
     if (err || !user) {
-      return res.redirect(`${frontendUrl}/login?error=google_failed`);
+      const reason = err && err.message ? encodeURIComponent(err.message.slice(0, 120)) : 'google_failed';
+      return res.redirect(`${frontendUrl}/login?error=${reason}`);
     }
     const token = signToken(user._id);
     res.redirect(`${frontendUrl}/auth/callback?token=${token}`);

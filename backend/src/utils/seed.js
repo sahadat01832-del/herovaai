@@ -8,10 +8,11 @@ async function seedAdmin() {
     const existing = await User.findOne({ email: adminEmail });
     
     if (!existing) {
-      const hashedPassword = await bcrypt.hash(
-        process.env.ADMIN_PASSWORD || 'Admin@123456',
-        12
-      );
+      if (!process.env.ADMIN_PASSWORD) {
+        console.error('Refusing to seed the admin account without ADMIN_PASSWORD in .env.');
+        return;
+      }
+      const hashedPassword = await bcrypt.hash(process.env.ADMIN_PASSWORD, 12);
       
       const admin = await User.create({
         name: 'Admin',
@@ -24,8 +25,7 @@ async function seedAdmin() {
       await AIMemory.create({ userId: admin._id });
       
       console.log(`✅ Admin account created: ${adminEmail}`);
-      console.log(`🔑 Default password: ${process.env.ADMIN_PASSWORD || 'Admin@123456'}`);
-      console.log('⚠️  Please change the admin password after first login!');
+      console.log('⚠️  Rotate the admin password in Settings after first login.');
     } else {
       console.log(`✅ Admin account already exists: ${adminEmail}`);
     }

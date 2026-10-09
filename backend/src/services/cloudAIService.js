@@ -15,6 +15,7 @@
 
 const axios = require('axios');
 const catalogService = require('./catalogService');
+const keyVault = require('./keyVault');
 
 // Curated catalog of models this deployment wants to offer. Whether each id can actually
 // serve is checked against the provider's live list by catalogService, never assumed here.
@@ -49,6 +50,17 @@ const ALL_MODELS_CATALOG = [
   },
 
   // ── Gemini Direct (7 Keys Fallback + Vision / Multimodal) ──
+  // End-to-end verified 2026-10-08: 2.5-flash + 3.8-flash answer; 3.8 may 503
+  // under demand spikes (transient — retry/failover covers it).
+  {
+    id: 'gemini-3.8-flash',
+    name: 'Gemini 3.8 Flash (Latest)',
+    provider: 'gemini',
+    badge: '✨ Gemini 3.8 · Latest',
+    description: 'Newest Gemini Flash — fastest capable model, 7-key rotation',
+    multimodal: true,
+    group: 'Gemini Direct (7 Keys)',
+  },
   {
     id: 'gemini-2.5-flash',
     name: 'Gemini 2.5 Flash (Vision+)',
@@ -223,41 +235,30 @@ const ALL_MODELS_CATALOG = [
   },
 
   // ── DeepSeek Direct ──
-  {
-    id: 'deepseek/deepseek-flash',
-    name: 'DeepSeek V4.1 Flash (Direct)',
-    provider: 'deepseek',
-    badge: '🔮 DeepSeek V4.1',
-    description: '1M-context DeepSeek-V4.1-Flash, text and image input',
-    multimodal: true,
-    group: 'DeepSeek Direct',
-  },
-  {
-    id: 'deepseek/deepseek-v4-pro',
-    name: 'DeepSeek V4 Pro (Direct)',
-    provider: 'deepseek',
-    badge: '🧩 DeepSeek V4 Pro',
-    description: 'DeepSeek-V4-Pro reasoning and large-context analysis',
-    multimodal: false,
-    group: 'DeepSeek Direct',
-  },
+  // PARKED 2026-10-08: both keys return 402 Insufficient Balance end-to-end.
+  // Keys stay registered (keyVault + DEEPSEEK_API_KEY_2 pool) so a top-up
+  // reactivates these two ids with no code change.
+  // { id: 'deepseek/deepseek-flash', ... },
+  // { id: 'deepseek/deepseek-v4-pro', ... },
 
   // ── Cohere Direct ──
+  // End-to-end verified 2026-10-08 (command-a-03-2025 answers on /v1/chat;
+  // command-a-plus-05-2026 needs /v2/chat so it is NOT listed).
+  {
+    id: 'command-a-03-2025',
+    name: 'Cohere Command A',
+    provider: 'cohere',
+    badge: '🌊 Cohere A',
+    description: 'Current-gen Cohere enterprise conversation model',
+    multimodal: false,
+    group: 'Cohere Direct',
+  },
   {
     id: 'command-r-plus-08-2024',
     name: 'Cohere Command R+',
     provider: 'cohere',
     badge: '🌊 Cohere R+',
-    description: 'Cohere flagship enterprise conversation model',
-    multimodal: false,
-    group: 'Cohere Direct',
-  },
-  {
-    id: 'command-r7b-12-2024',
-    name: 'Cohere Command R7B',
-    provider: 'cohere',
-    badge: '🌊 Cohere 7B',
-    description: 'Cohere fast response model',
+    description: 'Cohere flagship reasoning model (/v1 API)',
     multimodal: false,
     group: 'Cohere Direct',
   },
@@ -293,54 +294,53 @@ class CloudAIService {
     this.refreshKeys();
   }
 
+  /**
+   * Keys come from the vault, not straight from process.env: a key an admin rotated in the
+   * dashboard then takes effect on the next call, while the .env value stays as the fallback.
+   */
   refreshKeys() {
     // 1. OpenRouter Keys (pool)
-    this.openRouterKeys = [
-      process.env.OPENROUTER_API_KEY,
-      process.env.OPENROUTER_API_KEY_2,
-    ].filter(Boolean);
+    this.openRouterKeys = keyVault.resolveMany(['OPENROUTER_API_KEY', 'OPENROUTER_API_KEY_2']);
 
     // 2. Gemini Keys (pool of 7 keys for fallback)
-    this.geminiKeys = [
-      process.env.GEMINI_API_KEY,
-      process.env.GEMINI_API_KEY_2,
-      process.env.GEMINI_API_KEY_3,
-      process.env.GEMINI_API_KEY_4,
-      process.env.GEMINI_API_KEY_5,
-      process.env.GEMINI_API_KEY_6,
-      process.env.GEMINI_API_KEY_7,
-    ].filter(Boolean);
+    this.geminiKeys = keyVault.resolveMany(
+      ['GEMINI_API_KEY', ...Array.from({ length: 6 }, (_, i) => `GEMINI_API_KEY_${i + 2}`)]
+    );
 
     // 3. Agnes AI ("apenteis" / Agnes — pool of 7 keys)
-    this.agnesKeys = [
-      process.env.AGENS_API_KEY,
-      process.env.AGENS_API_KEY_2,
-      process.env.AGENS_API_KEY_3,
-      process.env.AGENS_API_KEY_4,
-      process.env.AGENS_API_KEY_5,
-      process.env.AGENS_API_KEY_6,
-      process.env.AGNES_API_KEY,
-    ].filter(Boolean);
+    this.agnesKeys = keyVault.resolveMany(
+      ['AGENS_API_KEY', ...Array.from({ length: 5 }, (_, i) => `AGENS_API_KEY_${i + 2}`), 'AGNES_API_KEY']
+    );
 
     // 4. Groq Key
-    this.groqKey = process.env.GROQ_API_KEY;
+    this.groqKey = keyVault.firstKey(['GROQ_API_KEY']) || undefined;
 
     // 5. UnoRouter Key ("orca router" / UnoRouter)
-    this.unorouterKey = process.env.UNOROUTER_API_KEY || process.env.CB_UNOROUTER_API_KEY;
+    this.unorouterKey = keyVault.firstKey(['UNOROUTER_API_KEY', 'CB_UNOROUTER_API_KEY']) || undefined;
 
     // 6. LLM7 Key
-    this.llm7Key = process.env.LLM7_API_KEY;
+    this.llm7Key = keyVault.firstKey(['LLM7_API_KEY']) || undefined;
 
     // 7. Ollama Cloud Key
-    this.ollamaCloudKey = process.env.OLLAMA_CLOUD_API_KEY || process.env.OLLAMA_API_KEY;
+    this.ollamaCloudKey = keyVault.firstKey(['OLLAMA_CLOUD_API_KEY', 'OLLAMA_API_KEY']) || undefined;
 
-    // 8. OpenCode Zen Key
-    this.opencodeZenKey = process.env.OPENCODE_ZEN_API_KEY;
+    // 8. OpenCode Zen Key (pool of 2)
+    this.opencodeZenKey = keyVault.firstKey(['OPENCODE_ZEN_API_KEY', 'OPENCODE_ZEN_API_KEY_2']) || undefined;
+    this.opencodeZenKeys = keyVault.resolveMany(['OPENCODE_ZEN_API_KEY', 'OPENCODE_ZEN_API_KEY_2']);
 
     // 9. Direct provider keys
-    this.deepSeekKey = process.env.DEEPSEEK_API_KEY;
-    this.cohereKey   = process.env.COHERE_API_KEY || process.env.CB_COHERE_API_KEY;
-    this.openAIKey   = process.env.OPENAI_API_KEY;
+    this.deepSeekKeys = keyVault.resolveMany(['DEEPSEEK_API_KEY', 'DEEPSEEK_API_KEY_2']);
+    this.deepSeekKey = this.deepSeekKeys[0] || undefined;
+    this.cohereKey   = keyVault.firstKey(['COHERE_API_KEY', 'CB_COHERE_API_KEY']) || undefined;
+    this.openAIKey   = keyVault.firstKey(['OPENAI_API_KEY']) || undefined;
+
+    // 10. Aggregator keys (registered for probes + generic caller; catalog
+    // models only land here once chat answers end-to-end — verified 2026-10-08)
+    this.apertisKey    = keyVault.firstKey(['APERTIS_API_KEY']) || undefined;
+    this.apinexKey     = keyVault.firstKey(['APINEX_API_KEY']) || undefined;
+    this.orcarouterKey = keyVault.firstKey(['ORCAROUTER_API_KEY']) || undefined;
+    this.airforceKey   = keyVault.firstKey(['AIRFORCE_API_KEY']) || undefined;
+    this.apmixKeys     = keyVault.resolveMany(['APMIX_API_KEY', 'APMIX_API_KEY_2']);
   }
 
   getAvailableModels() {
@@ -354,20 +354,56 @@ class CloudAIService {
         case 'llm7':         return Boolean(this.llm7Key);
         case 'ollama_cloud': return Boolean(this.ollamaCloudKey);
         case 'openrouter':   return this.openRouterKeys.length > 0;
-        case 'deepseek':     return Boolean(this.deepSeekKey);
+        case 'deepseek':     return this.deepSeekKeys.length > 0;
         case 'cohere':       return Boolean(this.cohereKey);
         case 'openai':       return Boolean(this.openAIKey || this.openRouterKeys.length > 0);
+        case 'apertis':      return Boolean(this.apertisKey);
+        case 'apinex':       return Boolean(this.apinexKey);
+        case 'orcarouter':   return Boolean(this.orcarouterKey);
+        case 'airforce':     return Boolean(this.airforceKey);
+        case 'apmix':        return this.apmixKeys.length > 0;
         default:             return true;
       }
     });
   }
 
+  /**
+   * POST that survives provider-side request rejections (ceilings differ per
+   * model): retry once with the offending knob removed, so a large artifact
+   * generation can never 400 just because one parameter didn't fit. Aborts
+   * (no response) pass straight through.
+   */
+  async _postCompat(url, body, config) {
+    try {
+      return await axios.post(url, body, config);
+    } catch (err) {
+      const data = err.response?.data;
+      const msg = typeof data === 'string' ? data : JSON.stringify(data || {});
+      const all = `${msg} ${err.message}`;
+      if (err.response?.status !== 400) throw err;
+      const hasCap = 'max_tokens' in body || body.generationConfig?.maxOutputTokens != null;
+      if (hasCap && /max[_ ]?tokens|maxOutputTokens|maximum.{0,20}tokens|too (large|many)|exceed/i.test(all)) {
+        delete body.max_tokens;
+        if (body.generationConfig) delete body.generationConfig.maxOutputTokens;
+        return await axios.post(url, body, config);
+      }
+      if (body.reasoning && /reasoning|unknown (field|parameter)|invalid.{0,20}parameter|not supported/i.test(all)) {
+        delete body.reasoning; // model doesn't take a reasoning knob — try without it
+        return await axios.post(url, body, config);
+      }
+      throw err;
+    }
+  }
+
   async generateCompletion({ model, messages = [], systemPrompt = '', attachments = [], temperature = 0.7,
-                            allowFailover = false }) {
+                            allowFailover = false, maxTokens = null, signal = null }) {
     this.refreshKeys();
     const targetModel = model || 'groq/qwen/qwen3.8-27b';
     const modelDef = ALL_MODELS_CATALOG.find(m => m.id === targetModel);
     const provider = modelDef?.provider || 'openrouter';
+    // Extra knobs every provider call understands: a bigger token budget for
+    // full-page artifacts (games/apps) and an abort signal for the Stop button.
+    const opts = { maxTokens, signal };
 
     const errors = [];
 
@@ -388,34 +424,50 @@ class CloudAIService {
     // ── Primary Attempt based on requested provider ──
     try {
       if (provider === 'groq') {
-        return await this.callGroq(targetModel, messages, systemPrompt, temperature);
+        return await this.callGroq(targetModel, messages, systemPrompt, temperature, opts);
       }
       if (provider === 'gemini') {
-        return await this.callGeminiWithKeyRotation(targetModel, messages, systemPrompt, attachments, temperature);
+        return await this.callGeminiWithKeyRotation(targetModel, messages, systemPrompt, attachments, temperature, opts);
       }
       if (provider === 'agnes') {
-        return await this.callAgnesWithKeyRotation(targetModel, messages, systemPrompt, temperature);
+        return await this.callAgnesWithKeyRotation(targetModel, messages, systemPrompt, temperature, opts);
       }
       if (provider === 'unorouter') {
-        return await this.callUnoRouter(targetModel, messages, systemPrompt, temperature);
+        return await this.callUnoRouter(targetModel, messages, systemPrompt, temperature, opts);
       }
       if (provider === 'llm7') {
-        return await this.callLLM7(targetModel, messages, systemPrompt, temperature);
+        return await this.callLLM7(targetModel, messages, systemPrompt, temperature, opts);
       }
       if (provider === 'ollama_cloud') {
-        return await this.callOllamaCloud(targetModel, messages, systemPrompt, temperature);
+        return await this.callOllamaCloud(targetModel, messages, systemPrompt, temperature, opts);
       }
       if (provider === 'deepseek') {
-        return await this.callDeepSeek(targetModel, messages, systemPrompt, temperature);
+        return await this.callDeepSeek(targetModel, messages, systemPrompt, temperature, opts);
+      }
+      // Aggregators via the generic caller (no catalog models today — branches
+      // activate the moment a verified id is added to ALL_MODELS_CATALOG).
+      const GENERIC_BASES = {
+        apertis: 'https://api.apertis.ai/v1',
+        apinex: 'https://api.apinex.bond/v1',
+        orcarouter: 'https://api.orcarouter.ai/v1',
+        airforce: 'https://api.airforce/v1',
+        apmix: 'https://api.apmix.ai/v1',
+      };
+      if (GENERIC_BASES[provider]) {
+        const pool = provider === 'apmix' ? this.apmixKeys
+          : [this[`${provider}Key`]].filter(Boolean);
+        const bareId = targetModel.includes('/') ? targetModel.slice(targetModel.indexOf('/') + 1) : targetModel;
+        return await this.callGenericCompat(provider, GENERIC_BASES[provider], pool, bareId, messages, systemPrompt, temperature, opts);
       }
       if (provider === 'cohere') {
-        return await this.callCohere(targetModel, messages, systemPrompt, temperature);
+        return await this.callCohere(targetModel, messages, systemPrompt, temperature, opts);
       }
       if (provider === 'openai' && this.openAIKey) {
-        return await this.callOpenAIDirect(targetModel, messages, systemPrompt, attachments, temperature);
+        return await this.callOpenAIDirect(targetModel, messages, systemPrompt, attachments, temperature, opts);
       }
-      return await this.callOpenRouterWithKeyRotation(targetModel, messages, systemPrompt, attachments, temperature);
+      return await this.callOpenRouterWithKeyRotation(targetModel, messages, systemPrompt, attachments, temperature, opts);
     } catch (err) {
+      if (signal?.aborted || err?.code === 'ERR_CANCELED') throw err; // Stop button — never failover after cancel
       errors.push(`${provider}: ${err.message}`);
       if (!allowFailover) {
         throw new ModelUnavailableError(
@@ -426,71 +478,118 @@ class CloudAIService {
     }
 
     // ── FAILOVER CHAIN (Guarantees zero-downtime reply) ──
+    // Stop button wins over any fallback: a cancelled request never retries.
+    if (signal?.aborted) throw Object.assign(new Error('Generation stopped'), { code: 'ERR_CANCELED' });
     // 1. Try Groq (Instant, ~300ms)
     if (this.groqKey && provider !== 'groq') {
       try {
         console.log(`[CloudAIService] Fallback 1: Trying Groq Qwen 3.8 27B...`);
-        const res = await this.callGroq('groq/qwen/qwen3.8-27b', messages, systemPrompt, temperature);
+        const res = await this.callGroq('groq/qwen/qwen3.8-27b', messages, systemPrompt, temperature, opts);
         res.failedOverFrom = targetModel;
         return res;
-      } catch (e) { errors.push(`groq-fallback: ${e.message}`); }
+      } catch (e) { if (signal?.aborted) throw e; errors.push(`groq-fallback: ${e.message}`); }
     }
 
     // 2. Try Gemini Direct (Rotates 7 keys)
     if (this.geminiKeys.length > 0 && provider !== 'gemini') {
       try {
         console.log(`[CloudAIService] Fallback 2: Trying Gemini 2.5 Flash...`);
-        const res = await this.callGeminiWithKeyRotation('gemini-2.5-flash', messages, systemPrompt, attachments, temperature);
+        const res = await this.callGeminiWithKeyRotation('gemini-2.5-flash', messages, systemPrompt, attachments, temperature, opts);
         res.failedOverFrom = targetModel;
         return res;
-      } catch (e) { errors.push(`gemini-fallback: ${e.message}`); }
+      } catch (e) { if (signal?.aborted) throw e; errors.push(`gemini-fallback: ${e.message}`); }
     }
 
     // 3. Try OpenRouter (Rotates keys)
     if (this.openRouterKeys.length > 0 && provider !== 'openrouter') {
       try {
         console.log(`[CloudAIService] Fallback 3: Trying OpenRouter Nemotron 3.5...`);
-        const res = await this.callOpenRouterWithKeyRotation('nvidia/nemotron-3.5-lightning:free', messages, systemPrompt, attachments, temperature);
+        const res = await this.callOpenRouterWithKeyRotation('nvidia/nemotron-3.5-lightning:free', messages, systemPrompt, attachments, temperature, opts);
         res.failedOverFrom = targetModel;
         return res;
-      } catch (e) { errors.push(`openrouter-fallback: ${e.message}`); }
+      } catch (e) { if (signal?.aborted) throw e; errors.push(`openrouter-fallback: ${e.message}`); }
     }
 
     // 4. Try UnoRouter ("orca router")
     if (this.unorouterKey && provider !== 'unorouter') {
       try {
         console.log(`[CloudAIService] Fallback 4: Trying UnoRouter...`);
-        const res = await this.callUnoRouter('unorouter/agnes-3.0-flash:free', messages, systemPrompt, temperature);
+        const res = await this.callUnoRouter('unorouter/agnes-3.0-flash:free', messages, systemPrompt, temperature, opts);
         res.failedOverFrom = targetModel;
         return res;
-      } catch (e) { errors.push(`unorouter-fallback: ${e.message}`); }
+      } catch (e) { if (signal?.aborted) throw e; errors.push(`unorouter-fallback: ${e.message}`); }
     }
 
     // 5. Try Agnes ("apenteis" / 7 keys)
     if (this.agnesKeys.length > 0 && provider !== 'agnes') {
       try {
         console.log(`[CloudAIService] Fallback 5: Trying Agnes 3.0 Flash...`);
-        const res = await this.callAgnesWithKeyRotation('agnes/agnes-3.0-flash', messages, systemPrompt, temperature);
+        const res = await this.callAgnesWithKeyRotation('agnes/agnes-3.0-flash', messages, systemPrompt, temperature, opts);
         res.failedOverFrom = targetModel;
         return res;
-      } catch (e) { errors.push(`agnes-fallback: ${e.message}`); }
+      } catch (e) { if (signal?.aborted) throw e; errors.push(`agnes-fallback: ${e.message}`); }
     }
 
     // 6. Try LLM7
     if (this.llm7Key && provider !== 'llm7') {
       try {
         console.log(`[CloudAIService] Fallback 6: Trying LLM7...`);
-        const res = await this.callLLM7('llm7/GLM-5.3-Flash', messages, systemPrompt, temperature);
+        const res = await this.callLLM7('llm7/GLM-5.3-Flash', messages, systemPrompt, temperature, opts);
         res.failedOverFrom = targetModel;
         return res;
-      } catch (e) { errors.push(`llm7-fallback: ${e.message}`); }
+      } catch (e) { if (signal?.aborted) throw e; errors.push(`llm7-fallback: ${e.message}`); }
     }
 
     throw new Error(`All AI providers and fallback keys failed: ${errors.join(' | ')}`);
   }
 
+  // ── Generic OpenAI-compatible caller ───────────────────────────────────
+  // Serves every aggregator with {baseUrl, key(s)} and no special quirks
+  // (apertis / apinex / orcarouter / airforce / apmix / zen). Keys rotate;
+  // a catalog id for one of these providers lands in the menu only after an
+  // end-to-end chat probe answers OK (see docs/MODELS.md).
+  async callGenericCompat(provider, baseUrl, keys, modelId, messages, systemPrompt, temperature = 0.7, opts = {}) {
+    const pool = Array.isArray(keys) ? keys : [keys];
+    if (!pool.length || !pool[0]) throw new Error(`No ${provider} API key configured`);
+    const formattedMessages = [];
+    if (systemPrompt) formattedMessages.push({ role: 'system', content: systemPrompt });
+    messages.forEach(m => formattedMessages.push({ role: m.role, content: m.content }));
+    let lastError = null;
+    for (let i = 0; i < pool.length; i++) {
+      try {
+        const res = await this._postCompat(`${baseUrl}/chat/completions`, {
+          model: modelId,
+          messages: formattedMessages,
+          temperature,
+          max_tokens: opts.maxTokens || 2048,
+        }, {
+          headers: {
+            Authorization: `Bearer ${pool[i]}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'http://localhost:3001',
+            'X-Title': 'ContentBot Studio',
+          },
+          timeout: opts.maxTokens ? 180000 : 45000,
+          signal: opts.signal,
+        });
+        const text = res.data.choices?.[0]?.message?.content || '';
+        const usage = res.data.usage || {};
+        return {
+          text: text.trim(),
+          tokensUsed: usage.total_tokens || Math.round((text.length / 4) + 80),
+          modelUsed: `${provider}/${modelId} (key #${i + 1})`,
+        };
+      } catch (err) {
+        if (opts.signal?.aborted || err?.code === 'ERR_CANCELED') throw err;
+        console.warn(`[${provider}] Key #${i + 1} failed (${err.response?.status || err.message}). Rotating...`);
+        lastError = err;
+      }
+    }
+    throw lastError || new Error(`All ${provider} API keys failed`);
+  }
+
   // ── Groq Implementation ──────────────────────────────────────────────────
-  async callGroq(modelId, messages, systemPrompt, temperature = 0.7) {
+  async callGroq(modelId, messages, systemPrompt, temperature = 0.7, opts = {}) {
     if (!this.groqKey) throw new Error('GROQ_API_KEY not configured');
     const cleanModel = modelId.replace('groq/', '');
 
@@ -498,17 +597,18 @@ class CloudAIService {
     if (systemPrompt) formattedMessages.push({ role: 'system', content: systemPrompt });
     messages.forEach(m => formattedMessages.push({ role: m.role, content: m.content }));
 
-    const response = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+    const response = await this._postCompat('https://api.groq.com/openai/v1/chat/completions', {
       model: cleanModel,
       messages: formattedMessages,
       temperature,
-      max_tokens: 2048,
+      max_tokens: opts.maxTokens || 2048,
     }, {
       headers: {
         Authorization: `Bearer ${this.groqKey}`,
         'Content-Type': 'application/json',
       },
-      timeout: 30000,
+      timeout: opts.maxTokens ? 180000 : 30000,
+      signal: opts.signal,
     });
 
     const text = response.data.choices?.[0]?.message?.content || '';
@@ -521,7 +621,7 @@ class CloudAIService {
   }
 
   // ── Gemini Direct with 7-Key Rotation Fallback ───────────────────────────
-  async callGeminiWithKeyRotation(modelId, messages, systemPrompt, attachments = [], temperature = 0.7) {
+  async callGeminiWithKeyRotation(modelId, messages, systemPrompt, attachments = [], temperature = 0.7, opts = {}) {
     if (this.geminiKeys.length === 0) throw new Error('No GEMINI_API_KEY configured');
     const cleanModel = modelId.replace('models/', '');
     let lastError = null;
@@ -536,17 +636,18 @@ class CloudAIService {
           if (systemPrompt) formattedMessages.push({ role: 'system', content: systemPrompt });
           messages.forEach(m => formattedMessages.push({ role: m.role, content: m.content }));
 
-          const res = await axios.post('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
+          const res = await this._postCompat('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
             model: cleanModel,
             messages: formattedMessages,
             temperature,
-            max_tokens: 3000,
+            max_tokens: opts.maxTokens || 3000,
           }, {
             headers: {
               Authorization: `Bearer ${apiKey}`,
               'Content-Type': 'application/json',
             },
-            timeout: 45000,
+            timeout: opts.maxTokens ? 180000 : 45000,
+            signal: opts.signal,
           });
 
           const text = res.data.choices?.[0]?.message?.content || '';
@@ -579,10 +680,10 @@ class CloudAIService {
             contents.push({ role, parts });
           }
 
-          const res = await axios.post(url, {
+          const res = await this._postCompat(url, {
             contents,
-            generationConfig: { temperature, maxOutputTokens: 3000 },
-          }, { timeout: 45000 });
+            generationConfig: { temperature, maxOutputTokens: opts.maxTokens || 3000 },
+          }, { timeout: opts.maxTokens ? 180000 : 45000, signal: opts.signal });
 
           const candidate = res.data.candidates?.[0];
           const text = candidate?.content?.parts?.map(p => p.text).join('\n') || '';
@@ -595,6 +696,7 @@ class CloudAIService {
           };
         }
       } catch (err) {
+        if (opts.signal?.aborted || err?.code === 'ERR_CANCELED') throw err; // Stop pressed — no key rotation
         console.warn(`[Gemini] Key #${i + 1} failed (${err.response?.status || err.message}). Rotating to next key...`);
         lastError = err;
       }
@@ -604,7 +706,7 @@ class CloudAIService {
   }
 
   // ── Agnes AI ("apenteis" / Agnes) with 7-Key Rotation ────────────────────
-  async callAgnesWithKeyRotation(modelId, messages, systemPrompt, temperature = 0.7) {
+  async callAgnesWithKeyRotation(modelId, messages, systemPrompt, temperature = 0.7, opts = {}) {
     if (this.agnesKeys.length === 0) throw new Error('No AGENS_API_KEY configured');
     const cleanModel = modelId.replace('agnes/', '');
 
@@ -616,17 +718,18 @@ class CloudAIService {
     for (let i = 0; i < this.agnesKeys.length; i++) {
       const apiKey = this.agnesKeys[i];
       try {
-        const res = await axios.post('https://apihub.agnes-ai.com/v1/chat/completions', {
+        const res = await this._postCompat('https://apihub.agnes-ai.com/v1/chat/completions', {
           model: cleanModel,
           messages: formattedMessages,
           temperature,
-          max_tokens: 2048,
+          max_tokens: opts.maxTokens || 2048,
         }, {
           headers: {
             Authorization: `Bearer ${apiKey}`,
             'Content-Type': 'application/json',
           },
-          timeout: 45000,
+          timeout: opts.maxTokens ? 180000 : 45000,
+          signal: opts.signal,
         });
 
         const text = res.data.choices?.[0]?.message?.content || '';
@@ -637,6 +740,7 @@ class CloudAIService {
           modelUsed: `agnes/${cleanModel} (key #${i + 1})`,
         };
       } catch (err) {
+        if (opts.signal?.aborted || err?.code === 'ERR_CANCELED') throw err; // Stop pressed — no key rotation
         console.warn(`[Agnes] Key #${i + 1} failed (${err.response?.status || err.message}). Rotating...`);
         lastError = err;
       }
@@ -646,7 +750,7 @@ class CloudAIService {
   }
 
   // ── UnoRouter ("orca router" / UnoRouter) ────────────────────────────────
-  async callUnoRouter(modelId, messages, systemPrompt, temperature = 0.7) {
+  async callUnoRouter(modelId, messages, systemPrompt, temperature = 0.7, opts = {}) {
     if (!this.unorouterKey) throw new Error('UNOROUTER_API_KEY not configured');
     const cleanModel = modelId.replace('unorouter/', '');
 
@@ -654,17 +758,18 @@ class CloudAIService {
     if (systemPrompt) formattedMessages.push({ role: 'system', content: systemPrompt });
     messages.forEach(m => formattedMessages.push({ role: m.role, content: m.content }));
 
-    const res = await axios.post('https://api.unorouter.com/v1/chat/completions', {
+    const res = await this._postCompat('https://api.unorouter.com/v1/chat/completions', {
       model: cleanModel,
       messages: formattedMessages,
       temperature,
-      max_tokens: 2048,
+      max_tokens: opts.maxTokens || 2048,
     }, {
       headers: {
         Authorization: `Bearer ${this.unorouterKey}`,
         'Content-Type': 'application/json',
       },
-      timeout: 45000,
+      timeout: opts.maxTokens ? 180000 : 45000,
+      signal: opts.signal,
     });
 
     const text = res.data.choices?.[0]?.message?.content || '';
@@ -677,7 +782,7 @@ class CloudAIService {
   }
 
   // ── LLM7 Gateway ─────────────────────────────────────────────────────────
-  async callLLM7(modelId, messages, systemPrompt, temperature = 0.7) {
+  async callLLM7(modelId, messages, systemPrompt, temperature = 0.7, opts = {}) {
     if (!this.llm7Key) throw new Error('LLM7_API_KEY not configured');
     const cleanModel = modelId.replace('llm7/', '');
 
@@ -685,17 +790,18 @@ class CloudAIService {
     if (systemPrompt) formattedMessages.push({ role: 'system', content: systemPrompt });
     messages.forEach(m => formattedMessages.push({ role: m.role, content: m.content }));
 
-    const res = await axios.post('https://api.llm7.io/v1/chat/completions', {
+    const res = await this._postCompat('https://api.llm7.io/v1/chat/completions', {
       model: cleanModel,
       messages: formattedMessages,
       temperature,
-      max_tokens: 2048,
+      max_tokens: opts.maxTokens || 2048,
     }, {
       headers: {
         Authorization: `Bearer ${this.llm7Key}`,
         'Content-Type': 'application/json',
       },
-      timeout: 45000,
+      timeout: opts.maxTokens ? 180000 : 45000,
+      signal: opts.signal,
     });
 
     const text = res.data.choices?.[0]?.message?.content || '';
@@ -708,7 +814,7 @@ class CloudAIService {
   }
 
   // ── Ollama Cloud ─────────────────────────────────────────────────────────
-  async callOllamaCloud(modelId, messages, systemPrompt, temperature = 0.7) {
+  async callOllamaCloud(modelId, messages, systemPrompt, temperature = 0.7, opts = {}) {
     if (!this.ollamaCloudKey) throw new Error('OLLAMA_CLOUD_API_KEY not configured');
     const cleanModel = modelId.replace('ollama/', '');
 
@@ -716,17 +822,18 @@ class CloudAIService {
     if (systemPrompt) formattedMessages.push({ role: 'system', content: systemPrompt });
     messages.forEach(m => formattedMessages.push({ role: m.role, content: m.content }));
 
-    const res = await axios.post('https://ollama.com/v1/chat/completions', {
+    const res = await this._postCompat('https://ollama.com/v1/chat/completions', {
       model: cleanModel,
       messages: formattedMessages,
       temperature,
-      max_tokens: 2048,
+      max_tokens: opts.maxTokens || 2048,
     }, {
       headers: {
         Authorization: `Bearer ${this.ollamaCloudKey}`,
         'Content-Type': 'application/json',
       },
-      timeout: 45000,
+      timeout: opts.maxTokens ? 180000 : 45000,
+      signal: opts.signal,
     });
 
     const text = res.data.choices?.[0]?.message?.content || '';
@@ -739,7 +846,7 @@ class CloudAIService {
   }
 
   // ── OpenRouter with Multi-Key Rotation ───────────────────────────────────
-  async callOpenRouterWithKeyRotation(modelId, messages, systemPrompt, attachments = [], temperature = 0.7) {
+  async callOpenRouterWithKeyRotation(modelId, messages, systemPrompt, attachments = [], temperature = 0.7, opts = {}) {
     if (this.openRouterKeys.length === 0) throw new Error('No OPENROUTER_API_KEY configured');
 
     const formattedMessages = [];
@@ -769,11 +876,16 @@ class CloudAIService {
     for (let i = 0; i < this.openRouterKeys.length; i++) {
       const apiKey = this.openRouterKeys[i];
       try {
-        const res = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+        const res = await this._postCompat('https://openrouter.ai/api/v1/chat/completions', {
           model: modelId,
           messages: formattedMessages,
           temperature,
-          max_tokens: 1500,
+          max_tokens: opts.maxTokens || 1500,
+          // Artifact-sized requests turn OFF this model's hidden reasoning: in the
+          // 2026-10-08 test it burned 84% of an 8192-token budget on thinking
+          // (1679/2000 in a probe) and cut the game off mid-function after 291s.
+          // With reasoning disabled the same generation finishes in seconds.
+          ...(opts.maxTokens ? { reasoning: { enabled: false } } : {}),
         }, {
           headers: {
             Authorization: `Bearer ${apiKey}`,
@@ -781,7 +893,8 @@ class CloudAIService {
             'HTTP-Referer': 'http://localhost:3001',
             'X-Title': 'ContentBot Studio',
           },
-          timeout: 70000,
+          timeout: opts.maxTokens ? 180000 : 70000,
+          signal: opts.signal,
         });
 
         const text = res.data.choices?.[0]?.message?.content || '';
@@ -792,6 +905,7 @@ class CloudAIService {
           modelUsed: `${res.data.model || modelId} (key #${i + 1})`,
         };
       } catch (err) {
+        if (opts.signal?.aborted || err?.code === 'ERR_CANCELED') throw err; // Stop pressed — no key rotation
         console.warn(`[OpenRouter] Key #${i + 1} failed (${err.response?.status || err.message}). Rotating...`);
         lastError = err;
       }
@@ -800,9 +914,9 @@ class CloudAIService {
     throw lastError || new Error('All OpenRouter API keys failed');
   }
 
-  // ── DeepSeek Direct ──────────────────────────────────────────────────────
-  async callDeepSeek(modelId, messages, systemPrompt, temperature = 0.7) {
-    if (!this.deepSeekKey) throw new Error('DEEPSEEK_API_KEY not configured');
+  // ── DeepSeek Direct (2-key rotation) ───────────────────────────────────
+  async callDeepSeek(modelId, messages, systemPrompt, temperature = 0.7, opts = {}) {
+    if (this.deepSeekKeys.length === 0) throw new Error('DEEPSEEK_API_KEY not configured');
     // DeepSeek renamed its models (deepseek-chat and deepseek-reasoner are gone from its live
     // list), so the request carries the catalog id verbatim instead of a stale hardcoded id.
     const dsModel = modelId.replace(/^deepseek\//, '');
@@ -811,30 +925,41 @@ class CloudAIService {
     if (systemPrompt) msgs.push({ role: 'system', content: systemPrompt });
     messages.forEach(m => msgs.push({ role: m.role, content: m.content }));
 
-    const res = await axios.post('https://api.deepseek.com/chat/completions', {
-      model: dsModel,
-      messages: msgs,
-      temperature,
-      max_tokens: 4096,
-    }, {
-      headers: {
-        Authorization: `Bearer ${this.deepSeekKey}`,
-        'Content-Type': 'application/json',
-      },
-      timeout: 70000,
-    });
+    let lastError = null;
+    for (let i = 0; i < this.deepSeekKeys.length; i++) {
+      try {
+        const res = await this._postCompat('https://api.deepseek.com/chat/completions', {
+          model: dsModel,
+          messages: msgs,
+          temperature,
+          max_tokens: opts.maxTokens || 4096,
+        }, {
+          headers: {
+            Authorization: `Bearer ${this.deepSeekKeys[i]}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: opts.maxTokens ? 180000 : 70000,
+          signal: opts.signal,
+        });
 
-    const text = res.data.choices?.[0]?.message?.content || '';
-    const usage = res.data.usage || {};
-    return {
-      text: text.trim(),
-      tokensUsed: Math.round(usage.total_tokens || (text.length / 4) + 100),
-      modelUsed: `deepseek/${dsModel}`,
-    };
+        const text = res.data.choices?.[0]?.message?.content || '';
+        const usage = res.data.usage || {};
+        return {
+          text: text.trim(),
+          tokensUsed: Math.round(usage.total_tokens || (text.length / 4) + 100),
+          modelUsed: `deepseek/${dsModel} (key #${i + 1})`,
+        };
+      } catch (err) {
+        if (opts.signal?.aborted || err?.code === 'ERR_CANCELED') throw err;
+        console.warn(`[DeepSeek] Key #${i + 1} failed (${err.response?.status || err.message}). Rotating...`);
+        lastError = err;
+      }
+    }
+    throw lastError || new Error('All DeepSeek API keys failed');
   }
 
   // ── Cohere Direct ────────────────────────────────────────────────────────
-  async callCohere(modelId, messages, systemPrompt, temperature = 0.7) {
+  async callCohere(modelId, messages, systemPrompt, temperature = 0.7, opts = {}) {
     if (!this.cohereKey) throw new Error('COHERE_API_KEY not configured');
     // As with DeepSeek: pass through what was requested rather than a hardcoded fallback id.
     const cohereModel = modelId.replace(/^cohere\//, '');
@@ -848,19 +973,20 @@ class CloudAIService {
     }
     const lastMsg = messages[messages.length - 1];
 
-    const res = await axios.post('https://api.cohere.com/v1/chat', {
+    const res = await this._postCompat('https://api.cohere.com/v1/chat', {
       model: cohereModel,
       message: lastMsg?.content || '',
       chat_history: chatHistory,
       preamble: systemPrompt || undefined,
       temperature,
-      max_tokens: 4096,
+      max_tokens: opts.maxTokens || 4096,
     }, {
       headers: {
         Authorization: `Bearer ${this.cohereKey}`,
         'Content-Type': 'application/json',
       },
-      timeout: 60000,
+      timeout: opts.maxTokens ? 180000 : 60000,
+      signal: opts.signal,
     });
 
     const text = res.data.text || '';
@@ -873,7 +999,7 @@ class CloudAIService {
   }
 
   // ── OpenAI Direct ────────────────────────────────────────────────────────
-  async callOpenAIDirect(modelId, messages, systemPrompt, attachments = [], temperature = 0.7) {
+  async callOpenAIDirect(modelId, messages, systemPrompt, attachments = [], temperature = 0.7, opts = {}) {
     if (!this.openAIKey) throw new Error('OPENAI_API_KEY not configured');
     const cleanModel = modelId.replace('openai/', '');
 
@@ -881,17 +1007,18 @@ class CloudAIService {
     if (systemPrompt) formattedMessages.push({ role: 'system', content: systemPrompt });
     messages.forEach(m => formattedMessages.push({ role: m.role, content: m.content }));
 
-    const res = await axios.post('https://api.openai.com/v1/chat/completions', {
+    const res = await this._postCompat('https://api.openai.com/v1/chat/completions', {
       model: cleanModel,
       messages: formattedMessages,
       temperature,
-      max_tokens: 4096,
+      max_tokens: opts.maxTokens || 4096,
     }, {
       headers: {
         Authorization: `Bearer ${this.openAIKey}`,
         'Content-Type': 'application/json',
       },
-      timeout: 60000,
+      timeout: opts.maxTokens ? 180000 : 60000,
+      signal: opts.signal,
     });
 
     const text = res.data.choices?.[0]?.message?.content || '';

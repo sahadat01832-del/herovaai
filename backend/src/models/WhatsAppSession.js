@@ -28,6 +28,20 @@ const WhatsAppSessionSchema = new mongoose.Schema({
   useMemory: { type: Boolean, default: true },
   customPrompt: { type: String, default: '' },
   tone: { type: String, default: '' },
+  // ── Single-speaker rule: when the owner steps into a conversation the AI
+  // goes silent there and auto-resumes after ownerMuteMinutes of owner silence.
+  // One mute per customer (phone number); absolute `until` timestamps mean
+  // expiry needs no scheduler — each incoming message just checks the clock.
+  aiMutes: [{
+    customer: { type: String, required: true },
+    until: { type: Date, required: true },
+    reason: { type: String, enum: ['owner_reply', 'handoff_request', 'manual'], default: 'owner_reply' },
+    createdAt: { type: Date, default: Date.now },
+  }],
+  ownerMuteMinutes: { type: Number, default: 5 },
+  // Deterministic reply when a customer asks for the real owner. Empty = let
+  // the AI model handle the handoff (ack still tracked the same way).
+  handoffMessage: { type: String, default: '' },
   // Last connect/handshake failure, so the UI can say why instead of guessing
   lastError: { type: String, default: null },
   lastErrorAt: { type: Date, default: null },

@@ -5,7 +5,7 @@ import {
   Paperclip, Image as ImageIcon, X, Play, Code, Download,
   Maximize2, Minimize2, Globe, Gamepad2, Code2, BarChart3,
   CreditCard, FileText, ChevronDown, ChevronUp, Check,
-  Brain, Cloud, Cpu, MessageSquare, Settings2
+  Brain, Cloud, Cpu, MessageSquare, Search, Settings2, Square
 } from 'lucide-react'
 import { chatApi } from '@/lib/api'
 import { useAuth } from '@/contexts/AuthContext'
@@ -25,6 +25,7 @@ interface AIModel {
   id: string; name: string; source: 'api' | 'local' | 'contentbot'
   tier: 'free' | 'paid'; isPaid: boolean; badge: string
   description?: string; multimodal?: boolean; group?: string
+  availability?: string; servable?: boolean; pricing?: { prompt: number; completion: number } | null
 }
 
 const SKILL_OPTIONS = [
@@ -39,6 +40,8 @@ export default function ChatPage() {
   const { user } = useAuth()
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeConvId, setActiveConvId] = useState<string | null>(null)
+  /** Sidebar filter — long histories are unusable without one. */
+  const [convQuery, setConvQuery] = useState('')
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
@@ -65,6 +68,7 @@ export default function ChatPage() {
   const modelRef     = useRef<HTMLDivElement>(null)
   const skillRef     = useRef<HTMLDivElement>(null)
   const modeRef      = useRef<HTMLDivElement>(null)
+  const abortRef     = useRef<AbortController | null>(null)
 
   useEffect(() => {
     loadConversations(); loadModels(); loadQuota()
@@ -157,15 +161,30 @@ export default function ChatPage() {
     const currentInput = input; const currentAttachments = [...attachments]
     setMessages(prev => [...prev, { role: 'user', content: currentInput, attachments: currentAttachments, timestamp: new Date().toISOString() }])
     setInput(''); setAttachments([]); setSending(true)
+    const controller = new AbortController()
+    abortRef.current = controller
     try {
-      const d: any = await chatApi.sendMessage(convId!, currentInput, mode, selectedModel, currentAttachments, selectedSkill)
+      const d: any = await chatApi.sendMessage(convId!, currentInput, mode, selectedModel, currentAttachments, selectedSkill, controller.signal)
       setMessages(prev => [...prev, d.aiMessage]); loadQuota()
       if (d.artifacts?.length > 0) toast.success(`✨ ${d.artifacts.length} artifact generated! Tap Run to preview.`)
       setConversations(prev => prev.map(c => c._id === convId ? { ...c, title: (currentInput || 'File').slice(0, 40) } : c))
     } catch (err: any) {
-      toast.error(err.message)
-      setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ ${err.message}` }])
-    } finally { setSending(false) }
+      if (err?.name === 'AbortError') {
+        toast('⏹ Generation stopped', { icon: '🛑' })
+      } else {
+        toast.error(err.message)
+        setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ ${err.message}` }])
+      }
+    } finally { setSending(false); abortRef.current = null }
+  }
+
+  // Stop button: cancel the browser fetch AND abort the upstream AI call on the
+  // backend, so a stuck "thinking" reply frees both sides (no ghost message
+  // appears later from the request we abandoned).
+  const stopGeneration = () => {
+    abortRef.current?.abort()
+    if (activeConvId) chatApi.stopMessage(activeConvId).catch(() => {})
+    setSending(false)
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -185,15 +204,23 @@ export default function ChatPage() {
   const activeSkillObj  = SKILL_OPTIONS.find(s => s.id === selectedSkill) || SKILL_OPTIONS[0]
   const SkillIcon = activeSkillObj.icon
 
-  // Group models for the picker
-  const modelGroups = currentModels.reduce((acc, m) => {
-    const g = m.group || 'Other'
-    if (!acc[g]) acc[g] = []
-    acc[g].push(m)
-    return acc
-  }, {} as Record<string, AIModel[]>)
+  // Group models for the picker — verified-servable first so the menu leads
+  // with models that answer; unverified entries stay selectable (the backend
+  // attempts them once and reports truthfully instead of silent-failover).
+  const modelGroups = [...currentModels]
+    .sort((a, b) => Number(b.servable ?? true) - Number(a.servable ?? true))
+    .reduce((acc, m) => {
+      const g = m.group || 'Other'
+      if (!acc[g]) acc[g] = []
+      acc[g].push(m)
+      return acc
+    }, {} as Record<string, AIModel[]>)
 
   const quotaPct = tokenQuota ? Math.min(100, Math.round((tokenQuota.tokensUsed7d / tokenQuota.weeklyLimit) * 100)) : 0
+
+  const filteredConversations = convQuery.trim()
+    ? conversations.filter(c => (c.title || '').toLowerCase().includes(convQuery.trim().toLowerCase()))
+    : conversations
 
   /* ───── Conversation sidebar ───── */
   const Sidebar = () => (
@@ -203,13 +230,30 @@ export default function ChatPage() {
           <Plus className="w-4 h-4" /> New Chat
         </button>
       </div>
-      <div className="flex-1 overflow-y-auto p-2">
+      {conversations.length > 2 ? (
+        <div className="relative px-3 pb-2">
+          <Search className="pointer-events-none absolute left-5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-dark-600" aria-hidden />
+          <input
+            value={convQuery}
+            onChange={e => setConvQuery(e.target.value)}
+            placeholder="Search chats…"
+            aria-label="Search conversations"
+            className="input-dark py-1.5 pl-8 text-[11.5px]"
+          />
+        </div>
+      ) : null}
+      <div className="scroll-thin flex-1 overflow-y-auto p-2">
         {conversations.length === 0 ? (
-          <div className="text-center py-12 px-4">
-            <Brain className="w-8 h-8 text-dark-700 mx-auto mb-2" />
-            <p className="text-dark-500 text-xs">No chats yet</p>
+          <div className="px-4 py-12 text-center">
+            <Brain className="mx-auto mb-2 h-8 w-8 text-dark-600" aria-hidden />
+            <p className="text-[12px] text-dark-500">No chats yet</p>
+            <p className="mt-1 text-[11px] text-dark-600">Start one and it will show up here.</p>
           </div>
-        ) : conversations.map(c => (
+        ) : filteredConversations.length === 0 ? (
+          <div className="px-4 py-10 text-center">
+            <p className="text-[12px] text-dark-500">Nothing matches “{convQuery}”</p>
+          </div>
+        ) : filteredConversations.map(c => (
           <button key={c._id} onClick={() => { selectConversation(c._id); setMobileSidebarOpen(false) }}
             className={`w-full text-left px-3 py-2.5 rounded-xl mb-1 flex items-center gap-2 group transition-all ${activeConvId === c._id ? 'nav-active' : 'text-dark-400 hover:bg-white/4 hover:text-white'}`}>
             <MessageSquare className={`w-3.5 h-3.5 flex-shrink-0 ${activeConvId === c._id ? 'text-brand-400' : 'text-dark-600'}`} />
@@ -224,7 +268,11 @@ export default function ChatPage() {
   )
 
   return (
-    <div className="flex h-screen overflow-hidden" style={{ background: 'var(--bg-void)' }}>
+    // Fills the shell's content area instead of the whole viewport: the dashboard chrome owns
+    // the outer scroll, so a nested 100vh here produced a second scrollbar and a dead strip.
+    // `dvh` keeps the composer above the mobile browser chrome, and the shorter mobile height
+    // reserves room for the fixed bottom navigation.
+    <div className="card chat-shell flex overflow-hidden p-0">
 
       {/* ── Desktop sidebar ── */}
       <div className="hidden md:flex w-60 flex-col flex-shrink-0" style={{ background: 'rgba(7,7,15,0.95)', borderRight: '1px solid rgba(255,255,255,0.06)' }}>
@@ -310,7 +358,7 @@ export default function ChatPage() {
 
           <div className="space-y-4 max-w-3xl mx-auto">
             {messages.map((msg, i) => (
-              <div key={i} className={`flex gap-2.5 animate-slide-up ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
+              <div key={i} className={`flex animate-fade-up gap-2.5 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
                 {/* Avatar */}
                 <div className={`w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0 mt-0.5 ${msg.role === 'user' ? 'bg-gradient-neon glow-brand' : 'bg-gradient-to-br from-cyan-700 to-blue-800 glow-cyan'}`}>
                   {msg.role === 'user' ? <User className="w-4 h-4 text-white" /> : <Bot className="w-4 h-4 text-white" />}
@@ -372,10 +420,15 @@ export default function ChatPage() {
                 <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-cyan-700 to-blue-800 flex items-center justify-center glow-cyan flex-shrink-0">
                   <Bot className="w-4 h-4 text-white" />
                 </div>
-                <div className="msg-ai rounded-2xl px-4 py-3">
-                  <div className="flex gap-1.5 items-center">
-                    {[0,150,300].map(d => <div key={d} className="w-2 h-2 rounded-full bg-brand-400 animate-bounce" style={{ animationDelay: `${d}ms` }} />)}
-                  </div>
+                <div className="msg-ai flex items-center gap-2.5 rounded-2xl px-4 py-3">
+                  <span className="typing flex items-center text-brand-300" aria-hidden>
+                    <span /><span /><span />
+                  </span>
+                  <span className="text-[12px] text-dark-400">Thinking…</span>
+                  <button onClick={stopGeneration}
+                    className="flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-semibold text-red-300 transition-colors hover:bg-red-500/10">
+                    <Square className="h-2.5 w-2.5 fill-current" /> Stop
+                  </button>
                 </div>
               </div>
             )}
@@ -451,7 +504,7 @@ export default function ChatPage() {
                       </div>
                       {groupModels.map(m => (
                         <button key={m.id} onClick={() => { setSelectedModel(m.id); setModelPickerOpen(false) }}
-                          className={`w-full text-left flex items-center gap-2.5 px-3 py-2.5 text-xs transition-all ${selectedModel === m.id ? 'bg-brand-500/15 text-white' : 'text-dark-300 hover:bg-white/5 hover:text-white'}`}>
+                          className={`w-full text-left flex items-center gap-2.5 px-3 py-2.5 text-xs transition-all ${selectedModel === m.id ? 'bg-brand-500/15 text-white' : 'text-dark-300 hover:bg-white/5 hover:text-white'} ${m.servable === false ? 'opacity-55' : ''}`}>
                           <div className={`w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 ${m.multimodal ? 'bg-cyan-500/15' : 'bg-brand-500/12'}`}>
                             {m.multimodal ? <ImageIcon className="w-3.5 h-3.5 text-cyan-400" /> : <Sparkles className="w-3.5 h-3.5 text-brand-400" />}
                           </div>
@@ -459,6 +512,7 @@ export default function ChatPage() {
                             <p className="font-semibold truncate">{m.name}</p>
                             <p className="text-[10px] text-dark-600 truncate">{m.badge}</p>
                           </div>
+                          {m.servable === false && <span className="badge py-0 text-[9px] flex-shrink-0" title={m.availability}>Unverified</span>}
                           {selectedModel === m.id && <Check className="w-3.5 h-3.5 text-brand-400 flex-shrink-0" />}
                           {m.multimodal && <span className="badge badge-cyan py-0 text-[9px] flex-shrink-0">Vision</span>}
                         </button>
@@ -522,12 +576,19 @@ export default function ChatPage() {
               rows={1} style={{ resize: 'none' }}
               className="input-dark flex-1 py-3 min-h-[46px] max-h-32 text-sm leading-relaxed" />
 
-            {/* Send */}
-            <button type="button" onClick={sendMessage as any}
-              disabled={sending || (!input.trim() && !attachments.length)}
-              className="btn-primary p-3 flex-shrink-0 rounded-xl">
-              {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-            </button>
+            {/* Send (while idle) / Stop (while the AI is thinking) */}
+            {sending ? (
+              <button type="button" onClick={stopGeneration} title="Stop generating"
+                className="btn-danger flex-shrink-0 px-3" aria-label="Stop generating">
+                <Square className="h-4 w-4 fill-current" />
+              </button>
+            ) : (
+              <button type="button" onClick={sendMessage as any}
+                disabled={!input.trim() && !attachments.length}
+                className="btn-primary p-3 flex-shrink-0 rounded-xl">
+                <Send className="w-4 h-4" />
+              </button>
+            )}
           </div>
         </div>
       </div>
