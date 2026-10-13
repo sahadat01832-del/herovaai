@@ -14,3 +14,4 @@ tokens/
 
 # Runtime logs, pidfiles and audit output (see docs/DEPLOY.md)
 /logs/
+backend/public/media/
