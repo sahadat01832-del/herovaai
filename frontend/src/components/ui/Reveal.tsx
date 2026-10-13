@@ -106,8 +106,8 @@ export function ProgressRing({ value, size = 132, stroke = 9, label, sublabel, t
 
   const offset = circumference - (drawn / 100) * circumference
   const color = tone === 'success'
-    ? pct >= 80 ? '#6ee7b7' : pct >= 40 ? '#c0a872' : '#7f9a8c'
-    : pct > 85 ? '#f87171' : pct > 60 ? '#e0b79f' : '#d4be8e'
+    ? pct >= 80 ? '#6ee7b7' : pct >= 40 ? '#d8bd85' : '#7f9a8c'
+    : pct > 85 ? '#f87171' : pct > 60 ? '#e0b79f' : '#e7d3a3'
 
   return (
     <div className="relative inline-flex items-center justify-center" style={{ width: size, height: size }}>
@@ -117,7 +117,7 @@ export function ProgressRing({ value, size = 132, stroke = 9, label, sublabel, t
           cx={size / 2} cy={size / 2} r={radius} fill="none"
           stroke={color} strokeWidth={stroke} strokeLinecap="round"
           strokeDasharray={circumference} strokeDashoffset={offset}
-          style={{ filter: 'drop-shadow(0 0 8px rgba(192,168,114,0.35))' }}
+          style={{ filter: 'drop-shadow(0 0 8px rgba(216,189,133,0.35))' }}
         />
       </svg>
       <div className="absolute inset-0 flex flex-col items-center justify-center text-center">

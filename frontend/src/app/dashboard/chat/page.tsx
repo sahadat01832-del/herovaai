@@ -61,6 +61,11 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  // True from the first streamed delta until the reply is final. While it is set the
+  // "Thinking…" row is hidden — text is already flowing on screen, so a second
+  // "thinking" caption under it would be contradictory. (It stays on for the whole
+  // wait BEFORE the first token, which is exactly when the user needs reassurance.)
+  const [streaming, setStreaming] = useState(false)
   const [mode, setMode] = useState<'api' | 'local' | 'contentbot'>('api')
   // Only a first guess: the model list below replaces it with the recommended
   // free model of whatever the API actually serves (see the loaders at 118/127).
@@ -250,32 +255,104 @@ export default function ChatPage() {
     setInput(''); setAttachments([]); setSending(true)
     const controller = new AbortController()
     abortRef.current = controller
+    // Streaming paints the reply as it arrives; a placeholder assistant bubble is
+    // appended and grown in place, then swapped for the authoritative message the
+    // server sends in `done` (it carries artifacts, token count and the real model).
+    let streamStarted = false
     try {
-      const d: any = await chatApi.sendMessage(
-        convId!,
-        currentInput,
-        mode,
-        selectedModel,
-        currentAttachments,
-        selectedSkill,
-        controller.signal,
-        {
-          flowModel,
-          flowAspectRatio,
-          flowMediaType,
+      let d: any
+      try {
+        d = await chatApi.sendMessageStream(
+          convId!,
+          currentInput,
+          mode,
+          selectedModel,
+          currentAttachments,
+          selectedSkill,
+          controller.signal,
+          { flowModel, flowAspectRatio, flowMediaType },
+          (delta) => {
+            if (!streamStarted) {
+              streamStarted = true
+              setStreaming(true)
+              setMessages(prev => [...prev, { role: 'assistant', content: delta }])
+            } else {
+              setMessages(prev => {
+                const next = [...prev]
+                for (let i = next.length - 1; i >= 0; i--) {
+                  if (next[i].role === 'assistant') {
+                    next[i] = { ...next[i], content: next[i].content + delta }
+                    break
+                  }
+                }
+                return next
+              })
+            }
+          },
+        )
+      } catch (streamErr: any) {
+        // Retry buffered only if no streamed text appeared; retrying after a partial
+        // response could duplicate a provider request that is still completing.
+        if (streamErr?.code === 'STREAM_UNAVAILABLE' && !streamStarted && !controller.signal.aborted) {
+          d = await chatApi.sendMessage(
+            convId!, currentInput, mode, selectedModel, currentAttachments, selectedSkill,
+            controller.signal, { flowModel, flowAspectRatio, flowMediaType },
+          )
+        } else {
+          throw streamErr
         }
-      )
-      setMessages(prev => [...prev, d.aiMessage]); loadQuota()
+      }
+
+      if (streamStarted) {
+        // Swap the live bubble for the final authoritative message.
+        setMessages(prev => {
+          const next = [...prev]
+          for (let i = next.length - 1; i >= 0; i--) {
+            if (next[i].role === 'assistant') { next[i] = d.aiMessage; break }
+          }
+          return next
+        })
+      } else {
+        setMessages(prev => [...prev, d.aiMessage])
+      }
+      loadQuota()
       if (d.artifacts?.length > 0) toast.success(`✨ ${d.artifacts.length} artifact generated! Tap Run to preview.`)
       setConversations(prev => prev.map(c => c._id === convId ? { ...c, title: (currentInput || 'File').slice(0, 40) } : c))
     } catch (err: any) {
-      if (err?.name === 'AbortError') {
+      if (err?.name === 'AbortError' || err?.code === 'STOPPED' || err?.stopped) {
         toast('⏹ Generation stopped', { icon: '🛑' })
+        // Drop a half-typed live bubble so no truncated answer lingers.
+        if (streamStarted) {
+          setMessages(prev => {
+            const next = [...prev]
+            const last = next[next.length - 1]
+            if (last?.role === 'assistant' && last.content) {
+              next[next.length - 1] = { ...last, content: last.content + ' ⏹' }
+            } else if (last?.role === 'assistant' && !last.content) {
+              next.pop()
+            }
+            return next
+          })
+        }
       } else {
         toast.error(err.message)
-        setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ ${err.message}` }])
+        if (streamStarted) {
+          setMessages(prev => {
+            const next = [...prev]
+            const last = next[next.length - 1]
+            if (last?.role === 'assistant') {
+              next[next.length - 1] = {
+                ...last,
+                content: `${last.content}\n\n⚠️ This response was interrupted and may be incomplete; it was not saved.`,
+              }
+            }
+            return next
+          })
+        } else {
+          setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ ${err.message}` }])
+        }
       }
-    } finally { setSending(false); abortRef.current = null }
+    } finally { setSending(false); setStreaming(false); abortRef.current = null }
   }
 
   // Stop button: cancel the browser fetch AND abort the upstream AI call on the
@@ -606,7 +683,7 @@ export default function ChatPage() {
               </div>
             ))}
 
-            {sending && (
+            {sending && !streaming && (
               <div className="flex gap-2.5 animate-slide-up">
                 <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-cyan-700 to-blue-800 flex items-center justify-center glow-cyan flex-shrink-0">
                   <Bot className="w-4 h-4 text-white" />

@@ -114,8 +114,20 @@ const section = (title, lines) => (lines.length ? [`${title}:`, ...lines].join('
  * The block prepended to every model call for this owner.
  * Returns '' when memory is switched off or genuinely empty, which keeps the
  * "optional" promise: no memory, no prompt, no behavioural change.
+ *
+ * Two audiences, because they are genuinely different jobs:
+ *
+ *   'customer' (default) — WhatsApp / channel replies, where the bot speaks AS the
+ *   business to a stranger: answer only from the recorded facts and hand anything
+ *   else to a human. That fence is the whole point there.
+ *
+ *   'owner' — the dashboard chat, where the boss is talking to their OWN
+ *   assistant. The same facts are still facts (never invent a price), but they are
+ *   background knowledge, not a fence: an ordinary question must never be refused
+ *   just because it is not in these notes.
  */
-function promptBlock(memory) {
+function promptBlock(memory, opts = {}) {
+  const forOwner = opts.audience === 'owner';
   if (!memory || memory.enabled === false) return '';
 
   const businessName = collapse(memory.businessName);
@@ -127,14 +139,27 @@ function promptBlock(memory) {
   const lines = [];
 
   const who = [];
-  if (businessName) who.push(`a customer-facing assistant for "${businessName}"`);
-  if (ownerName) who.push(`${collapse(memory.ownerRole) || 'the business owner'} is ${ownerName}`);
-  if (who.length) lines.push(`You are ${who.join('. ')}.`);
-
-  lines.push(
-    'Speak as the business, not as a generic AI. Greet customers the way a helpful member of ' +
-    'staff would, and answer only from the facts listed below.'
-  );
+  if (forOwner) {
+    if (businessName) who.push(`the assistant for "${businessName}"`);
+    if (ownerName) who.push(`working for ${collapse(memory.ownerRole) || 'the owner'}, ${ownerName}`);
+    if (who.length) lines.push(`You are ${who.join(', ')}.`);
+    lines.push(
+      'This is background on the business so you can answer about it accurately. ' +
+      'The person you are chatting with IS the owner (or their staff) — you are not replying ' +
+      'to a customer here, so speak directly and plainly: no customer-service formalities, ' +
+      'and no promising to "check with the team", because they are the team. Answer ordinary ' +
+      'questions, explain, write, plan and brainstorm freely — never decline a normal question ' +
+      'just because the answer is not in these notes.'
+    );
+  } else {
+    if (businessName) who.push(`a customer-facing assistant for "${businessName}"`);
+    if (ownerName) who.push(`${collapse(memory.ownerRole) || 'the business owner'} is ${ownerName}`);
+    if (who.length) lines.push(`You are ${who.join('. ')}.`);
+    lines.push(
+      'Speak as the business, not as a generic AI. Greet customers the way a helpful member of ' +
+      'staff would, and answer only from the facts listed below.'
+    );
+  }
 
   if (collapse(memory.businessType)) lines.push(`Business type: ${collapse(memory.businessType)}.`);
   if (collapse(memory.businessDescription)) lines.push(`About the business: ${collapse(memory.businessDescription)}`);
@@ -169,10 +194,17 @@ function promptBlock(memory) {
     .map((entry) => `• ${collapse(entry.key)}: ${collapse(entry.value)}`);
   lines.push(section('Verified facts from the owner', entryLines));
 
-  const rules = [
-    '• Never invent prices, stock levels, delivery times, addresses or promises. If a fact is not listed above, say you will confirm with the team rather than guessing.',
-    '• If the customer asks for something outside this list — a custom quote, a complaint, a refund, an order change — take their name, phone number and request, confirm you have noted it, and hand it to a human.',
-  ];
+  const rules = [];
+  if (forOwner) {
+    // The owner still must not be fed invented business facts — but the two
+    // customer-handling rules below are meaningless when the reader IS the human,
+    // and the "never name an AI vendor" rule would only make the dashboard chat
+    // evasive about a model name the UI already prints next to every message.
+    rules.push('• Never invent prices, stock levels, delivery times, addresses or promises about the business — if a fact is not listed above, say plainly that it is not in your notes and offer to look it up; never guess, and never say you will "confirm with the owner" (that is who you are talking to).');
+  } else {
+    rules.push('• Never invent prices, stock levels, delivery times, addresses or promises. If a fact is not listed above, say you will confirm with the team rather than guessing.');
+    rules.push('• If the customer asks for something outside this list — a custom quote, a complaint, a refund, an order change — take their name, phone number and request, confirm you have noted it, and hand it to a human.');
+  }
   if (memory.guardrails) {
     // Split first, collapse each line second — collapsing first would weld the
     // owner's separate rules into one bullet.
@@ -181,21 +213,30 @@ function promptBlock(memory) {
       if (trimmed) rules.push(`• ${trimmed}`);
     });
   }
-  if (collapse(memory.escalationContact)) {
+  if (!forOwner && collapse(memory.escalationContact)) {
     rules.push(`• Escalate to a human via ${collapse(memory.escalationContact)} when the request needs a decision you cannot make.`);
   }
-  rules.push('• Never claim to be a specific AI model or name an AI vendor.');
+  if (!forOwner) rules.push('• Never claim to be a specific AI model or name an AI vendor.');
   lines.push(section('Rules you must never break', rules));
 
   const voice = [];
   if (collapse(memory.tone)) voice.push(`• Tone: ${collapse(memory.tone)}.`);
-  const lengthCopy = { short: 'one or two sentences', balanced: 'under about 80 words', detailed: 'thorough, but still skimmable' };
-  voice.push(`• Reply length: ${lengthCopy[memory.replyLength] || lengthCopy.balanced}.`);
-  if (collapse(memory.language)) {
-    voice.push(`• Default language: ${collapse(memory.language)} — switch to match the customer if they write in another language.`);
+  if (!forOwner) {
+    // A fixed reply length and a forced greeting/signoff are what a customer reply
+    // needs; applied to the owner's own chat they would truncate explanations and
+    // stamp "Hi!" and "Regards" onto every answer.
+    const lengthCopy = { short: 'one or two sentences', balanced: 'under about 80 words', detailed: 'thorough, but still skimmable' };
+    voice.push(`• Reply length: ${lengthCopy[memory.replyLength] || lengthCopy.balanced}.`);
   }
-  if (collapse(memory.greeting)) voice.push(`• Open with: "${collapse(memory.greeting)}"`);
-  if (collapse(memory.signoff)) voice.push(`• Close with: "${collapse(memory.signoff)}"`);
+  if (collapse(memory.language)) {
+    voice.push(forOwner
+      ? `• Language: ${collapse(memory.language)} — switch to match the owner if they write in another language.`
+      : `• Default language: ${collapse(memory.language)} — switch to match the customer if they write in another language.`);
+  }
+  if (!forOwner) {
+    if (collapse(memory.greeting)) voice.push(`• Open with: "${collapse(memory.greeting)}"`);
+    if (collapse(memory.signoff)) voice.push(`• Close with: "${collapse(memory.signoff)}"`);
+  }
   lines.push(section('How to sound', voice));
 
   return lines.filter(Boolean).join('\n');

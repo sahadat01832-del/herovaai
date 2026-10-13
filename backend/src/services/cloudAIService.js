@@ -243,6 +243,59 @@ class CloudAIService {
     }
   }
 
+  /**
+   * Streaming twin of generateCompletion: same free-catalog and availability gates,
+   * same return shape, but the reply arrives token-by-token through `onToken`.
+   *
+   * Recoverable failures before the first token fall back to the buffered path.
+   * Timeouts, cancellation, and failures after visible output are surfaced instead of
+   * silently repeating work that may already have completed upstream.
+   */
+  async streamCompletion({ model, messages = [], systemPrompt = '', attachments = [], temperature = 0.7,
+                          allowFailover = false, maxTokens = null, signal = null, onToken = null }) {
+    this.refreshKeys();
+    const targetModel = model || DEFAULT_MODEL;
+    const modelDef = ALL_MODELS_CATALOG.find(m => m.id === targetModel);
+    const opts = { maxTokens, signal };
+
+    // Same gate as the buffered path: only a listed free model may be forwarded.
+    if (!modelDef) {
+      throw new ModelUnavailableError(
+        `${targetModel} is not one of the free models this deployment serves`,
+        { model: targetModel, availability: catalogService.OUT_OF_STOCK });
+    }
+
+    const provider = modelDef?.provider || 'omniroute';
+    const servable = await catalogService.checkServable(provider, targetModel);
+    if (!servable.ok && servable.availability !== catalogService.UNVERIFIED && !allowFailover) {
+      throw new ModelUnavailableError(
+        `${targetModel} is unavailable (${servable.availability}): ${servable.reason}`,
+        { model: targetModel, availability: servable.availability });
+    }
+
+    let emitted = 0;
+    const countingToken = (delta) => { emitted += 1; if (onToken) onToken(delta); };
+
+    try {
+      return await this.callOmniRouteStream(targetModel, messages, systemPrompt, attachments,
+        temperature, opts, countingToken);
+    } catch (err) {
+      if (signal?.aborted || err?.code === 'ERR_CANCELED') throw err;   // Stop — never failover
+      if (err?.code === 'ETIMEDOUT' || err?.name === 'TimeoutError') {
+        err.code = 'ETIMEDOUT';
+        throw err;
+      }
+      if (emitted > 0) {
+        // Tokens are already on screen; restarting would duplicate the opening words.
+        throw err;
+      }
+      console.warn(`[CloudAIService] stream failed before first token (${err.message}) — `
+        + `falling back to buffered path${allowFailover ? ' with failover' : ''}.`);
+      return await this.generateCompletion({ model: targetModel, messages, systemPrompt,
+        attachments, temperature, allowFailover, maxTokens, signal });
+    }
+  }
+
   async generateCompletion({ model, messages = [], systemPrompt = '', attachments = [], temperature = 0.7,
                             allowFailover = false, maxTokens = null, signal = null }) {
     this.refreshKeys();
@@ -337,23 +390,14 @@ class CloudAIService {
   }
 
   /**
-   * OmniRoute — one local gateway in front of every upstream provider.
+   * Shape caller history into the OpenAI wire format: system prompt first, then the
+   * trailing turns, with the last user message carrying any attached images as
+   * image_url parts (which is how the vision tiers read a screenshot).
    *
-   * Catalog ids carry an `omniroute/` prefix so they can never be mistaken for an
-   * upstream's own spelling; the gateway wants the id with the prefix removed
-   * (e.g. `omniroute/groq/qwen/qwen3.8-27b` is requested as `groq/qwen/qwen3.8-27b`).
-   *
-   * Attachments are sent as OpenAI-style image parts, which is how the free
-   * Gemini and Command-vision tiers read a screenshot or a photo of a product.
+   * Extracted so the buffered and streaming transports cannot drift apart — they must
+   * build byte-identical requests or a streamed reply would see different context.
    */
-  async callOmniRoute(catalogId, messages, systemPrompt, attachments = [], temperature = 0.7, opts = {}) {
-    if (!this.omnirouteKey) throw new Error('OMNIROUTE_API_KEY not configured');
-    const base = this.omnirouteBase
-      || (process.env.OMNIROUTE_BASE_URL || 'http://127.0.0.1:20128/v1').replace(/\/+$/, '');
-    const bareId = catalogId.startsWith(OMNIROUTE_PREFIX)
-      ? catalogId.slice(OMNIROUTE_PREFIX.length)
-      : catalogId;
-
+  _formatMessages(systemPrompt, messages, attachments = []) {
     const formattedMessages = [];
     if (systemPrompt) formattedMessages.push({ role: 'system', content: systemPrompt });
     const lastUserIndex = messages.map(m => m.role).lastIndexOf('user');
@@ -370,6 +414,34 @@ class CloudAIService {
         formattedMessages.push({ role: msg.role, content: msg.content });
       }
     });
+    return formattedMessages;
+  }
+
+  /** Base gateway URL + de-prefixed model id. One definition, both transports. */
+  _omnirouteTarget(catalogId) {
+    if (!this.omnirouteKey) throw new Error('OMNIROUTE_API_KEY not configured');
+    const base = this.omnirouteBase
+      || (process.env.OMNIROUTE_BASE_URL || 'http://127.0.0.1:20128/v1').replace(/\/+$/, '');
+    const bareId = catalogId.startsWith(OMNIROUTE_PREFIX)
+      ? catalogId.slice(OMNIROUTE_PREFIX.length)
+      : catalogId;
+    return { base, bareId };
+  }
+
+  /**
+   * OmniRoute — one local gateway in front of every upstream provider. Buffered
+   * transport: the reply comes back whole in one JSON body.
+   *
+   * Catalog ids carry an `omniroute/` prefix so they can never be mistaken for an
+   * upstream's own spelling; the gateway wants the id with the prefix removed
+   * (e.g. `omniroute/groq/qwen/qwen3.8-27b` is requested as `groq/qwen/qwen3.8-27b`).
+   *
+   * Attachments are sent as OpenAI-style image parts, which is how the free
+   * Gemini and Command-vision tiers read a screenshot or a photo of a product.
+   */
+  async callOmniRoute(catalogId, messages, systemPrompt, attachments = [], temperature = 0.7, opts = {}) {
+    const { base, bareId } = this._omnirouteTarget(catalogId);
+    const formattedMessages = this._formatMessages(systemPrompt, messages, attachments);
 
     const res = await this._postCompat(`${base}/chat/completions`, {
       model: bareId,
@@ -397,6 +469,116 @@ class CloudAIService {
       // menu never offered — and would make a correctly-honoured pin look swapped.
       modelUsed: catalogId,
       upstreamModel: res.data.model || bareId,
+    };
+  }
+
+  /**
+   * Streaming transport: same gateway, same body, but `stream: true` so the reply
+   * arrives as SSE chunks. Each content delta is handed to `onToken` the moment it
+   * lands, which is what lets the UI paint the answer while the model is still
+   * thinking instead of holding the whole reply behind one spinner.
+   *
+   * Returns the same shape as callOmniRoute once the stream closes, so the caller
+   * can finish exactly as it would have buffered. `onDone` receives {usage} when the
+   * gateway reports it on the terminal chunk (it does), which keeps quota accounting
+   * identical to the buffered path.
+   */
+  async callOmniRouteStream(catalogId, messages, systemPrompt, attachments = [], temperature = 0.7, opts = {}, onToken) {
+    const { base, bareId } = this._omnirouteTarget(catalogId);
+    const formattedMessages = this._formatMessages(systemPrompt, messages, attachments);
+    const timeoutSignal = AbortSignal.timeout(opts.maxTokens ? 180000 : 60000);
+    const requestSignal = opts.signal
+      ? AbortSignal.any([opts.signal, timeoutSignal])
+      : timeoutSignal;
+
+    const res = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.omnirouteKey}`,
+        'Content-Type': 'application/json',
+        'X-Title': 'HerovaAi',
+      },
+      body: JSON.stringify({
+        model: bareId,
+        messages: formattedMessages,
+        temperature,
+        max_tokens: opts.maxTokens || 2048,
+        stream: true,
+      }),
+      signal: requestSignal,
+    });
+
+    if (!res.ok || !res.body) {
+      const detail = await res.text().catch(() => '');
+      const err = new Error(`gateway ${res.status}: ${detail.slice(0, 300) || res.statusText}`);
+      err.response = { status: res.status, data: detail };
+      throw err;
+    }
+
+    // Node's fetch gives a web ReadableStream — decode incrementally so a chunk split
+    // across a UTF-8 boundary cannot inject a mangled character into the answer.
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let text = '';
+    let usage = null;
+    let upstreamModel = null;
+    let sawDone = false;
+
+    const handleLine = (line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) return;      // ignore comments / keepalives
+      const payload = trimmed.slice(5).trim();
+      if (payload === '[DONE]') { sawDone = true; return; }
+      let chunk;
+      try { chunk = JSON.parse(payload); } catch { return; }
+      if (chunk.usage) usage = chunk.usage;
+      if (chunk.model) upstreamModel = chunk.model;
+      const delta = chunk.choices?.[0]?.delta?.content;
+      if (delta) {
+        text += delta;
+        if (onToken) { try { onToken(delta); } catch { /* a UI hiccup must not kill the stream */ } }
+      }
+    };
+
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let nl;
+        // SSE frames are newline-delimited; hold the tail back until its newline arrives.
+        while ((nl = buffer.indexOf('\n')) !== -1) {
+          handleLine(buffer.slice(0, nl));
+          buffer = buffer.slice(nl + 1);
+        }
+      }
+      if (buffer) handleLine(buffer);                 // flush a final line without a trailing newline
+    } catch (err) {
+      if (opts.signal?.aborted) {
+        const e = new Error('Generation stopped');
+        e.code = 'ERR_CANCELED';
+        throw e;
+      }
+      throw err;
+    }
+
+    if (!sawDone) {
+      const e = new Error(text
+        ? 'stream ended before the completion marker'
+        : 'stream ended before any content arrived');
+      e.code = 'STREAM_INCOMPLETE';
+      e.response = { status: 502, data: 'empty stream' };
+      throw e;
+    }
+
+    const trimmed = text.trim();
+    return {
+      text: trimmed,
+      tokensUsed: usage?.total_tokens || Math.round((trimmed.length / 4) + 80),
+      modelUsed: catalogId,
+      upstreamModel: upstreamModel || bareId,
+      usage,
     };
   }
 

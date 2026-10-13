@@ -133,9 +133,9 @@ export function Avatar({ name, src, size = 'md', className }: {
   const hash = Array.from(label).reduce((acc, ch) => acc + ch.charCodeAt(0), 0)
   const tint = hash % 3
   const gradient = tint === 0
-    ? 'linear-gradient(140deg,#d4be8e,#8f7746)'
+    ? 'linear-gradient(140deg,#e7d3a3,#b89a5e)'
     : tint === 1
-      ? 'linear-gradient(140deg,#c0a872,#6f5c37)'
+      ? 'linear-gradient(140deg,#d8bd85,#967d47)'
       : 'linear-gradient(140deg,#9fb0bb,#4b5b66)'
 
   return (
@@ -291,7 +291,7 @@ export function Meter({ value, tone = 'gold', className }: { value: number; tone
   const fill = tone === 'danger'
     ? 'linear-gradient(90deg,#b91c1c,#f87171)'
     : tone === 'warn'
-      ? 'linear-gradient(90deg,#8f7746,#e0b79f)'
+      ? 'linear-gradient(90deg,#b89a5e,#e0b79f)'
       : undefined
   return (
     <div className={cn('meter', className)} role="progressbar" aria-valuenow={Math.round(pct)} aria-valuemin={0} aria-valuemax={100}>

@@ -1,4 +1,4 @@
-import { apiRequest, apiUpload } from './auth'
+import { apiRequest, apiUpload, getApiUrl, getToken } from './auth'
 
 // ─── Auth ──────────────────────────────────────────────────────────────────
 export const authApi = {
@@ -41,6 +41,118 @@ export const chatApi = {
       method: 'POST',
       body: JSON.stringify({}),
     }),
+  /**
+   * Streaming twin of sendMessage: the reply arrives token-by-token over SSE.
+   *
+   * `onDelta(text)` fires for every fragment so the UI can paint as the model
+   * thinks; the promise resolves with the SAME payload shape sendMessage returns
+   * (from the terminal `done` event), so callers treat both paths identically.
+   *
+   * Fails safe by construction: validation and quota rejections are returned by the
+   * server as ordinary JSON *before* the stream opens, so a non-SSE response is
+   * parsed and surfaced as a normal error — and any transport-level failure rejects
+   * with `code: 'STREAM_UNAVAILABLE'`, which the caller uses to retry buffered.
+   */
+  sendMessageStream: async (
+    conversationId: string,
+    message: string,
+    mode?: string,
+    model?: string,
+    attachments?: any[],
+    skill?: string,
+    signal?: AbortSignal,
+    options?: { flowModel?: string; flowAspectRatio?: string; flowMediaType?: 'image' | 'video' },
+    onDelta?: (text: string) => void,
+  ): Promise<any> => {
+    const token = getToken()
+    const res = await fetch(`${getApiUrl()}/chat/conversations/${conversationId}/message`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ message, mode, model, attachments, skill, stream: true, ...options }),
+      signal,
+    })
+
+    const contentType = res.headers.get('content-type') || ''
+
+    // Server answered with JSON: either an error raised before the stream opened
+    // (quota, validation) or an older backend without SSE. Surface it faithfully.
+    if (!contentType.includes('text/event-stream')) {
+      const data = await res.json().catch(() => null)
+      if (!res.ok) {
+        const error = new Error(data?.message || `Request failed (${res.status})`) as any
+        error.status = res.status
+        error.code = data?.code
+        throw error
+      }
+      // Buffered fallback body — hand it straight back as a normal success.
+      return data
+    }
+
+    if (!res.ok || !res.body) {
+      const error = new Error(`Stream failed (${res.status})`) as any
+      error.code = 'STREAM_UNAVAILABLE'
+      throw error
+    }
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let finalPayload: any = null
+    let streamError: any = null
+
+    const handleFrame = (frame: string) => {
+      const lines = frame.split('\n')
+      let event = 'message'
+      const dataLines: string[] = []
+      for (const line of lines) {
+        if (line.startsWith('event:')) event = line.slice(6).trim()
+        else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
+      }
+      if (!dataLines.length) return
+      let data: any
+      try { data = JSON.parse(dataLines.join('\n')) } catch { return }
+      if (event === 'delta' && data.text) onDelta?.(data.text)
+      else if (event === 'done') finalPayload = data
+      else if (event === 'error') {
+        const error = new Error(data.message || 'Generation failed') as any
+        error.code = data.code
+        error.status = data.status
+        error.stopped = data.stopped
+        streamError = error
+      }
+    }
+
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let sep: number
+        // SSE frames are separated by a blank line; hold the tail until it arrives.
+        while ((sep = buffer.search(/\n\n/)) !== -1) {
+          handleFrame(buffer.slice(0, sep))
+          buffer = buffer.slice(sep + 2)
+        }
+      }
+      if (buffer.trim()) handleFrame(buffer)
+    } catch (err: any) {
+      if (err?.name === 'AbortError') throw err
+      const error = new Error(err?.message || 'Stream interrupted') as any
+      error.code = 'STREAM_UNAVAILABLE'
+      throw error
+    }
+
+    if (streamError) throw streamError
+    if (!finalPayload) {
+      const error = new Error('Stream ended without a result') as any
+      error.code = 'STREAM_UNAVAILABLE'
+      throw error
+    }
+    return finalPayload
+  },
   sendPublicMessage: (message: string, conversationId?: string | null, model?: string, signal?: AbortSignal) =>
     apiRequest<any>('/chat/public/message', {
       method: 'POST',

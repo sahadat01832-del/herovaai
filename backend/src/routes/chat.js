@@ -281,6 +281,30 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
     const mediaIntent = detectMediaGenerationIntent(message);
     const isMediaGenerationRequest = chosenSkill === 'flow' || Boolean(mediaIntent);
 
+    // ── Optional SSE plumbing ───────────────────────────────────────────
+    // Off unless the client explicitly asks (`stream: true`), and deliberately NOT
+    // started yet: every validation/quota rejection below must still be an ordinary
+    // JSON status. sseSend is a no-op until startSSE() fires, which only happens once
+    // generation genuinely begins — so the buffered contract is untouched by default.
+    const wantsStream = req.body.stream === true && chatMode === 'api' && !isMediaGenerationRequest;
+    let sseStarted = false;
+    const startSSE = () => {
+      if (sseStarted || !wantsStream) return;
+      sseStarted = true;
+      res.status(200);
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      // Proxy buffering (nginx) would otherwise hold the whole reply and defeat the point.
+      res.setHeader('X-Accel-Buffering', 'no');
+      if (res.flushHeaders) res.flushHeaders();
+      res.write(`event: start\ndata: ${JSON.stringify({ conversationId: String(req.params.id) })}\n\n`);
+    };
+    const sseSend = (event, data) => {
+      if (!sseStarted) return;
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
     // ── Check Token Quota for API Models (1M Tokens / 7 Days limit) ─────────
     if (chatMode === 'api' && !isMediaGenerationRequest) {
       const quotaStatus = await tokenQuotaService.checkQuota(req.user._id, 200);
@@ -425,7 +449,7 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
 
       // Strict by default: the chosen model answers, or the caller is told why not.
       // Failover happens only when this request explicitly asks for it.
-      const apiResult = await cloudAIService.generateCompletion({
+      const completionArgs = {
         model: chosenModel,
         messages: contextMessages,
         systemPrompt,
@@ -436,7 +460,20 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
         // is what turned "Build a Flappy Bird clone" into a placeholder sketch.
         maxTokens: ARTIFACT_SKILLS.has(chosenSkill) ? 8192 : null,
         signal: genCtl.signal,
-      });
+      };
+
+      let apiResult;
+      if (wantsStream) {
+        // Open the event stream only after request validation and quota checks. Model
+        // availability errors are sent as SSE because the response is now committed.
+        startSSE();
+        apiResult = await cloudAIService.streamCompletion({
+          ...completionArgs,
+          onToken: (delta) => sseSend('delta', { text: delta }),
+        });
+      } else {
+        apiResult = await cloudAIService.generateCompletion(completionArgs);
+      }
 
       aiResponse = apiResult.text;
       modelUsed = apiResult.modelUsed || chosenModel;
@@ -549,7 +586,7 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
       });
     }
 
-    res.json({
+    const payload = {
       success: true,
       userMessage: userMsgObj,
       aiMessage: assistantMsgObj,
@@ -558,16 +595,40 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
       tokensUsed,
       modelUsed,
       failedOverFrom,
-    });
+    };
+
+    if (sseStarted) {
+      // The client has been reading deltas; close with the same object the buffered
+      // path would have returned, so both code paths hand the UI identical data.
+      sseSend('done', payload);
+      return res.end();
+    }
+
+    res.json(payload);
   } catch (err) {
     const cancelled = err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError'
       || err?.name === 'AbortError' || genCtl.signal.aborted;
     if (cancelled) {
       // Stop button: keep the user's message, never a ghost AI reply later.
       try { if (convo) await convo.save(); } catch { /* already unwound */ }
+      if (sseStarted) {
+        // Same 499 semantics, delivered over the open stream.
+        sseSend('error', { success: false, stopped: true, code: 'STOPPED', message: 'Generation stopped' });
+        return res.end();
+      }
       return res.status(499).json({ success: false, stopped: true, message: 'Generation stopped' });
     }
     console.error('Chat error:', err.message);
+    if (sseStarted) {
+      // Headers are already sent as text/event-stream — a res.status().json() here would
+      // throw. Tell the client over the channel it is already listening on instead.
+      sseSend('error', {
+        success: false,
+        code: err.code || 'STREAM_ERROR',
+        message: err.message || 'Generation failed',
+      });
+      return res.end();
+    }
     if (err.code === 'MODEL_UNAVAILABLE') {
       return res.status(409).json({
         success: false,
@@ -1217,7 +1278,12 @@ router.post('/public/message', async (req, res) => {
 // The business-profile block lives in services/memoryProfile so the web chat and
 // the WhatsApp auto-reply describe the same shop in the same words.
 function buildSystemPrompt(memory, basePrompt) {
-  const profile = memoryProfile.promptBlock(memory);
+  // Audience 'owner': this is the dashboard, where the boss talks to their own
+  // assistant. Memory becomes background knowledge rather than a customer-facing
+  // fence, so an ordinary question is answered instead of bounced back with
+  // "that is not in the verified facts". The WhatsApp/channel callers keep the
+  // default 'customer' audience and are unchanged.
+  const profile = memoryProfile.promptBlock(memory, { audience: 'owner' });
   let prompt = profile;
 
   if (basePrompt) {

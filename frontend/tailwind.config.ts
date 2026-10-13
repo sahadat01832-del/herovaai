@@ -4,7 +4,7 @@ import type { Config } from 'tailwindcss'
  * HerovaAi theme tokens.
  *
  * The palette is sampled from the brand mark: an obsidian base (#0f1316) and a champagne accent
- * (#c0a872). Every screen reads these tokens instead of raw hex values, so the whole product
+ * (#d8bd85). Every screen reads these tokens instead of raw hex values, so the whole product
  * re-skins from this one file.
  *
  * Motion is tokenised the same way: named easings + named animations mean a page never invents
@@ -21,16 +21,16 @@ const config: Config = {
       colors: {
         // Champagne gold — the accent from the logo.
         brand: {
-          50:  '#faf6ee',
-          100: '#f2e9d5',
-          200: '#e4d3ae',
-          300: '#d4be8e',
-          400: '#c0a872',
-          500: '#ad9159',
-          600: '#8f7746',
-          700: '#6f5c37',
-          800: '#4e4027',
-          900: '#332a1a',
+          50:  '#faf7f0',
+          100: '#f6efdf',
+          200: '#efe2c4',
+          300: '#e7d3a3',
+          400: '#d8bd85',
+          500: '#c4a76b',
+          600: '#b89a5e',
+          700: '#967d47',
+          800: '#756033',
+          900: '#54452a',
         },
         // Muted steel replaces the old cyan: reads as "system/technical" without neon.
         cyan: {
@@ -123,8 +123,8 @@ const config: Config = {
         pulseSoft: { '0%, 100%': { opacity: '1' }, '50%': { opacity: '0.55' } },
         /* A breath, not a glow-up: premium surfaces do not flash. */
         brandPulse: {
-          '0%, 100%': { boxShadow: '0 0 0 0 rgba(192,168,114,0.18)' },
-          '50%':      { boxShadow: '0 0 24px 2px rgba(192,168,114,0.16)' },
+          '0%, 100%': { boxShadow: '0 0 0 0 rgba(216,189,133,0.18)' },
+          '50%':      { boxShadow: '0 0 24px 2px rgba(216,189,133,0.16)' },
         },
         blink: { '0%, 100%': { opacity: '1' }, '50%': { opacity: '0' } },
         marquee: { from: { transform: 'translateX(0)' }, to: { transform: 'translateX(-50%)' } },
@@ -136,17 +136,17 @@ const config: Config = {
         'neon-sm': '0 10px 30px -14px rgba(0,0,0,0.7)',
         'cyan':    '0 18px 50px -22px rgba(0,0,0,0.8)',
         'green':   '0 12px 34px -18px rgba(16,185,129,0.5)',
-        'gold':    '0 20px 60px -24px rgba(192,168,114,0.45)',
-        'gold-sm': '0 12px 30px -18px rgba(192,168,114,0.4)',
+        'gold':    '0 20px 60px -24px rgba(216,189,133,0.45)',
+        'gold-sm': '0 12px 30px -18px rgba(216,189,133,0.4)',
         'lift':    '0 28px 60px -32px rgba(0,0,0,0.95), 0 0 0 1px rgba(255,255,255,0.06)',
         'inner-line': 'inset 0 1px 0 0 rgba(255,255,255,0.05)',
-        'focus':   '0 0 0 3px rgba(192,168,114,0.28)',
+        'focus':   '0 0 0 3px rgba(216,189,133,0.28)',
       },
       backgroundImage: {
-        'gradient-neon':   'linear-gradient(135deg, #c0a872, #8f7746)',
-        'gradient-violet': 'linear-gradient(135deg, #d4be8e, #ad9159)',
-        'gradient-warm':   'linear-gradient(135deg, #c0a872, #6f5c37)',
-        'grid-dots':       'radial-gradient(circle, rgba(192,168,114,0.14) 1px, transparent 1px)',
+        'gradient-neon':   'linear-gradient(135deg, #d8bd85, #b89a5e)',
+        'gradient-violet': 'linear-gradient(135deg, #e7d3a3, #c4a76b)',
+        'gradient-warm':   'linear-gradient(135deg, #d8bd85, #967d47)',
+        'grid-dots':       'radial-gradient(circle, rgba(216,189,133,0.14) 1px, transparent 1px)',
         'sheen':           'linear-gradient(100deg, transparent 20%, rgba(255,255,255,0.14) 45%, transparent 70%)',
       },
       backgroundSize: {

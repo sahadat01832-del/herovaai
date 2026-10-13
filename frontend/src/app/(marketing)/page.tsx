@@ -322,7 +322,7 @@ export default function HomePage() {
           {/* ── Left: proposition ─────────────────────────────────────── */}
           <section className="lg:col-span-6 xl:col-span-5">
             <Reveal>
-              <span className="inline-flex items-center gap-2 rounded-full border border-brand-400/25 bg-brand-400/[0.08] px-3.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-brand-200 shadow-[0_0_20px_rgba(192,168,114,0.15)]">
+              <span className="inline-flex items-center gap-2 rounded-full border border-brand-400/25 bg-brand-400/[0.08] px-3.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-brand-200 shadow-[0_0_20px_rgba(216,189,133,0.15)]">
                 <Sparkles className="h-3 w-3 text-brand-300" aria-hidden />
                 Autonomous Business AI &amp; Content Engine
               </span>

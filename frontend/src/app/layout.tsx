@@ -52,7 +52,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             },
             success: { iconTheme: { primary: '#34d399', secondary: '#0a0d0f' } },
             error: { iconTheme: { primary: '#f87171', secondary: '#0a0d0f' } },
-            loading: { iconTheme: { primary: '#c0a872', secondary: '#0a0d0f' } },
+            loading: { iconTheme: { primary: '#d8bd85', secondary: '#0a0d0f' } },
           }}
         />
       </body>

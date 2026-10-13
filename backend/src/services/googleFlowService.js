@@ -81,8 +81,49 @@ function buildBraveArgs({ profileDir, headless, port, url = 'about:blank' }) {
   return args;
 }
 
+/**
+ * True only when the profile's SingletonLock names a LIVE Brave that is really
+ * attached to this profile.
+ *
+ * Every generation ends with `closeBrowserContext()` killing the browser, and
+ * Chromium does not always manage to unlink its `Singleton*` files on the way
+ * out — so the profile is normally left with a lock pointing at a dead PID.
+ * Chromium usually repairs that itself, but the leftover `/tmp` socket can also
+ * make the next launch stall trying to notify a process that no longer exists
+ * (the hang seen on 2026-10-13, until the locks were cleared by hand). Reading
+ * `/proc/<pid>/cmdline` instead of merely signalling the PID also rules out PID
+ * reuse: a recycled number belonging to some unrelated program must not be
+ * mistaken for the browser that owns this profile.
+ */
+function profileIsLockedByLiveBrowser(profileDir) {
+  let target;
+  try {
+    target = fsSync.readlinkSync(path.join(profileDir, 'SingletonLock'));
+  } catch {
+    return false; // no lock at all → nobody owns the profile
+  }
+  if (!String(target).startsWith(`${os.hostname()}-`)) return false; // lock from another host
+  const pid = Number(String(target).match(/-(\d+)$/)?.[1]);
+  if (!Number.isInteger(pid)) return false;
+  let commandLine;
+  try {
+    commandLine = fsSync.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+  } catch {
+    return false; // the PID is gone → stale lock
+  }
+  return commandLine.includes(`--user-data-dir=${profileDir}`);
+}
+
 async function prepareBraveProfile(profileDir = PROFILE_DIR) {
   await fs.mkdir(profileDir, { recursive: true, mode: 0o700 });
+  // Drop locks left behind by a previous generation whose browser was killed
+  // before it could unlink them. A lock held by a genuinely running browser is
+  // preserved — removing that would let two browsers fight over one profile.
+  if (!profileIsLockedByLiveBrowser(profileDir)) {
+    for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      await fs.unlink(path.join(profileDir, name)).catch(() => {});
+    }
+  }
   const localStatePath = path.join(profileDir, 'Local State');
   let localState = {};
   try {
