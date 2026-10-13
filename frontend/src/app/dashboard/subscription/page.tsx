@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 import {
   BarChart3, Check, Clock, Cpu, CreditCard, Layers, ListOrdered, RefreshCw, Shield, Smartphone, Sparkles, Zap,
 } from 'lucide-react'
-import { chatApi, paymentApi, userApi } from '@/lib/api'
+import { chatApi, flowApi, paymentApi, userApi } from '@/lib/api'
 import { useAuth } from '@/contexts/AuthContext'
 import { cn } from '@/lib/cn'
 import { compactNumber, formatDateTime, percent, relativeTime } from '@/lib/format'
@@ -32,6 +32,7 @@ interface Plan {
   period: string
   blurb: string
   tokens: number
+  imageQuota: { limit: number | null; period: string; unlimited: boolean }
   popular?: boolean
   features: string[]
 }
@@ -40,32 +41,38 @@ interface Plan {
 const PLAN_FALLBACK: Plan[] = [
   {
     id: 'free', name: 'Free', bdt: 0, period: 'forever', tokens: 1_000_000,
+    imageQuota: { limit: 10, period: 'day', unlimited: false },
     blurb: 'Everyday chatting, WhatsApp automation and the standard cloud models.',
     features: [
       'Local on-device models — free and unmetered',
       '1,000,000 cloud tokens per 7 days',
+      '10 AI image generations each day',
       'WhatsApp assistant with business memory',
       'Channel connections: Messenger, Facebook, Telegram',
       'Memory released automatically when idle',
     ],
   },
   {
-    id: 'pro', name: 'Pro', bdt: 100, period: 'per month', tokens: 2_000_000, popular: true,
+    id: 'pro', name: 'Pro', bdt: 100, period: 'per month', tokens: 2_000_000,
+    imageQuota: { limit: 100, period: 'billing cycle', unlimited: false }, popular: true,
     blurb: 'Heavier throughput, larger local models and daily auto-posting.',
     features: [
       'Larger local models (3B – 26B)',
       '2,000,000 cloud tokens per 7 days',
+      '100 AI image generations per billing cycle',
       'Daily auto-post to Facebook, Instagram and Telegram',
       'AI auto-reply on Messenger, Instagram, Telegram and WhatsApp',
-      'Gemini+ multimodal: images, video, documents',
+      'Vision on the free models: images, screenshots and documents',
     ],
   },
   {
     id: 'enterprise', name: 'Enterprise', bdt: 300, period: 'per month', tokens: 5_000_000,
+    imageQuota: { limit: null, period: 'billing cycle', unlimited: true },
     blurb: 'For high-volume operations and multi-number, multi-channel setups.',
     features: [
       '5,000,000 cloud tokens per 7 days',
-      'Frontier models: GPT-4o, Claude, Gemini Pro',
+      'Unlimited AI image generations',
+      'Every free model in the picker, vision included',
       'Multiple WhatsApp numbers + YouTube / Google channels',
       'Unlimited memory entries, personas and post topics',
       'Priority replies and admin quota controls',
@@ -98,6 +105,7 @@ const ORDER_LABEL: Record<string, string> = {
 export default function SubscriptionPage() {
   const { user, isAdmin } = useAuth()
   const [quota, setQuota] = useState<any>(null)
+  const [imageQuota, setImageQuota] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [pendingPlan, setPendingPlan] = useState<Plan | null>(null)
@@ -109,10 +117,20 @@ export default function SubscriptionPage() {
     setLoading(true)
     setError('')
     try {
-      const res: any = await chatApi.getQuota()
-      if (res?.success) setQuota(res.quota)
-    } catch (err: any) {
-      setError(err.message || 'Could not read the token quota')
+      const [tokenResult, imageResult] = await Promise.allSettled([
+        chatApi.getQuota(),
+        flowApi.getImageQuota(),
+      ])
+      if (tokenResult.status === 'fulfilled' && tokenResult.value?.success) {
+        setQuota(tokenResult.value.quota)
+      } else if (tokenResult.status === 'rejected') {
+        setError(tokenResult.reason?.message || 'Could not read the token quota')
+      }
+      if (imageResult.status === 'fulfilled' && imageResult.value?.success) {
+        setImageQuota(imageResult.value.imageQuota)
+      } else {
+        setImageQuota(null)
+      }
     } finally {
       setLoading(false)
     }
@@ -194,7 +212,7 @@ export default function SubscriptionPage() {
             ) : null}
           </h1>
           <p className="mt-1 text-[13px] text-dark-400">
-            Free, ৳100 and ৳300 a month. Local models never touch this allowance — only cloud requests count.
+            Free: 10 images a day. Pro (৳100/month): 100 images per billing cycle. Enterprise (৳300/month): unlimited images.
           </p>
         </div>
         <Button variant="ghost" size="sm" onClick={load} loading={loading} icon={<RefreshCw className="h-3.5 w-3.5" />}>
@@ -269,6 +287,45 @@ export default function SubscriptionPage() {
               </>
             )}
           </div>
+        </Card>
+      </Reveal>
+
+      <Reveal delay={30}>
+        <Card className="space-y-4">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="flex items-start gap-3">
+              <span className="flex h-9 w-9 items-center justify-center rounded-xl border border-brand-400/20 bg-brand-400/[0.08] text-brand-200">
+                <Sparkles className="h-4 w-4" aria-hidden />
+              </span>
+              <div>
+                <p className="text-[13px] font-semibold text-white">AI image generations</p>
+                <p className="mt-1 text-[11.5px] leading-relaxed text-dark-400">
+                  {imageQuota?.unlimited
+                    ? `${compactNumber(imageQuota.used)} generated this billing cycle — your Enterprise plan has no image cap.`
+                    : imageQuota
+                      ? `${imageQuota.remaining} of ${imageQuota.limit} images left ${imageQuota.period === 'day' ? 'today' : 'this billing cycle'}.`
+                      : 'Image allowance depends on your active plan.'}
+                </p>
+              </div>
+            </div>
+            {imageQuota?.resetsAt && !imageQuota.unlimited ? (
+              <p className="text-[11px] text-dark-500">
+                Resets {imageQuota.period === 'day' ? 'at midnight UTC' : 'with your next plan cycle'} · {formatDateTime(imageQuota.resetsAt)}
+              </p>
+            ) : null}
+          </div>
+          {imageQuota && !imageQuota.unlimited ? (
+            <div className="space-y-1.5">
+              <Meter
+                value={percent(imageQuota.used, imageQuota.limit)}
+                tone={percent(imageQuota.used, imageQuota.limit) > 85 ? 'danger' : percent(imageQuota.used, imageQuota.limit) > 60 ? 'warn' : 'gold'}
+              />
+              <div className="flex justify-between text-[10.5px] text-dark-500">
+                <span>{compactNumber(imageQuota.used)} used</span>
+                <span>{compactNumber(imageQuota.limit)} included</span>
+              </div>
+            </div>
+          ) : null}
         </Card>
       </Reveal>
 

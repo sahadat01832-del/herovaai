@@ -25,11 +25,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const savedToken = getToken()
     const savedUser = getUser()
-    if (savedToken && savedUser) {
+    if (savedToken) {
       setTokenState(savedToken)
-      setUserState(savedUser)
+      if (savedUser) {
+        setUserState(savedUser)
+        setLoading(false)
+      }
+      // Revalidate in background so freshness is ensured without kicking the user out
+      authApi.me()
+        .then((data: any) => {
+          if (data?.user) {
+            setUser(data.user)
+            setUserState(data.user)
+          }
+        })
+        .catch((err: any) => {
+          if (err?.status === 401) {
+            removeToken()
+            setTokenState(null)
+            setUserState(null)
+          }
+        })
+        .finally(() => {
+          setLoading(false)
+        })
+    } else {
+      setLoading(false)
     }
-    setLoading(false)
   }, [])
 
   const login = async (email: string, password: string): Promise<boolean> => {

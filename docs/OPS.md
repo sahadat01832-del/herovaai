@@ -44,7 +44,8 @@ never expose it.
 
 ## Env files (never commit, never print)
 
-- `backend/.env` — Mongo URI, JWT secret, admin seed, LM/Groq/Gemini/OpenRouter keys
+- `backend/.env` — Mongo URI, JWT secret, admin seed, and `OMNIROUTE_API_KEY` (the one AI
+  credential; the gateway holds every upstream key, see [MODELS.md](MODELS.md))
 - `frontend/.env.local` — `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_SOCKET_URL`
 
 ## Environment knobs (backend)

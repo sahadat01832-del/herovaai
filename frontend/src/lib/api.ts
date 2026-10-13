@@ -1,14 +1,24 @@
-import { apiRequest } from './auth'
+import { apiRequest, apiUpload } from './auth'
 
 // ─── Auth ──────────────────────────────────────────────────────────────────
 export const authApi = {
   /** Whether "Continue with Google" is switched on, plus the URLs Google needs. */
-  googleStatus: () => apiRequest<any>('/auth/google/status'),
+  googleStatus: (probe?: boolean) => apiRequest<any>(`/auth/google/status${probe ? '?probe=1' : ''}`),
   login: (email: string, password: string) =>
     apiRequest<any>('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
   register: (name: string, email: string, password: string, phone?: string) =>
     apiRequest<any>('/auth/register', { method: 'POST', body: JSON.stringify({ name, email, password, phone }) }),
   me: () => apiRequest<any>('/auth/me'),
+  /**
+   * One-click YouTube: ask for a signed, owner-bound state, then send the browser
+   * to `${getApiUrl()}/auth/google/youtube?state=…`. The app's own Google client
+   * runs the consent screen with YouTube scopes, so nobody needs a developer
+   * console or a copied token.
+   */
+  youtubeConnectStart: () => apiRequest<{ success: boolean; state: string; url: string }>(
+    '/auth/google/youtube/start',
+    { method: 'POST', body: JSON.stringify({}) },
+  ),
 }
 
 // ─── Chat ──────────────────────────────────────────────────────────────────
@@ -19,7 +29,7 @@ export const chatApi = {
     apiRequest<any>('/chat/conversations', { method: 'POST', body: JSON.stringify({ mode, model, skill }) }),
   deleteConversation: (id: string) =>
     apiRequest<any>(`/chat/conversations/${id}`, { method: 'DELETE' }),
-  sendMessage: (conversationId: string, message: string, mode?: string, model?: string, attachments?: any[], skill?: string, signal?: AbortSignal, options?: { flowModel?: string; flowAspectRatio?: string }) =>
+  sendMessage: (conversationId: string, message: string, mode?: string, model?: string, attachments?: any[], skill?: string, signal?: AbortSignal, options?: { flowModel?: string; flowAspectRatio?: string; flowMediaType?: 'image' | 'video' }) =>
     apiRequest<any>(`/chat/conversations/${conversationId}/message`, {
       method: 'POST',
       body: JSON.stringify({ message, mode, model, attachments, skill, ...options }),
@@ -66,10 +76,16 @@ export const chatApi = {
   getModels: (opts?: { refresh?: boolean }) =>
     apiRequest<any>(`/chat/models${opts?.refresh ? '?refresh=1' : ''}`, { cache: 'no-store' }),
   getQuota: () => apiRequest<any>('/chat/quota'),
-  unloadModel: (model?: string) =>
+  unloadModel: (model?: string, opts?: { stopServer?: boolean; graceSeconds?: number }) =>
     apiRequest<any>('/chat/lm-studio/unload', {
       method: 'POST',
-      body: JSON.stringify({ model }),
+      body: JSON.stringify({
+        model,
+        // Omitted (undefined) → the backend keeps its default of stopping the
+        // server. Passing false frees the model but keeps the daemon warm.
+        stopServer: opts?.stopServer,
+        graceSeconds: opts?.graceSeconds,
+      }),
     }),
   getLmStatus: () => apiRequest<any>('/chat/lm-studio/status'),
 }
@@ -116,6 +132,11 @@ export const channelApi = {
     apiRequest<any>(`/channels/${id}/automations`, { method: 'PUT', body: JSON.stringify(data) }),
   postNow: (id: string, text?: string) =>
     apiRequest<any>(`/channels/${id}/post-now`, { method: 'POST', body: JSON.stringify({ text }) }),
+  getScheduledPosts: () => apiRequest<any>('/channels/scheduled-posts', { cache: 'no-store' }),
+  schedulePost: (data: { channelId: string; text: string; mediaUrl?: string; scheduledAt: string }) =>
+    apiRequest<any>('/channels/scheduled-posts', { method: 'POST', body: JSON.stringify(data) }),
+  cancelScheduledPost: (id: string) =>
+    apiRequest<any>(`/channels/scheduled-posts/${id}`, { method: 'DELETE' }),
   disconnect: (id: string) => apiRequest<any>(`/channels/${id}`, { method: 'DELETE' }),
 }
 
@@ -168,13 +189,22 @@ export const memoryApi = {
 // ─── WhatsApp ──────────────────────────────────────────────────────────────
 export const whatsappApi = {
   getSessions: () => apiRequest<any>('/whatsapp/sessions'),
+  getAnalytics: () => apiRequest<any>('/whatsapp/analytics', { cache: 'no-store' }),
   /** Message log for one session, optionally narrowed to a single customer. */
   getMessages: (id: string, from?: string) =>
     apiRequest<any>(`/whatsapp/sessions/${id}/messages${from ? `?from=${encodeURIComponent(from)}` : ''}`),
-  createSession: (sessionName: string) =>
-    apiRequest<any>('/whatsapp/sessions', { method: 'POST', body: JSON.stringify({ sessionName }) }),
+  exportHistory: (id: string) =>
+    apiRequest<any>(`/whatsapp/sessions/${id}/export`, { cache: 'no-store' }),
+  createSession: (sessionName: string, phoneNumber?: string) =>
+    apiRequest<any>('/whatsapp/sessions', { method: 'POST', body: JSON.stringify({ sessionName, phoneNumber }) }),
   disconnect: (id: string) =>
     apiRequest<any>(`/whatsapp/sessions/${id}/disconnect`, { method: 'POST' }),
+  /** Ask the backend to mint an 8-char pairing code (link-by-code, no QR scan). */
+  requestPairingCode: (id: string, phoneNumber: string) =>
+    apiRequest<any>(`/whatsapp/sessions/${id}/pairing-code`, {
+      method: 'POST',
+      body: JSON.stringify({ phoneNumber }),
+    }),
   deleteSession: (id: string) =>
     apiRequest<any>(`/whatsapp/sessions/${id}`, { method: 'DELETE' }),
   updateSettings: (id: string, settings: any) =>
@@ -285,6 +315,8 @@ export const adminApi = {
 export const flowApi = {
   /** Get Flow MCP status, connection readiness, and model capabilities */
   getStatus: () => apiRequest<any>('/flow/status', { cache: 'no-store' }),
+  /** Get the active account's image allowance and current period usage. */
+  getImageQuota: () => apiRequest<any>('/flow/image-quota', { cache: 'no-store' }),
   /** Get available Flow models and aspect ratios */
   getModels: () => apiRequest<any>('/flow/models', { cache: 'no-store' }),
   /** Generate an image or video using Google Flow MCP */
@@ -295,6 +327,12 @@ export const flowApi = {
   /** Complete Google Flow account connection handshake */
   completeConnect: (data?: { connectionId?: string }) =>
     apiRequest<any>('/flow/connect/complete', { method: 'POST', body: JSON.stringify(data || {}) }),
+  /** Begin an admin-only handshake for one HerovaAi shared image account. */
+  beginHouseConnect: (accountId: 'ff2' | 'ff3' | 'ff1') =>
+    apiRequest<any>('/flow/house/connect/begin', { method: 'POST', body: JSON.stringify({ accountId }) }),
+  /** Complete an admin-only handshake for one HerovaAi shared image account. */
+  completeHouseConnect: (data: { accountId: 'ff2' | 'ff3' | 'ff1'; connectionId: string }) =>
+    apiRequest<any>('/flow/house/connect/complete', { method: 'POST', body: JSON.stringify(data) }),
   /** Connect Google Flow via cookies / session */
   connectCookies: (rawCookies: string | any[]) =>
     apiRequest<any>('/flow/connect/cookies', { method: 'POST', body: JSON.stringify({ rawCookies }) }),
@@ -303,8 +341,22 @@ export const flowApi = {
   /** AI Auto-Generate Social Post (Hook, Caption, 10-15 #tags, CTA, Thumbnail recommendation) */
   generatePost: (data: { mediaUrl: string; prompt: string; platform?: string; customTopic?: string }) =>
     apiRequest<any>('/flow/generate-post', { method: 'POST', body: JSON.stringify(data) }),
+  /** Create original Facebook commercial copy from a brief, reference image, and business profile. */
+  generateCommercialPost: (data: {
+    prompt?: string
+    customTopic?: string
+    referenceImage?: { mimeType: string; data: string } | null
+  }) => apiRequest<any>('/flow/generate-commercial-post', { method: 'POST', body: JSON.stringify(data) }),
+  /** Store a selected image only when the user chooses to publish or schedule it. */
+  uploadCommercialReference: (data: { mimeType: string; data: string }) =>
+    apiRequest<any>('/flow/commercial-post/reference', { method: 'POST', body: JSON.stringify(data) }),
   /** Push/Publish post directly to connected channel */
   publishPost: (data: { channelId: string; text: string; mediaUrl?: string }) =>
     apiRequest<any>('/flow/publish-post', { method: 'POST', body: JSON.stringify(data) }),
 }
 
+/** Admin Google Flow Studio, which accepts optional multipart reference images. */
+export const googleFlowApi = {
+  getOptions: () => apiRequest<any>('/google-flow/options', { cache: 'no-store' }),
+  generate: (formData: FormData) => apiUpload<any>('/google-flow/generate', formData),
+}

@@ -84,14 +84,16 @@ herovaai/
 ├── docs/
 │   ├── DEPLOY.md           # hosting, OAuth, SEO, operations
 │   ├── OPS.md              # runbook: services, paths, LM Studio lifecycle
-│   └── MODELS.md           # local model inventory & public-safe rule
+│   └── MODELS.md           # the free model menu, and why there is one AI key
 └── package.json            # root helpers (install:all, dev, build)
 ```
 
 ## Environment
 
-- `backend/.env` — `MONGODB_URI`, `JWT_SECRET`, admin seed creds, LM Studio / Groq / Gemini /
-  OpenRouter keys. Never commit.
+- `backend/.env` — `MONGODB_URI`, `JWT_SECRET`, admin seed creds, and the single AI
+  credential `OMNIROUTE_API_KEY` (with `OMNIROUTE_BASE_URL`). OmniRoute fronts every
+  upstream provider, so no Groq/Gemini/OpenRouter key is needed or accepted — see
+  [docs/MODELS.md](docs/MODELS.md). Never commit.
 - `frontend/.env.local` — nothing required. The app talks to its own origin
   (`/api`, `/socket.io`) and the gateway forwards both; set
   `NEXT_PUBLIC_API_URL` / `NEXT_PUBLIC_SOCKET_URL` only to point the frontend at a

@@ -58,8 +58,19 @@ const activeSessions = new Map();
 // still waiting to be scanned). These own a real Chromium process, so anything that closes or
 // restarts a session has to account for them too.
 const pendingSessions = new Map();
+// Launch-generation token per session. Every launch — and every close — bumps
+// it, and each create()'s QR/status/code callbacks check they still own the
+// session before writing. The browser keeps firing statusFind events for a few
+// hundred ms after it is killed (qrReadError, autocloseCalled, …); without this
+// those stragglers race the caller's own save and flip a just-disconnected
+// session back to qr_pending.
+const launchGen = new Map();
 
 const TOKENS_DIR = path.join(process.cwd(), 'tokens');
+// How long we wait for the page to mint a pairing code before telling the owner
+// it failed. First code usually lands in <30s; a throttled request never
+// answers at all, so this is a watchdog, not a stopwatch.
+const CODE_TIMEOUT_MS = 75000;
 // Files Chromium leaves behind when it is killed instead of closed; a stale lock makes the
 // next launch with the same profile dir hang waiting for a browser that will never appear.
 const STALE_LOCK_FILES = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
@@ -67,8 +78,11 @@ const STALE_LOCK_FILES = ['SingletonLock', 'SingletonCookie', 'SingletonSocket']
 // wppconnect reports its own status strings. Only post-login signals mean connected; the
 // states that merely prove the browser is up stay "linking" (our qr_pending), and anything
 // unknown is reported as disconnected rather than optimistically promoted.
-const CONNECTED_STATES = new Set(['isLogged', 'successChat', 'connected', 'CONNECTED']);
-const LINKING_STATES = new Set(['notLogged', 'inChat', 'qrReadSuccess', 'chatsAvailable',
+// 'inChat' is a POST-LOGIN signal: host.layer.js checkInChat() logs "Connected" and then
+// fires statusFind('inChat') — classifying it as linking left the dashboard showing
+// "scan QR" for a fully logged-in session (and invited re-links that dropped messages).
+const CONNECTED_STATES = new Set(['isLogged', 'successChat', 'connected', 'CONNECTED', 'inChat']);
+const LINKING_STATES = new Set(['notLogged', 'qrReadSuccess', 'chatsAvailable',
   'SYNCING', 'RESUMING', 'disconnectedMobile', 'phoneNotConnected', 'qrReadFail', 'qrReadError']);
 const CLOSED_STATES = new Set(['browserClose', 'serverClose', 'autocloseCalled', 'deleteToken',
   'DISCONNECTED']);
@@ -214,12 +228,24 @@ async function setStatus(sessionName, userId, status, extra = {}) {
  * returns is intentionally not awaited here, because it only settles after the QR has been
  * scanned — the caller must not be blocked by a human holding a phone.
  */
-async function startSession(sessionName, userId, io) {
+async function startSession(sessionName, userId, io, opts = {}) {
   if (!wppconnect) {
     const message = 'WPPConnect library is not installed on the server';
     await setStatus(sessionName, userId, 'error', { lastError: message, lastErrorAt: new Date() });
     emit(io, userId, 'whatsapp-status', { sessionName, status: 'error', error: message });
     return { ok: false, error: message };
+  }
+
+  // "Link with phone number" mode: the login method is chosen once, at create()
+  // time. With a phone number WPPConnect mints an 8-char pairing code (via the
+  // page's WPP.conn.genLinkDeviceCodeForPhoneNumber) instead of a QR.
+  const phone = String(opts.phoneNumber || '').replace(/[^0-9]/g, '');
+
+  // A fresh QR launch invalidates any code minted earlier — a stale code must
+  // never sit in the UI and hide the new QR. (setStatus is not used here so the
+  // session's status/lastActive are left alone until statusFind reports.)
+  if (!phone) {
+    await WhatsAppSession.updateOne({ sessionName, userId }, { $set: { pairingCode: null, pairingCodeAt: null } });
   }
 
   const existing = activeSessions.get(sessionName);
@@ -236,17 +262,39 @@ async function startSession(sessionName, userId, io) {
   }
 
   clearStaleLocks(sessionName);
+  if (phone) {
+    armCodeWatchdog(sessionName, userId, io);
+  }
   // A session that is starting is no longer waiting in line.
   WhatsAppSession.findOneAndUpdate({ sessionName, userId }, { $set: { queuePosition: null } }).catch(() => {});
-  console.log(`📱 Starting WPPConnect session: ${sessionName}`);
+  console.log(`📱 Starting WPPConnect session: ${sessionName}${phone ? ` (pairing code mode for ${phone})` : ''}`);
 
   let clientPromise;
   try {
+    // Claim a fresh generation for this launch — callbacks below capture it and
+    // bail out if a later launch or a close has moved the session on.
+    const gen = (launchGen.get(sessionName) || 0) + 1;
+    launchGen.set(sessionName, gen);
+
     clientPromise = wppconnect.create({
       session: sessionName,
-      autoClose: false,
+      autoClose: 0,
       disableWelcome: true,
       headless: true,
+      // Phone-number ("link with a code") mode: only when a number was supplied.
+      ...(phone ? { phoneNumber: phone } : {}),
+      // Fires only in phone-number mode. Store the one-time code and push it to
+      // the owner's dashboard over the same socket channel the QR uses.
+      catchLinkCode: async (code) => {
+        if (launchGen.get(sessionName) !== gen) return; // superseded launch
+        const clean = String(code || '').trim();
+        clearCodeWatchdog(sessionName);
+        console.log(`🔑 Pairing code for ${sessionName}: ${clean}`);
+        await setStatus(sessionName, userId, 'qr_pending', {
+          pairingCode: clean, pairingCodeAt: new Date(), qrCode: null, lastError: null, lastErrorAt: null,
+        });
+        emit(io, userId, 'whatsapp-pairing-code', { sessionName, code: clean });
+      },
       puppeteerOptions: {
         ...(executablePath ? { executablePath } : {}),
         args: [
@@ -260,6 +308,7 @@ async function startSession(sessionName, userId, io) {
         ],
       },
       catchQR: async (base64Qr, asciiQR, attempts) => {
+        if (launchGen.get(sessionName) !== gen) return; // superseded launch
         console.log(`📲 QR Code generated for ${sessionName} (attempt ${attempts})`);
         const qrImage = (base64Qr && base64Qr.startsWith('data:'))
           ? base64Qr
@@ -272,10 +321,14 @@ async function startSession(sessionName, userId, io) {
       statusFind: async (statusSession) => {
         const status = mapStatus(statusSession);
         console.log(`📱 Session status [${sessionName}]: ${statusSession} -> ${status}`);
+        if (launchGen.get(sessionName) !== gen) return; // superseded launch
         if (status === 'connected') {
-          await setStatus(sessionName, userId, 'connected', { qrCode: null, lastError: null, lastErrorAt: null });
+          // A successful link burns the one-time code — never show it again.
+          await setStatus(sessionName, userId, 'connected', {
+            qrCode: null, pairingCode: null, pairingCodeAt: null, lastError: null, lastErrorAt: null,
+          });
         } else if (status === 'disconnected') {
-          await setStatus(sessionName, userId, 'disconnected', { qrCode: null });
+          await setStatus(sessionName, userId, 'disconnected', { qrCode: null, pairingCode: null, pairingCodeAt: null });
         } else {
           await setStatus(sessionName, userId, 'qr_pending');
         }
@@ -403,6 +456,14 @@ async function stopSession(sessionName) {
  * profile so a deleted session cannot silently resume its old login.
  */
 async function closeSession(sessionName, { removeProfile = false } = {}) {
+  // Retire every callback owned by the browser we are about to kill: its
+  // statusFind/QR/code events keep landing for a few hundred ms after death and
+  // must not overwrite the caller's fresh state.
+  launchGen.set(sessionName, (launchGen.get(sessionName) || 0) + 1);
+  // A close also ends any pairing-code generation in flight — its watchdog must
+  // not report a timeout for a session nobody is waiting on any more.
+  clearCodeWatchdog(sessionName);
+
   await stopSession(sessionName);
 
   const dir = profileDirFor(sessionName);
@@ -692,7 +753,16 @@ async function handleIncomingMessage(sessionName, userId, message, io) {
 
     const wantsReply = session.autoReply && session.autoReplyMode !== 'never'
       && !message.isGroupMsg && Boolean(message.body);
-    if (!wantsReply) return;
+    if (!wantsReply) {
+      // Say WHY nothing was sent — the old silent return made "connected but not
+      // replying" impossible to diagnose from the logs.
+      const why = (!session.autoReply || session.autoReplyMode === 'never') ? 'auto-reply off for this session'
+        : message.isGroupMsg ? 'group message (auto-reply is 1:1 only)'
+        : !message.body ? 'no text body (media/empty message)'
+        : 'not eligible';
+      console.log(`[Auto-Reply] ${fromNumber}: received, not answered (${why})`);
+      return;
+    }
 
     // Master switch from the admin panel. The customer's message is stored (it
     // is), the owner still gets the alert, and no automatic reply is sent — which
@@ -813,41 +883,38 @@ async function generateAIReply(userId, incomingMessage, session, recentHistory =
     const mediaIntent = detectMediaGenerationIntent(incomingMessage);
     if (mediaIntent) {
       try {
-        const flowStatus = await flowService.getStatus();
-        if (flowStatus.ready) {
-          const userSettings = user?.chatSettings || {};
-          const flowModel = mediaIntent.type === 'video'
-            ? (userSettings.flowVideoModel || 'omni-flash')
-            : (userSettings.flowImageModel || 'nano-banana-2');
-          const flowRatio = userSettings.flowAspectRatio || (mediaIntent.type === 'video' ? '16:9' : '1:1');
+        const userSettings = user?.chatSettings || {};
+        const savedImageModel = userSettings.flowImageModel;
+        const flowModel = mediaIntent.type === 'video'
+          ? (userSettings.flowVideoModel || 'omni-flash')
+          : (savedImageModel || 'nano-banana-pro');
+        const flowRatio = userSettings.flowAspectRatio || (mediaIntent.type === 'video' ? '16:9' : '1:1');
 
-          console.log(`🎨 WhatsApp triggering Google Flow with model ${flowModel} for ${mediaIntent.type}: "${mediaIntent.prompt}"`);
-          const genResult = await flowService.generateMedia({
-            prompt: mediaIntent.prompt,
-            mediaType: mediaIntent.type,
-            model: flowModel,
-            ratio: flowRatio,
-          });
-          const fname = genResult.filename || (genResult.url ? path.basename(genResult.url) : null);
-          const localPath = fname ? flowService.findMediaFile(fname) : null;
-          if (localPath && fs.existsSync(localPath)) {
-            const caption = `✨ Generated ${mediaIntent.type} (${flowModel})\n\nPrompt: "${mediaIntent.prompt}"`;
-            return {
-              text: caption,
-              mediaPath: localPath,
-              mediaUrl: genResult.url || `/api/media/${fname}`,
-              answeredBy: 'google-flow-mcp',
-            };
-          } else if (genResult.pending) {
-            return {
-              text: `⏳ Your ${mediaIntent.type} is being generated by Google Flow in the background (Job: ${genResult.jobId || 'in progress'}).`,
-              answeredBy: 'google-flow-mcp',
-            };
-          }
-        } else {
-          console.warn(`[WhatsApp Auto-Reply] Media intent detected but Flow MCP is not ready`);
+        console.log(`🎨 WhatsApp triggering ${mediaIntent.type} generation with model ${flowModel}: "${mediaIntent.prompt}"`);
+        const genResult = await flowService.generateMedia({
+          prompt: mediaIntent.prompt,
+          mediaType: mediaIntent.type,
+          model: flowModel,
+          ratio: flowRatio,
+        });
+        const fname = genResult.filename || (genResult.url ? path.basename(genResult.url) : null);
+        const localPath = fname ? flowService.findMediaFile(fname) : null;
+        if (localPath && fs.existsSync(localPath)) {
+          const providerName = genResult.providerName || ({
+            'agnes-direct': 'Agnes',
+            'omniroute-video': 'OmniRoute',
+            'omniroute-fallback': 'OmniRoute',
+          }[genResult.servedBy] || 'Google Flow');
+          const caption = `✨ Generated ${mediaIntent.type} (${providerName}: ${genResult.modelName || genResult.model || flowModel})\n\nPrompt: "${mediaIntent.prompt}"`;
           return {
-            text: `🎨 I received your request to generate a ${mediaIntent.type} ("${mediaIntent.prompt}").\n\nOur Google Flow media generator is currently offline or waiting for session link in the dashboard. Our team has been notified!`,
+            text: caption,
+            mediaPath: localPath,
+            mediaUrl: genResult.url || `/api/media/${fname}`,
+            answeredBy: providerName,
+          };
+        } else if (genResult.pending) {
+          return {
+            text: `⏳ Your ${mediaIntent.type} is being generated (Job: ${genResult.jobId || 'in progress'}).`,
             answeredBy: 'google-flow-mcp',
           };
         }
@@ -857,10 +924,13 @@ async function generateAIReply(userId, incomingMessage, session, recentHistory =
     }
 
     // ── Tier 1: cloud, on a catalog id that verifies in its provider's live list ──
-    const pinnedCloud = process.env.WHATSAPP_AI_MODEL || 'groq/qwen/qwen3.8-27b';
+    // Defaults to the free gateway model, so WhatsApp auto-reply works out of the
+    // box instead of depending on an operator-set id that names a provider this
+    // deployment does not have.
+    const pinnedCloud = process.env.WHATSAPP_AI_MODEL || cloudAIService.DEFAULT_MODEL;
     try {
       const modelDef = cloudAIService.ALL_MODELS_CATALOG.find(m => m.id === pinnedCloud);
-      const provider = modelDef?.provider || 'groq';
+      const provider = modelDef?.provider || 'omniroute';
       const servable = await catalogService.checkServable(provider, pinnedCloud);
       if (servable.ok) {
         const cloudRes = await cloudAIService.generateCompletion({
@@ -1227,8 +1297,88 @@ async function muteState(sessionId, userId, customer) {
     : { muted: false, until: null, reason: null };
 }
 
+/**
+ * Switch a session to "link with a code" login: restart its browser in
+ * phone-number mode so WPPConnect mints an 8-char pairing code (delivered over
+ * the `whatsapp-pairing-code` socket event). QR login stays the default; this is
+ * the alternative for anyone who cannot scan. The login method is fixed when the
+ * session is created, so the browser waiting on a scan is closed and relaunched
+ * in code mode.
+ */
+async function requestPairingCode(sessionName, userId, phoneNumber, io) {
+  let digits = String(phoneNumber || '').replace(/[^0-9]/g, '');
+  // Auto-normalize Bangladesh numbers starting with 01 (e.g. 018... -> 88018...)
+  if (/^01[3-9]\d{8}$/.test(digits)) {
+    digits = '88' + digits;
+  }
+  if (digits.length < 7 || digits.length > 15) {
+    return { ok: false, error: 'Enter your full phone number with country code (e.g. 8801712345678).' };
+  }
+  if (!wppconnect) return { ok: false, error: 'WPPConnect library is not installed on the server' };
+
+  // WhatsApp throttles repeated companion-code requests for the same number
+  // (observed live: a third request inside 7 minutes never answers). One
+  // generation at a time; the watchdog below reports a request that hangs.
+  if (codeWatchdogs.has(sessionName)) {
+    return { ok: false, error: 'A code is already being generated for this session — give it up to a minute, then try again.' };
+  }
+
+  const state = await getSessionState(sessionName).catch(() => ({}));
+  if (state && state.connected) {
+    return { ok: false, error: 'This number is already connected. Disconnect it first if you want to re-link with a code.' };
+  }
+
+  // Tear down whatever is mid-scan with clean profile, then relaunch in code mode.
+  // The short pause lets the old browser release the profile's SingletonLock first.
+  await closeSession(sessionName, { removeProfile: true }).catch(() => {});
+  await sleep(1500);
+
+  const started = await startSession(sessionName, userId, io, { phoneNumber: digits });
+  if (!started || started.ok === false) {
+    return { ok: false, error: (started && started.error) || 'Could not start the session' };
+  }
+  armCodeWatchdog(sessionName, userId, io);
+  return { ok: true, message: 'Generating your pairing code…' };
+}
+
+// sessionName -> timer handle for the "code never arrived" watchdog.
+const codeWatchdogs = new Map();
+
+function clearCodeWatchdog(sessionName) {
+  const timer = codeWatchdogs.get(sessionName);
+  if (timer) {
+    clearTimeout(timer);
+    codeWatchdogs.delete(sessionName);
+  }
+}
+
+/**
+ * The page's genLinkDeviceCodeForPhoneNumber call can hang forever when
+ * WhatsApp throttles it — without this, the dashboard would sit on
+ * "Generating…" for ever. After CODE_TIMEOUT_MS, tell the owner what happened
+ * (unless the code landed late, in which case stay quiet and show it).
+ */
+function armCodeWatchdog(sessionName, userId, io) {
+  clearCodeWatchdog(sessionName);
+  const timer = setTimeout(async () => {
+    codeWatchdogs.delete(sessionName);
+    try {
+      const doc = await WhatsAppSession.findOne({ sessionName, userId }, { pairingCode: 1 }).lean();
+      if (doc && doc.pairingCode) return; // arrived late — not a failure
+      const message = 'The pairing code took too long to arrive — WhatsApp may be limiting repeated requests. Wait a minute and try again, or scan the QR instead.';
+      console.warn(`⏱️  Pairing code timed out for ${sessionName}`);
+      await setStatus(sessionName, userId, 'qr_pending', { lastError: message, lastErrorAt: new Date() });
+      emit(io, userId, 'whatsapp-pairing-error', { sessionName, error: message });
+    } catch (err) {
+      console.warn(`Pairing-code watchdog for ${sessionName} failed: ${err.message}`);
+    }
+  }, CODE_TIMEOUT_MS);
+  codeWatchdogs.set(sessionName, timer);
+}
+
 module.exports = {
   startSession, closeSession, sendMessage, sendMedia, getActiveSessions,
+  requestPairingCode,
   getSessionState, reconcileOnBoot, handleIncomingMessage, mapStatus,
   browserPidsFor, trackOwnSend,
   liveSessionReport, launchHeadroom, liveCountForUser, stopSession,

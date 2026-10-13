@@ -9,6 +9,7 @@ const nagad = require('../services/nagad');
 const plans = require('../config/plans');
 const subs = require('../services/subscriptionService');
 const appSettings = require('../services/appSettings');
+const publicUrl = require('../services/publicUrl');
 
 /**
  * Checkout can be switched off from the admin panel (wrong wallet, Nagad outage,
@@ -39,12 +40,19 @@ function frontendBase(req) {
   const host = req.headers['x-forwarded-host'] || req.headers.host || '';
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
   if (!host) return (process.env.FRONTEND_URL || 'http://localhost:3001').replace(/\/+$/, '');
+  // The request's own Host is always current — unlike a stored URL — so it is
+  // used as-is.
   return `${proto}://${host}`.replace(/\/+$/, '');
 }
 
-/** Absolute URL of this API, so a gateway can call home from anywhere. */
+/**
+ * Absolute URL of this API, so a gateway can call home from anywhere.
+ * Resolved per call: a rotating public tunnel changes its hostname, and a
+ * callback URL pinned to yesterday's hostname means a paid plan that never
+ * activates.
+ */
 function apiBase() {
-  return (process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`).replace(/\/+$/, '');
+  return publicUrl.publicOrigin();
 }
 
 const newTranId = (prefix = 'HV') =>

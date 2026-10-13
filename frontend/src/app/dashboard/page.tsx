@@ -102,9 +102,16 @@ export default function DashboardPage() {
   const daysLeft = quota?.daysLeft ?? 7
   const usedPct = percent(used, limit)
 
-  const localReady = Boolean(localModel?.running || localModel?.serverRunning || localModel?.ok)
+  // The status route reports `isOnline`/`starting`/`loadedModels` — the old
+  // `running`/`serverRunning`/`ok` fields never existed, so this tile was stuck
+  // on "idle" even with a model loaded. Match the marketing page's check.
+  const localReady = Boolean(localModel?.isOnline && !localModel?.starting)
   const agentKeySet = Boolean(user?.hasContentbotApiKey)
-  const providerCount = vault ? `${vault.providersConfigured}/${vault.providersTotal}` : null
+  // The AI gateway alone: the vault's other slots (agent platform key, Google sign-in)
+  // are not model providers, so counting them here would read as missing providers.
+  const gatewayCount = vault?.aiGatewayTotal
+    ? `${vault.aiGatewayConfigured || 0}/${vault.aiGatewayTotal}`
+    : null
 
   return (
     <div className="space-y-5">
@@ -461,12 +468,14 @@ export default function DashboardPage() {
                 value={agentKeySet ? user?.contentbotApiKeyMasked || 'set' : 'not set'}
                 hint={agentKeySet ? undefined : 'add it in Settings → API keys'}
               />
-              {providerCount ? (
+              {gatewayCount ? (
                 <StatusRow
-                  label="Cloud providers"
-                  tone={vault?.failingKeys ? 'warn' : 'live'}
-                  value={`${providerCount} configured`}
-                  hint={vault?.failingKeys ? `${vault.failingKeys} key(s) rejected by their provider` : undefined}
+                  label="AI gateway"
+                  tone={vault?.aiGatewayConfigured > 0 && !vault?.failingKeys ? 'live' : 'warn'}
+                  value={`OmniRoute ${gatewayCount} configured`}
+                  hint={vault?.failingKeys
+                    ? `${vault.failingKeys} key(s) rejected by their provider`
+                    : 'Free models are served through this one key'}
                 />
               ) : null}
             </ul>

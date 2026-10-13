@@ -2,11 +2,53 @@ const express = require('express');
 const router = express.Router();
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const flowService = require('../services/flowService');
+const imageGenerationService = require('../services/imageGenerationService');
 const channelService = require('../services/channelService');
 const ChannelConnection = require('../models/ChannelConnection');
 const AIMemory = require('../models/AIMemory');
-const { authenticate, optionalAuth } = require('../middleware/auth');
+const CommercialPost = require('../models/CommercialPost');
+const ScheduledPost = require('../models/ScheduledPost');
+const { authenticate, optionalAuth, adminOnly } = require('../middleware/auth');
+
+const HOUSE_FLOW_ACCOUNTS = new Map([
+  ['ff2', 'FF2 (primary)'],
+  ['ff3', 'FF3 (backup 1)'],
+  ['ff1', 'FF1 (backup 2)'],
+]);
+
+const REFERENCE_IMAGE_TYPES = {
+  'image/jpeg': { extension: '.jpg', signature: (buffer) => buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff },
+  'image/png': { extension: '.png', signature: (buffer) => buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) },
+  'image/webp': { extension: '.webp', signature: (buffer) => buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP' },
+};
+
+function decodeReferenceImage(referenceImage) {
+  const type = REFERENCE_IMAGE_TYPES[referenceImage?.mimeType];
+  const data = referenceImage?.data;
+  if (!type || typeof data !== 'string' || !data || data.length > 900_000 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) {
+    throw new Error('Choose a JPEG, PNG, or WebP image smaller than 650 KB.');
+  }
+  const image = Buffer.from(data, 'base64');
+  if (!image.length || image.length > 650 * 1024 || !type.signature(image)) {
+    throw new Error('The reference image is invalid or too large. Choose another image.');
+  }
+  return { image, type };
+}
+
+function commercialPostSimilarity(left, right) {
+  const words = (text) => new Set(
+    String(text || '').toLowerCase().replace(/#[\p{L}\p{N}_]+/gu, ' ')
+      .match(/[\p{L}\p{N}]{4,}/gu) || []
+  );
+  const a = words(left);
+  const b = words(right);
+  if (a.size < 6 || b.size < 6) return 0;
+  let shared = 0;
+  for (const word of a) if (b.has(word)) shared += 1;
+  return shared / (a.size + b.size - shared);
+}
 
 // Status of Google Flow MCP & connected accounts (including per-user quota info)
 router.get('/status', optionalAuth, async (req, res) => {
@@ -19,9 +61,16 @@ router.get('/status', optionalAuth, async (req, res) => {
       connectedAt: req.user.flowAccountConnectedAt,
     } : null;
 
+    // How many accounts serve everyone. This is what makes "images are free and
+    // need no connection" true or false, so the UI can say it plainly instead of
+    // asking a visitor to connect an account they do not have.
+    const houseAccounts = await flowService.houseAccounts({ status }).catch(() => []);
+
     res.json({
       ...status,
       userFlowAccount: userAccount,
+      houseAccounts: { count: houseAccounts.length, ids: houseAccounts.slice(0, 10) },
+      freeForEveryone: houseAccounts.length > 0,
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -33,8 +82,56 @@ router.get('/models', (_req, res) => {
   res.json({ success: true, models: flowService.FLOW_MODELS });
 });
 
+router.get('/image-quota', optionalAuth, async (req, res) => {
+  try {
+    const quota = await imageGenerationService.getQuota({ user: req.user, ip: req.ip });
+    res.json({ success: true, ...quota });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/house/connect/begin', authenticate, adminOnly, async (req, res) => {
+  try {
+    const accountId = String(req.body?.accountId || '');
+    const label = HOUSE_FLOW_ACCOUNTS.get(accountId);
+    if (!label) {
+      return res.status(400).json({ success: false, message: 'Choose FF2, FF3, or FF1.' });
+    }
+    const result = await flowService.beginConnect({ accountId, label });
+    res.json({ success: true, result });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/house/connect/complete', authenticate, adminOnly, async (req, res) => {
+  try {
+    const accountId = String(req.body?.accountId || '');
+    const connectionId = String(req.body?.connectionId || '');
+    const label = HOUSE_FLOW_ACCOUNTS.get(accountId);
+    if (!label) {
+      return res.status(400).json({ success: false, message: 'Choose FF2, FF3, or FF1.' });
+    }
+    if (!connectionId) {
+      return res.status(400).json({ success: false, message: 'Start the account handshake first.' });
+    }
+
+    const result = await flowService.completeConnect({ connectionId, accountId, label });
+    flowService.houseAccountsCache = { at: 0, ids: [] };
+    const connectedIds = await flowService.houseAccounts({ fresh: true });
+    res.json({
+      success: true,
+      result,
+      houseAccounts: { count: connectedIds.length, ids: connectedIds },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // Trigger generation (image or video) with on-demand headless spin-up & per-user quota
-router.post('/generate', authenticate, async (req, res) => {
+router.post('/generate', optionalAuth, async (req, res) => {
   try {
     const { prompt, mediaType = 'image', duration = 6, ratio, model } = req.body;
     if (!prompt?.trim()) {
@@ -42,23 +139,40 @@ router.post('/generate', authenticate, async (req, res) => {
     }
 
     const userSettings = req.user?.chatSettings || {};
+    const savedImageModel = userSettings.flowImageModel;
+    const defaultImageModel = savedImageModel || 'nano-banana-pro';
     const defaultModel = mediaType === 'video'
       ? (userSettings.flowVideoModel || 'omni-flash')
-      : (userSettings.flowImageModel || 'nano-banana-2');
+      : defaultImageModel;
     const defaultRatio = userSettings.flowAspectRatio || ratio || '16:9';
 
-    // Personal user quota account if connected, else user ID
-    const accountId = req.user?.flowAccountId || ('user_' + req.user?._id);
+    // Images try the shared pool first and then a connected personal account.
+    // Videos continue using the owner's connected account.
+    const accountId = req.user ? flowService.accountIdForGeneration(req.user, mediaType) : null;
 
-    const result = await flowService.generateMedia({
-      prompt,
-      mediaType,
-      duration,
-      ratio: ratio || defaultRatio,
-      model: model || defaultModel,
-      accountId,
+    const result = String(mediaType).toLowerCase() === 'image'
+      ? await imageGenerationService.generate({
+        prompt,
+        ratio: ratio || defaultRatio,
+        model: model || defaultModel,
+        user: req.user,
+        ip: req.ip,
+      })
+      : await flowService.generateMedia({
+        prompt,
+        mediaType,
+        duration,
+        ratio: ratio || defaultRatio,
+        model: model || defaultModel,
+        accountId,
+      });
+    if (result.code === 'IMAGE_QUOTA_LIMIT') {
+      return res.status(429).json({ success: false, ...result });
+    }
+    res.json({
+      success: result.ok !== false,
+      ...result,
     });
-    res.json(result);
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -70,6 +184,7 @@ router.post('/connect/begin', authenticate, async (req, res) => {
     const accountId = 'user_' + req.user._id;
     const label = req.user.name || req.user.email;
     const result = await flowService.beginConnect({ accountId, label });
+    flowService.invalidateStatusCache();
     res.json(result);
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -188,6 +303,110 @@ router.post('/generate-post', authenticate, async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/commercial-post/reference', authenticate, async (req, res) => {
+  try {
+    const { image, type } = decodeReferenceImage(req.body);
+    const filename = `commercial-${crypto.randomUUID()}${type.extension}`;
+    const mediaDirectory = path.resolve(__dirname, '../../public/media');
+    await fs.promises.mkdir(mediaDirectory, { recursive: true });
+    await fs.promises.writeFile(path.join(mediaDirectory, filename), image, { flag: 'wx', mode: 0o600 });
+    res.json({ success: true, mediaUrl: `/api/flow/media/${filename}` });
+  } catch (err) {
+    const status = /reference image|choose a jpeg/i.test(err.message) ? 400 : 500;
+    res.status(status).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/generate-commercial-post', authenticate, async (req, res) => {
+  try {
+    const prompt = String(req.body?.prompt || '').trim().slice(0, 2000);
+    const customTopic = String(req.body?.customTopic || '').trim().slice(0, 1000);
+    const mediaUrl = String(req.body?.mediaUrl || '').trim().slice(0, 500);
+    let referenceImage = null;
+    if (req.body?.referenceImage) {
+      const { image, type } = decodeReferenceImage(req.body.referenceImage);
+      referenceImage = { mimeType: req.body.referenceImage.mimeType, data: image.toString('base64') };
+    }
+    const memory = await AIMemory.findOne({ userId: req.user._id }).catch(() => null);
+    const businessInfo = req.user.businessInfo || {};
+    const hasBusinessProfile = Boolean(
+      memory?.enabled !== false && (
+        memory?.businessName || memory?.businessType || memory?.businessDescription || memory?.catalog?.length
+      )
+    ) || Boolean(businessInfo.name || businessInfo.industry || businessInfo.description);
+
+    if (!prompt && !customTopic && !mediaUrl && !referenceImage && !hasBusinessProfile) {
+      return res.status(400).json({
+        success: false,
+        message: 'Add a short description, upload a reference image, or complete your business profile first.',
+      });
+    }
+
+    const [generatedPosts, scheduledPosts] = await Promise.all([
+      CommercialPost.find({ userId: req.user._id }).sort({ createdAt: -1 }).limit(10).select('text').lean(),
+      ScheduledPost.find({
+        userId: req.user._id,
+        channel: 'facebook_page',
+        status: { $in: ['scheduled', 'published'] },
+      }).sort({ updatedAt: -1 }).limit(10).select('text').lean(),
+    ]);
+    const recentPosts = [...generatedPosts, ...scheduledPosts]
+      .map((post) => String(post.text || '').slice(0, 1200))
+      .filter(Boolean)
+      .filter((text, index, all) => all.indexOf(text) === index)
+      .slice(0, 12);
+
+    let post = null;
+    let avoidPosts = recentPosts;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      post = await flowService.generateSocialPost({
+        mediaUrl,
+        prompt: prompt || 'Create an original Facebook commercial post using the available business details.',
+        mediaType: 'image',
+        platform: 'facebook_page',
+        customTopic,
+        user: req.user,
+        memory,
+        commercialMode: true,
+        referenceImage,
+        recentPosts: avoidPosts,
+        variationId: crypto.randomUUID(),
+      });
+      const tooSimilar = avoidPosts.some((previous) => commercialPostSimilarity(post.fullPost, previous) >= 0.86);
+      if (!tooSimilar) break;
+      avoidPosts = [post.fullPost, ...avoidPosts].slice(0, 12);
+      post = null;
+    }
+    if (!post) {
+      return res.status(409).json({
+        success: false,
+        message: 'The last drafts were too similar to recent posts. Change the brief or try again for a fresh angle.',
+      });
+    }
+    if (!post?.fullPost?.trim()) {
+      return res.status(502).json({ success: false, message: 'The post generator returned an empty result. Please try again.' });
+    }
+
+    const savedPost = await CommercialPost.create({ userId: req.user._id, text: post.fullPost.slice(0, 5000) });
+    const retainedPosts = await CommercialPost.find({ userId: req.user._id })
+      .sort({ createdAt: -1 }).limit(30).select('_id').lean();
+    await CommercialPost.deleteMany({
+      userId: req.user._id,
+      _id: { $nin: retainedPosts.map((item) => item._id) },
+    });
+
+    res.json({
+      success: true,
+      post: { ...post, fullPost: savedPost.text },
+      mediaUrl,
+      businessProfileUsed: hasBusinessProfile,
+    });
+  } catch (err) {
+    const status = /reference image/i.test(err.message) ? 400 : 502;
+    res.status(status).json({ success: false, message: err.message });
   }
 });
 

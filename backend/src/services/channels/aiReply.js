@@ -17,7 +17,9 @@ const lmStudioService = require('../lmStudioService');
 const cloudAIService = require('../cloudAIService');
 const catalogService = require('../catalogService');
 
-const PINNED_CLOUD = () => (process.env.CHANNEL_AI_MODEL || '').trim();
+// Falls back to the free gateway default: channel replies should not go dark just
+// because the operator never named a model.
+const PINNED_CLOUD = () => (process.env.CHANNEL_AI_MODEL || cloudAIService.DEFAULT_MODEL).trim();
 
 function systemPromptFor({ memory, user, extra }) {
   const businessName = memory?.businessName || user?.businessInfo?.name || 'this business';
@@ -61,7 +63,7 @@ async function generateReply({ userId, incomingText, history = [], channelLabel 
   const pinned = PINNED_CLOUD();
   try {
     const modelDef = pinned ? cloudAIService.ALL_MODELS_CATALOG.find((m) => m.id === pinned) : null;
-    const provider = modelDef?.provider || 'groq';
+    const provider = modelDef?.provider || 'omniroute';
     const servable = await catalogService.checkServable(provider, pinned || modelDef?.id);
     if (pinned && servable.ok) {
       const res = await cloudAIService.generateCompletion({ model: pinned, messages, systemPrompt, temperature: 0.6 });

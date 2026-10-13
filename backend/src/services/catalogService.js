@@ -27,50 +27,29 @@ const UNVERIFIED = 'unverified';
 const TTL_MS = Number(process.env.CATALOG_TTL_MS || 10 * 60 * 1000);
 const PROBE_TIMEOUT_MS = Number(process.env.CATALOG_PROBE_TIMEOUT_MS || 8000);
 
-const GEMINI_KEY_NAMES = ['GEMINI_API_KEY', ...Array.from({ length: 6 }, (_, i) => `GEMINI_API_KEY_${i + 2}`)];
-const AGNES_KEY_NAMES = ['AGENS_API_KEY', 'AGNES_API_KEY',
-  ...Array.from({ length: 5 }, (_, i) => `AGENS_API_KEY_${i + 2}`)];
+/** Where the operator's OmniRoute gateway lives. One place to change it. */
+function omnirouteBase() {
+  return (process.env.OMNIROUTE_BASE_URL || 'http://127.0.0.1:20128/v1').replace(/\/+$/, '');
+}
 
 /**
  * One entry per provider: where to ask, which env vars count as "we have a key", how that
  * provider spells ids in its own list, and whether it publishes pricing we can trust.
  * `strip` is the prefix the catalog id carries that the provider's own ids do not.
+ *
+ * There is exactly one entry, on purpose. This deployment holds a single credential —
+ * OMNIROUTE_API_KEY — and the gateway behind it fronts every upstream provider itself
+ * (Groq, Gemini, Cohere, …), so listing those providers here would only describe keys
+ * nobody is allowed to spend. Keeping the map this short is what makes "the app runs on
+ * the operator's OmniRoute key and nothing else" true by construction rather than by
+ * convention: a probe round has nothing else it could reach.
  */
 const PROVIDERS = {
-  groq: { keys: ['GROQ_API_KEY'], strip: 'groq/', style: 'openai',
-    url: 'https://api.groq.com/openai/v1/models' },
-  // No auth header here on purpose: Google rejects the request with 401 when a Bearer token
-  // accompanies the key= query parameter, even if the key itself is valid.
-  gemini: { keys: GEMINI_KEY_NAMES, strip: '', style: 'gemini', authHeader: false,
-    url: () => `https://generativelanguage.googleapis.com/v1beta/models?key=${firstKey(GEMINI_KEY_NAMES)}` },
-  openrouter: { keys: ['OPENROUTER_API_KEY', 'OPENROUTER_API_KEY_2'], strip: '', style: 'openai',
-    url: 'https://openrouter.ai/api/v1/models', pricing: true },
-  agnes: { keys: AGNES_KEY_NAMES, strip: 'agnes/', style: 'openai',
-    url: 'https://apihub.agnes-ai.com/v1/models' },
-  unorouter: { keys: ['UNOROUTER_API_KEY', 'CB_UNOROUTER_API_KEY'], strip: 'unorouter/', style: 'openai',
-    url: 'https://api.unorouter.com/v1/models' },
-  llm7: { keys: ['LLM7_API_KEY'], strip: 'llm7/', style: 'openai',
-    url: 'https://api.llm7.io/v1/models' },
-  ollama_cloud: { keys: ['OLLAMA_CLOUD_API_KEY', 'OLLAMA_API_KEY'], strip: 'ollama/', style: 'openai',
-    url: 'https://ollama.com/v1/models' },
-  deepseek: { keys: ['DEEPSEEK_API_KEY', 'DEEPSEEK_API_KEY_2'], strip: 'deepseek/', style: 'openai',
-    url: 'https://api.deepseek.com/models' },
-  cohere: { keys: ['COHERE_API_KEY', 'CB_COHERE_API_KEY'], strip: '', style: 'cohere',
-    url: 'https://api.cohere.com/v1/models' },
-  openai: { keys: ['OPENAI_API_KEY'], strip: 'openai/', style: 'openai',
-    url: 'https://api.openai.com/v1/models' },
-  // Registered for dashboard probes/snapshot only — no catalog models while
-  // chat is account-gated (verified 2026-10-08, see docs/MODELS.md).
-  apertis: { keys: ['APERTIS_API_KEY'], strip: '', style: 'openai',
-    url: 'https://api.apertis.ai/v1/models' },
-  apinex: { keys: ['APINEX_API_KEY'], strip: '', style: 'openai',
-    url: 'https://api.apinex.bond/v1/models' },
-  orcarouter: { keys: ['ORCAROUTER_API_KEY'], strip: '', style: 'openai',
-    url: 'https://api.orcarouter.ai/v1/models' },
-  airforce: { keys: ['AIRFORCE_API_KEY'], strip: '', style: 'openai',
-    url: 'https://api.airforce/v1/models' },
-  apmix: { keys: ['APMIX_API_KEY', 'APMIX_API_KEY_2'], strip: '', style: 'openai',
-    url: 'https://api.apmix.ai/v1/models' },
+  // `strip` removes the catalog's own prefix, which exists so an id like
+  // `omniroute/groq/qwen/qwen3.8-27b` can never be confused with the upstream
+  // spelling `groq/qwen/qwen3.8-27b`.
+  omniroute: { keys: ['OMNIROUTE_API_KEY'], strip: 'omniroute/', style: 'openai',
+    url: () => `${omnirouteBase()}/models` },
 };
 
 function firstKey(names) {
@@ -116,10 +95,10 @@ function parseIds(provider, body) {
   return (body?.data || []).map(m => String(m.id || m.name || '')).filter(Boolean);
 }
 
-/** OpenRouter is the one provider here that publishes per-token pricing; keep it verbatim. */
+/** Only a provider that publishes per-token pricing gets prices; OmniRoute publishes none. */
 function parsePricing(provider, body) {
   const pricing = new Map();
-  if (!PROVIDERS[provider].pricing) return pricing;
+  if (!PROVIDERS[provider]?.pricing) return pricing;
   for (const model of body?.data || []) {
     const raw = model?.pricing;
     if (!model?.id || !raw) continue;
@@ -234,7 +213,10 @@ function annotate(models) {
   return models.map(model => {
     const availability = availabilityOf(model.provider, model.id);
     const pricing = pricingOf(model.provider, model.id);
-    const isPaid = pricing ? pricing.prompt > 0 || pricing.completion > 0 : null;
+    // `free: true` on a catalog entry is an explicit claim by the operator — used
+    // for gateways like OmniRoute whose /models publishes no prices, where the
+    // alternative would be to label a free model "unknown" forever.
+    const isPaid = model.free === true ? false : (pricing ? pricing.prompt > 0 || pricing.completion > 0 : null);
     return {
       ...model,
       availability,

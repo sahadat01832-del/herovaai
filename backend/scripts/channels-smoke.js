@@ -68,6 +68,8 @@ async function main() {
   await mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/contentbot', { serverSelectionTimeoutMS: 15000 });
   const User = require('../src/models/User');
   const ChannelConnection = require('../src/models/ChannelConnection');
+  const ScheduledPost = require('../src/models/ScheduledPost');
+  const WhatsAppSession = require('../src/models/WhatsAppSession');
 
   const hash = await bcrypt.hash(USER.password, 12);
   await User.findOneAndUpdate(
@@ -137,6 +139,20 @@ async function main() {
   const hookRow = (afterPost.data.channels || []).find((c) => c.id === 'webhook');
   check('the post is counted', hookRow?.connection?.stats?.postsSent === 1, `posts=${hookRow?.connection?.stats?.postsSent}`);
   check('the post is in the activity receipt', (hookRow?.connection?.activity || []).some((a) => a.kind === 'post' && a.ok));
+  const queued = await call('POST', '/api/channels/scheduled-posts', {
+    token,
+    data: { channelId: 'webhook', text: 'A scheduled smoke-test post.', scheduledAt: new Date(Date.now() + 5 * 60 * 1000).toISOString() },
+  });
+  check('a verified channel accepts a future scheduled post (201)', queued.status === 201, `got ${queued.status}: ${queued.data?.message || ''}`);
+  const queuedList = await call('GET', '/api/channels/scheduled-posts', { token });
+  check('the scheduled post appears in the owner queue', (queuedList.data.posts || []).some((row) => row._id === queued.data?.post?._id));
+  const invalidSchedule = await call('POST', '/api/channels/scheduled-posts', {
+    token,
+    data: { channelId: 'webhook', text: 'Too soon.', scheduledAt: new Date(Date.now() + 20 * 1000).toISOString() },
+  });
+  check('a post cannot be scheduled less than two minutes ahead (400)', invalidSchedule.status === 400, `got ${invalidSchedule.status}`);
+  const cancelled = await call('DELETE', `/api/channels/scheduled-posts/${queued.data?.post?._id}`, { token });
+  check('the owner can cancel a queued post', cancelled.data?.post?.status === 'cancelled');
   check('the daily post is no longer due today', (() => {
     const scheduler = require('../src/services/channelScheduler');
     return scheduler.postIsDue({ automations: { autoPostTime: '00:01' }, stats: { lastPostAt: new Date() }, _id: hookRow?.connection?._id }) === false;
@@ -189,13 +205,36 @@ async function main() {
   });
   check('a page with no connection is refused (404)', unknownPage.status === 404, `got ${unknownPage.status}`);
 
-  // ─── 7. disconnect really removes the credentials ───────────────────────
+  // ─── 7. owner history export + tenant analytics ─────────────────────────
+  const session = await WhatsAppSession.create({
+    userId: user._id,
+    sessionName: `${user._id}_Smoke`,
+    status: 'connected',
+    qrCode: 'must-not-export',
+    pairingCode: 'must-not-export',
+    totalMessagesReceived: 1,
+    totalMessagesSent: 1,
+    messages: [
+      { from: '8801700000000@c.us', to: 'me', body: 'Do you deliver?', direction: 'incoming', timestamp: new Date() },
+      { from: 'me', to: '8801700000000@c.us', body: 'Yes, we do.', direction: 'outgoing', aiGenerated: true, aiModel: 'private-admin-value', timestamp: new Date() },
+    ],
+  });
+  const history = await call('GET', `/api/whatsapp/sessions/${session._id}/export`, { token });
+  check('WhatsApp backup includes the owner’s message history', history.data?.format === 'herovaai-whatsapp-history' && history.data?.messages?.length === 2);
+  check('WhatsApp backup excludes login factors and admin-only model details', !JSON.stringify(history.data).includes('must-not-export') && !JSON.stringify(history.data).includes('private-admin-value'));
+  const analytics = await call('GET', '/api/whatsapp/analytics', { token });
+  check('analytics are scoped to the signed-in owner', analytics.data?.whatsapp?.messagesReceived === 1 && analytics.data?.whatsapp?.messagesSent === 1);
+  check('analytics include seven days of WhatsApp activity', analytics.data?.whatsapp?.days?.length === 7);
+
+  // ─── 8. disconnect really removes the credentials ───────────────────────
   const removed = await call('DELETE', '/api/channels/webhook', { token });
   check('disconnect answers', removed.data?.success === true);
   const afterDelete = await call('GET', '/api/channels', { token });
   check('the credential is gone after disconnecting', (afterDelete.data.channels || []).find((c) => c.id === 'webhook')?.connection === null);
 
-  // ─── 8. housekeeping ────────────────────────────────────────────────────
+  // ─── 9. housekeeping ────────────────────────────────────────────────────
+  await ScheduledPost.deleteMany({ userId: user._id });
+  await WhatsAppSession.deleteMany({ userId: user._id });
   await ChannelConnection.deleteMany({ userId: user._id });
   await User.deleteOne({ _id: user._id });
 

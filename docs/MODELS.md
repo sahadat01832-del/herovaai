@@ -1,53 +1,94 @@
-# Models — end-to-end verification record
-Last verified: 2026-10-08. Probe = `POST chat/completions` with
-`Reply with exactly: OK`, `max_tokens: 20`.
+# Models — one gateway, free models only
 
-## Menu models (all answer OK)
+Last verified: 2026-10-10 with `node scripts/verify-catalog.js`
+(**13/13 advertised models available, 0 out of stock, 0 key missing, exit 0**).
 
-| Menu id | Provider | Result |
-|---|---|---|
-| groq/qwen/qwen3.8-27b | groq | OK |
-| groq/openai/gpt-oss-120b, gpt-oss-20b | groq | in live list (qwen tested OK) |
-| gemini-3.8-flash (NEW) | gemini | OK (one transient 503 on first try — demand spike, retry passed) |
-| gemini-2.5-flash, gemini-flash-latest, gemini-2.5-pro, gemini-3-flash-preview | gemini | OK (2.5-flash tested; rest in live 50-model list) |
-| agnes/agnes-3.0-flash, agnes/agnes-2.5-flash | agnes (`apihub.agnes-ai.com`) | OK |
-| unorouter/agnes-3.0-flash:free | unorouter | OK |
-| unorouter/allam-2-7b:free | unorouter | 429 transient (1 req/min free tier) — kept, resets alone |
-| llm7/GLM-5.3-Flash | llm7 | OK |
-| ollama/nemotron-3-nano:30b | ollama_cloud | 429 free-cap reached at probe time — kept, cap resets |
-| openrouter free x8 (nemotron-3.5-lightning:free OK tested) | openrouter | OK; stale ids auto-hide via catalog out_of_stock filter |
-| openai/gpt-4o-mini (via openrouter) | openrouter | OK |
-| command-a-03-2025 (NEW, replaces command-r7b) | cohere | OK on /v1/chat |
-| command-r-plus-08-2024 | cohere | kept (proven /v1 id) |
+## The rule
 
-## Registered but NOT in the menu (keys valid, chat account-gated)
+- This deployment holds **one AI credential**: `OMNIROUTE_API_KEY`, against
+  `OMNIROUTE_BASE_URL` (default `http://127.0.0.1:20128/v1`). OmniRoute fronts the
+  upstream providers itself, so their keys are never needed here, and `backend/.env`
+  carries no other provider's key.
+- `catalogService.PROVIDERS` has **exactly one entry**. A probe round therefore has
+  nothing else it could reach, which makes "the app runs on the operator's OmniRoute
+  key alone" true by construction rather than by convention.
+- Every menu model is a **free tier** behind that gateway. `free: true` on a catalog
+  entry is an explicit operator claim, used because OmniRoute's `/models` publishes no
+  prices (see `catalogService.annotate`).
+- **`generateCompletion` refuses any id outside the catalog before calling the
+  gateway.** The gateway also serves paid models and holds the upstream credentials, so
+  without this gate a crafted request (`model: "openai/gpt-4o"`) could spend the
+  operator's account on a model the menu never offered. Refusals are `409` with
+  `"<id> is not one of the free models this deployment serves"`.
+- What a plan buys is throughput, bigger local models, channels and automation —
+  never access to a paid model. `config/plans.js` says only that.
 
-| Provider | Chat verdict | Unblocks when |
-|---|---|---|
-| apertis (382 models) | 403 PAYG credits must be positive | top up balance |
-| apinex free/* | 402 daily check-in required | visit apinex.bond/airdrop |
-| orcarouter/free | 429 link a GitHub account | workspace owner links GitHub |
-| airforce (637 models) | 402 subscription or PAYG balance | subscribe / top up |
-| apmix x2 (claude-sonnet-4-6-free) | 429 monthly allowance used up | reset or top-up |
-| opencode zen x2 | 403 free tier only inside OpenCode | use from OpenCode / paid zen |
-| deepseek x2 (flash + v4-pro) | 402 Insufficient Balance, both keys | top up balance |
-| samba | 401 invalid key | key is dead — replace, do not add |
-| kilo_free | untested (POST-only endpoint, no backend caller) | add caller + probe first |
+## The menu (13 — every one verified available, every one free)
 
-Rule: a catalog id lands in the menu only after a chat probe answers OK,
-or the failure is a self-resetting rate limit. Account-gated providers stay
-registered in keyVault + catalogService (dashboard probes stay truthful) with
-a generic caller ready in `cloudAIService.callGenericCompat`.
+| Menu id | Upstream | Sees images | Badge |
+|---|---|---|---|
+| `omniroute/gemini/gemini-2.5-flash` | gemini | yes | ⭐ Recommended |
+| `omniroute/gemini/gemini-3-flash-preview` | gemini | yes | ✨ Newer |
+| `omniroute/gemini/gemini-3.1-flash-lite` | gemini | no | 🪶 Light |
+| `omniroute/groq/qwen/qwen3.8-27b` | groq | no | ⚡ Instant |
+| `omniroute/groq/openai/gpt-oss-120b` | groq | no | ⚡ 120B |
+| `omniroute/groq/openai/gpt-oss-20b` | groq | no | 🪶 Light |
+| `omniroute/agnes/agnes-3.0-flash` | agnes | no | 🆓 Uncapped |
+| `omniroute/agnes/agnes-2.5-flash` | agnes | no | 🆓 Uncapped |
+| `omniroute/cohere/command-a-03-2025` | cohere | no | 🗣️ Writing |
+| `omniroute/cohere/command-a-reasoning-08-2025` | cohere | no | 🧠 Thinking |
+| `omniroute/cohere/command-a-vision-07-2025` | cohere | yes | 📷 Vision |
+| `omniroute/cohere/command-r-plus-08-2024` | cohere | no | 🗣️ Writing |
+| `omniroute/nara/laguna-s-2.1` | nara | no | 🍃 Alternative |
+
+Default when a caller names no model: `omniroute/gemini/gemini-2.5-flash`
+(`cloudAIService.DEFAULT_MODEL` — the one constant the chat route and the website both
+read, so they cannot drift).
+
+Only models observed to actually answer are listed. OmniRoute's own free catalogue is
+far larger, but most of those entries 404, sit behind a per-user rate limit, or have run
+out of credits — listing them would put dead options in front of customers. (33 free
+candidates were probed end-to-end; 18 replied, and near-duplicates were folded away.)
+
+### Adding a model
+
+Verify it first, then add it to `ALL_MODELS_CATALOG`:
+
+```bash
+cd backend
+node -e "…POST /chat/completions with the id, max_tokens 20, expecting 'OK'…"
+node scripts/verify-catalog.js      # must stay exit 0
+```
+
+Do **not** add a paid id, and do not add a second provider to `catalogService.PROVIDERS`
+— either would break the single-key guarantee this file describes.
+
+## Local models (LM Studio) are a separate path
+
+Local ids are not catalog ids and never touch the gateway. They are served by the
+LM Studio server on `LM_STUDIO_BASE_URL` (default `http://localhost:1234/v1`) and are the
+private, unmetered option. When LM Studio is not serving a model, the local tier honestly
+reports that instead of substituting a cloud answer — `backend/scripts/verify-reply-tiers.js`
+covers exactly that (its two local-tier cases need LM Studio running).
+
+## Image generation
+
+Image requests use Google Flow MCP with **Nano Banana Pro** by default; they do
+not use the OmniRoute text-model catalog. The shared Flow pool tries FF2 first,
+then FF3 and FF1 if an account is unavailable. The account sessions must be
+connected and verified in Flow MCP before the site can generate images.
 
 ## Quotas (known)
 
-| Provider | Limit |
+| Scope | Limit |
 |---|---|
-| gemini | 1,500 req/day/key x 7 keys |
-| groq | ~14,400 req/day/key x 2 |
-| openrouter | no cap set; used $0.19 / $0.16; `:free` models $0 |
-| llm7 | ~1M tokens/day shared |
-| ollama_cloud | free cap window (429 at probe, resets) |
-| unorouter free | 1 req/min on free ids |
-| elevenlabs | 0/10,000 chars (tool API, not chat) |
-| app quota | 1M tokens / 7 days per user (`tokenQuotaService`) |
+| App quota | 1,000,000 tokens / 7 days per user (`tokenQuotaService`) |
+| Upstream free tiers | per-provider caps, enforced by the gateway — a saturated model is reported `out_of_stock` and drops out of the menu |
+
+## History
+
+Before 2026-10-10 this deployment carried keys for ~15 providers and the catalog mixed
+free and paid ids across them. That is what let a request for one provider be answered by
+another, and what let an unlisted id reach a paid model. The provider registry, the vault
+and the service were reduced to OmniRoute alone; the raw verification record for the old
+multi-provider menu is in git history.

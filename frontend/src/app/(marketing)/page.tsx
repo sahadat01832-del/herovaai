@@ -4,14 +4,16 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import Link from 'next/link'
 import {
   Bot, Send, User, Sparkles, ShieldCheck, Smartphone, Brain,
-  ArrowRight, Cpu, Loader2, Square, Wifi, WifiOff, Check, Lock,
+  ArrowRight, Cpu, Loader2, Square, Wifi, WifiOff, Check, Lock, Download,
 } from 'lucide-react'
-import { chatApi } from '@/lib/api'
-import { getToken, getUser, ApiError } from '@/lib/auth'
+import { chatApi, authApi } from '@/lib/api'
+import { getToken, getUser, getApiUrl, ApiError } from '@/lib/auth'
+import { downloadMedia } from '@/lib/download'
 import toast from 'react-hot-toast'
 import ReactMarkdown from 'react-markdown'
 import { Reveal } from '@/components/ui/Reveal'
 import { SiteFooter } from '@/components/marketing/SiteFooter'
+import { useAuth } from '@/contexts/AuthContext'
 
 interface Message {
   role: 'user' | 'assistant'
@@ -43,15 +45,16 @@ interface LocalStatus {
 }
 
 const QUICK_PROMPTS = [
+  'What should my shop promote this week?',
   'What can you do for my shop?',
   'Write a WhatsApp reply for a price question',
-  'How do I stop answering the same questions all day?',
   'Give me 3 ideas to bring customers back',
 ]
 
 export default function HomePage() {
-  const [isLoggedIn, setIsLoggedIn] = useState(false)
-  const [userName, setUserName] = useState('')
+  const { user, token } = useAuth()
+  const isLoggedIn = Boolean(user || token)
+  const userName = user?.name || ''
   const [messages, setMessages] = useState<Message[]>([
     {
       role: 'assistant',
@@ -78,16 +81,6 @@ export default function HomePage() {
   const selected = models.find(m => m.id === selectedModel)
   const selectedIsLocal = selected?.source === 'local'
   const localReady = Boolean(status?.isOnline && (!status?.starting))
-
-  // ── Session ───────────────────────────────────────────────────────────────
-  useEffect(() => {
-    const token = getToken()
-    const user = getUser()
-    if (token && user) {
-      setIsLoggedIn(true)
-      setUserName(user.name)
-    }
-  }, [])
 
   // ── Model catalog ─────────────────────────────────────────────────────────
   const loadModels = useCallback(async () => {
@@ -177,7 +170,7 @@ export default function HomePage() {
         // unloads the model and (when it started it) stops LM Studio.
         // 90s of grace: a reload re-uses the running server, but a visitor who
         // really left gets the RAM back shortly after.
-        fetch(`${window.location.protocol}//${window.location.hostname}:5000/api/chat/lm-studio/unload`, {
+        fetch(`${getApiUrl()}/chat/lm-studio/unload`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ stopServer: true, graceSeconds: 90 }),
@@ -185,13 +178,9 @@ export default function HomePage() {
         }).catch(() => {})
       } catch { /* nothing else we can do while unloading */ }
     }
-    const onHidden = () => { if (document.visibilityState === 'hidden') release() }
-
     window.addEventListener('pagehide', release)
-    document.addEventListener('visibilitychange', onHidden)
     return () => {
       window.removeEventListener('pagehide', release)
-      document.removeEventListener('visibilitychange', onHidden)
     }
   }, [])
 
@@ -333,20 +322,18 @@ export default function HomePage() {
           {/* ── Left: proposition ─────────────────────────────────────── */}
           <section className="lg:col-span-6 xl:col-span-5">
             <Reveal>
-              <span className="inline-flex items-center gap-2 rounded-full border border-brand-400/20 bg-brand-400/[0.08] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-brand-200">
-                <Sparkles className="h-3 w-3" aria-hidden />
-                For shop owners &amp; managers
+              <span className="inline-flex items-center gap-2 rounded-full border border-brand-400/25 bg-brand-400/[0.08] px-3.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-brand-200 shadow-[0_0_20px_rgba(192,168,114,0.15)]">
+                <Sparkles className="h-3 w-3 text-brand-300" aria-hidden />
+                Autonomous Business AI &amp; Content Engine
               </span>
 
-              <h1 className="mt-5 text-[30px] font-semibold leading-[1.08] tracking-tight text-white sm:text-[40px] lg:text-[44px]">
-                Answer every customer
-                <span className="gradient-text block">even while you are serving one</span>
+              <h1 className="mt-5 text-[32px] font-semibold leading-[1.08] tracking-tight text-white sm:text-[42px] lg:text-[46px]">
+                Automate Customer Sales
+                <span className="gradient-text block">&amp; Grow Your Social Presence</span>
               </h1>
 
-              <p className="mt-5 max-w-xl text-[14.5px] leading-relaxed text-dark-400 sm:text-[15px]">
-                “How much is it?” “When do you open?” “Do you deliver to my area?” — the assistant
-                answers all of it on WhatsApp, in your words, using the prices and rules you gave it.
-                Try it below without signing up.
+              <p className="mt-5 max-w-xl text-[14.5px] leading-relaxed text-dark-300 sm:text-[15px]">
+                “How much is it?” “When do you open?” “Do you deliver?” — HerovaAi answers inquiries on WhatsApp using your shop rules, turns your offers or references into original social posts, and schedules content for your connected channels.
               </p>
 
               <div className="mt-8 flex flex-wrap items-center gap-3">
@@ -356,7 +343,7 @@ export default function HomePage() {
                     panelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
                     chatInputRef.current?.focus({ preventScroll: true })
                   }}
-                  className="btn-primary btn-sheen btn-lg"
+                  className="btn-primary btn-sheen btn-lg shadow-gold"
                 >
                   Ask it something
                   <ArrowRight className="h-4 w-4" aria-hidden />
@@ -370,12 +357,13 @@ export default function HomePage() {
 
             <dl className="stagger mt-9 space-y-4 border-t border-white/[0.06] pt-7">
               {[
-                { icon: Smartphone, title: 'It answers on WhatsApp', body: 'Pair your number once. Customers get replies at 11pm, on holidays, while you are with someone.' },
-                { icon: Brain, title: 'It learns your business', body: 'Your name, products, prices, opening hours and the rules it must never break — optional, two minutes.' },
-                { icon: Cpu, title: 'It can stay on your machine', body: 'Prefer nothing leaving your shop? Run the private model and your conversations stay here.' },
+                { icon: Smartphone, title: 'Autonomous WhatsApp & Messenger AI', body: 'Pair your number once. Customers get replies at 11pm, on holidays, while you are with someone.' },
+                { icon: Sparkles, title: 'AI image generation · no personal account needed', body: 'HerovaAi tries its shared Google Flow image pool first and uses its configured backup image engine when Flow is unavailable. Free includes 10 successful images a day, Pro (৳100/month) includes 100 per billing cycle, and Enterprise (৳300/month) is unlimited.' },
+                { icon: Brain, title: 'Original posts for connected channels', body: 'Create distinct, on-brand posts from an offer, reference image, or business profile, then schedule them for your connected social channels.' },
+                { icon: Cpu, title: 'Private & Isolated Execution', body: 'Prefer nothing leaving your shop? Run private local models with strict tenant data isolation.' },
               ].map(({ icon: Icon, title, body }) => (
                 <div key={title} className="flex gap-4">
-                  <span className="mt-0.5 flex h-9 w-9 flex-none items-center justify-center rounded-xl border border-brand-400/15 bg-brand-400/[0.06] text-brand-200">
+                  <span className="mt-0.5 flex h-9 w-9 flex-none items-center justify-center rounded-xl border border-brand-400/20 bg-brand-400/[0.08] text-brand-200 shadow-sm">
                     <Icon className="h-4 w-4" aria-hidden />
                   </span>
                   <div>
@@ -482,7 +470,51 @@ export default function HomePage() {
                     )}
                     <div className={`max-w-[82%] px-4 py-2.5 text-[13.5px] leading-relaxed ${msg.role === 'user' ? 'msg-user text-white' : 'msg-ai text-dark-100'}`}>
                       <div className="prose prose-invert prose-sm max-w-none prose-p:my-1.5 prose-pre:bg-black/40">
-                        <ReactMarkdown>{msg.content}</ReactMarkdown>
+                        <ReactMarkdown
+                          components={{
+                            img: ({ node, ...props }) => {
+                              const src = String(props.src || '')
+                              return (
+                                <div className="my-2.5 space-y-2 group">
+                                  <a href={src} target="_blank" rel="noopener noreferrer" className="block">
+                                    <img
+                                      {...props}
+                                      alt={props.alt || 'AI generated image'}
+                                      className="max-h-80 w-auto rounded-xl border border-white/10 shadow-lg transition-transform group-hover:scale-[1.01]"
+                                      loading="lazy"
+                                    />
+                                  </a>
+                                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => downloadMedia(src, '1k', 'herova_image')}
+                                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium text-dark-200 bg-white/[0.06] hover:bg-white/[0.12] border border-white/10 shadow transition-all cursor-pointer"
+                                    >
+                                      <Download className="w-3.5 h-3.5 text-emerald-400" /> ⬇ 1K (HD)
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => downloadMedia(src, '2k', 'herova_image')}
+                                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold text-brand-200 bg-brand-500/20 hover:bg-brand-500/30 border border-brand-400/30 shadow transition-all cursor-pointer"
+                                    >
+                                      <Sparkles className="w-3.5 h-3.5 text-brand-300" /> ⬆ 2K (Ultra HD)
+                                    </button>
+                                    <a
+                                      href={src}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-[11px] text-dark-400 hover:text-brand-300 ml-1"
+                                    >
+                                      ↗ Full Size
+                                    </a>
+                                  </div>
+                                </div>
+                              )
+                            },
+                          }}
+                        >
+                          {msg.content}
+                        </ReactMarkdown>
                       </div>
                       {msg.model && msg.role === 'assistant' && (
                         <p className="mt-2 border-t border-white/[0.06] pt-1.5 text-[10.5px] uppercase tracking-wider text-dark-500">

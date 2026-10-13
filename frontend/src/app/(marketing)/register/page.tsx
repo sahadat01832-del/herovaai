@@ -21,13 +21,20 @@ import toast from 'react-hot-toast'
    ══════════════════════════════════════════════════════════════════════════ */
 
 function RegisterForm() {
-  const { register } = useAuth()
+  const { user, register } = useAuth()
   const router = useRouter()
   const [form, setForm] = useState({ name: '', email: '', password: '', phone: '' })
   const [showPass, setShowPass] = useState(false)
   const [loading, setLoading] = useState(false)
   const [errors, setErrors] = useState<{ name?: string; email?: string; password?: string; form?: string }>({})
   const [googleReady, setGoogleReady] = useState<boolean | null>(null)
+
+  // If already authenticated, redirect straight to dashboard
+  useEffect(() => {
+    if (user || (typeof window !== 'undefined' && localStorage.getItem('token'))) {
+      router.replace('/dashboard')
+    }
+  }, [user, router])
 
   // Only invite the Google path when the server says it can actually finish it.
   useEffect(() => {
@@ -169,7 +176,7 @@ function RegisterForm() {
             toast.error('Google sign-up is not switched on yet — create an account with your email instead')
             return
           }
-          window.location.href = `${getApiUrl()}/auth/google`
+          window.location.href = `${getApiUrl()}/auth/google?return_to=${encodeURIComponent(window.location.origin)}`
         }}
       />
     </AuthShell>
@@ -177,9 +184,5 @@ function RegisterForm() {
 }
 
 export default function RegisterPage() {
-  return (
-    <AuthProvider>
-      <RegisterForm />
-    </AuthProvider>
-  )
+  return <RegisterForm />
 }

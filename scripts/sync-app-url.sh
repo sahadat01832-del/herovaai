@@ -19,7 +19,9 @@ log() { printf '%s %s\n' "$(date -Is)" "$*" | tee -a "$SELF_LOG" >/dev/null 2>&1
 
 [ -d "$SITE/.git" ] || { log "no site checkout at $SITE — nothing to do"; exit 0; }
 
-HOST=$(grep -ohE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" 2>/dev/null \
+# A real quick-tunnel hostname always has a hyphen; "api.trycloudflare.com" from an
+# error line must never be treated as the public address.
+HOST=$(grep -ohE 'https://[a-z0-9]+(-[a-z0-9]+)+\.trycloudflare\.com' "$TUNNEL_LOG" 2>/dev/null \
   | grep -v '//api\.trycloudflare\.com' \
   | tail -1 | sed 's#https://##')
 [ -n "${HOST:-}" ] || { log "no tunnel hostname in $TUNNEL_LOG yet"; exit 0; }

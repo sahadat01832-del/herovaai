@@ -6,9 +6,13 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "seed": "node src/utils/seed.js"
+    "seed": "node src/utils/seed.js",
+    "flow:login": "node src/scripts/googleFlowLogin.js",
+    "mcp:google-flow": "node src/mcp/googleFlowServer.js",
+    "test": "node --test"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "@wppconnect-team/wppconnect": "^1.33.0",
     "axios": "^1.7.3",
     "bcryptjs": "^2.4.3",
@@ -26,9 +30,11 @@
     "passport-google-oauth20": "^2.0.0",
     "passport-jwt": "^4.0.1",
     "passport-local": "^1.0.0",
+    "playwright": "^1.64.0",
     "socket.io": "^4.7.5",
     "twilio": "^5.3.1",
-    "uuid": "^10.0.0"
+    "uuid": "^10.0.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "mongodb-memory-server": "^11.3.0",

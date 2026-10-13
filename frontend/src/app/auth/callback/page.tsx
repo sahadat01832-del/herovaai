@@ -22,7 +22,7 @@ function CallbackHandler() {
     authApi.me()
       .then((data: any) => {
         if (data?.user) setUser(data.user)
-        router.push('/dashboard')
+        window.location.href = '/dashboard'
       })
       .catch(() => router.push('/login?error=oauth'))
   }, [params, router])

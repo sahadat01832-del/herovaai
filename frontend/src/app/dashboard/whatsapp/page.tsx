@@ -2,8 +2,9 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   Smartphone, Plus, WifiOff, Send, Bot, CheckCircle2, Settings2, Trash2,
-  RefreshCw, User, MessageSquare, Clock, Save, X, Mic, MicOff, Server
+  RefreshCw, User, MessageSquare, Clock, Save, X, Mic, MicOff, Server, QrCode
 } from 'lucide-react'
+import { Download, Search } from 'lucide-react'
 import { whatsappApi } from '@/lib/api'
 import { io, Socket } from 'socket.io-client'
 import { getToken, getSocketUrl } from '@/lib/auth'
@@ -29,8 +30,10 @@ interface WASession {
   useMemory: boolean
   tone?: string
   customPrompt?: string
+  phoneNumber?: string | null
   lastError?: string | null
   qrCode?: string | null
+  pairingCode?: string | null
   totalMessagesReceived: number
   totalMessagesSent: number
   messages?: WAMessage[]
@@ -49,9 +52,18 @@ export default function WhatsAppPage() {
   const [selectedSession, setSelectedSession] = useState<WASession | null>(null)
   const [selectedCustomer, setSelectedCustomer] = useState<string | null>(null)
   const [customers, setCustomers] = useState<string[]>([])
+  const [customerSearch, setCustomerSearch] = useState('')
+  const [customerLastActivity, setCustomerLastActivity] = useState<Record<string, number>>({})
   const [messages, setMessages] = useState<WAMessage[]>([])
   const [qrCodes, setQrCodes] = useState<Record<string, string>>({})
-  const [newSessionName, setNewSessionName] = useState('')
+  // "Link with a code" alternative: per-session phone input, minted code, and
+  // which session is currently generating one.
+  const [pairingCodes, setPairingCodes] = useState<Record<string, string>>({})
+  const [pairingPhone, setPairingPhone] = useState<Record<string, string>>({})
+  const [codeBusy, setCodeBusy] = useState<string | null>(null)
+  const [newSessionName, setNewSessionName] = useState('WhatsApp')
+  const [newSessionPhone, setNewSessionPhone] = useState('')
+  const [connectMethod, setConnectMethod] = useState<'code' | 'qr'>('code')
   const [showNewSession, setShowNewSession] = useState(false)
   const [sendMsg, setSendMsg] = useState('')
   const [manualPhone, setManualPhone] = useState('')
@@ -67,6 +79,16 @@ export default function WhatsAppPage() {
   const [loading, setLoading] = useState(false)
   const socketRef = useRef<Socket | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const selectedSessionRef = useRef<WASession | null>(null)
+  const selectSession = (session: WASession | null) => {
+    selectedSessionRef.current = session
+    setSelectedSession(session)
+  }
+  const selectedCustomerRef = useRef<string | null>(null)
+  const selectCustomer = (customer: string | null) => {
+    selectedCustomerRef.current = customer
+    setSelectedCustomer(customer)
+  }
 
   useEffect(() => {
     loadSessions()
@@ -83,6 +105,20 @@ export default function WhatsAppPage() {
       )
     })
 
+    // The one-time pairing code minted for "link with a code" login.
+    socket.on('whatsapp-pairing-code', ({ sessionName, code }: any) => {
+      setPairingCodes(prev => ({ ...prev, [sessionName]: code }))
+      setCodeBusy(null)
+      toast.success('Pairing code ready — enter it on your phone to link.')
+    })
+
+    // Generation failed or hung (WhatsApp throttled it) — release the button
+    // and say why, instead of sitting on "Generating…" for ever.
+    socket.on('whatsapp-pairing-error', ({ error }: any) => {
+      setCodeBusy(null)
+      toast.error(error || 'Could not generate a pairing code. Try again in a minute.')
+    })
+
     socket.on('whatsapp-status', ({ sessionName, status, error }: any) => {
       setSessions(prev =>
         prev.map(s => (s.sessionName === sessionName ? {
@@ -93,6 +129,8 @@ export default function WhatsAppPage() {
         } : s))
       )
       if (status === 'connected') {
+        // The one-time pairing code is burned by a successful link.
+        setPairingCodes(prev => { const n = { ...prev }; delete n[sessionName]; return n })
         toast.success('WhatsApp connected successfully!')
       } else if (status === 'error') {
         toast.error(error || 'WhatsApp could not connect. Check the session error for details.')
@@ -101,6 +139,13 @@ export default function WhatsAppPage() {
 
     socket.on('whatsapp-message', (data: any) => {
       const { message, senderContact } = data
+      const currentSession = selectedSessionRef.current
+      const matchesSession = currentSession && (
+        data.sessionId
+          ? String(data.sessionId) === String(currentSession._id)
+          : data.sessionName === currentSession.sessionName
+      )
+      if (!matchesSession) return
       setMessages(prev => [...prev, message])
       if (message.from && message.from !== 'me') {
         setCustomers(prev => Array.from(new Set([...prev, message.from])))
@@ -109,13 +154,13 @@ export default function WhatsAppPage() {
     })
     socket.on('whatsapp-mute', (data: any) => {
       const { customer, mutedUntil, reason } = data
-      if (customer === selectedCustomer) {
+      if (customer === selectedCustomerRef.current) {
         setMuteFlag(prev => ({ ...prev, [customer]: { muted: true, until: mutedUntil, reason } }))
       }
     })
     socket.on('whatsapp-handoff', (data: any) => {
       const { customer, mutedUntil } = data
-      if (customer === selectedCustomer) {
+      if (customer === selectedCustomerRef.current) {
         setMuteFlag(prev => ({ ...prev, [customer]: { muted: true, until: mutedUntil, reason: 'handoff_request' } }))
       }
       toast.success(`🙋 ${customer.replace('@c.us','')} wants to talk to the owner — AI muted, waiting for you to respond`)
@@ -149,15 +194,18 @@ export default function WhatsAppPage() {
         setSessions(d.sessions)
         // Store any initial QR codes from DB
         const qrMap: Record<string, string> = {}
+        const codeMap: Record<string, string> = {}
         d.sessions.forEach((s: WASession) => {
           if (s.qrCode) qrMap[s.sessionName] = s.qrCode
+          if (s.pairingCode) codeMap[s.sessionName] = s.pairingCode
         })
         setQrCodes(prev => ({ ...prev, ...qrMap }))
+        setPairingCodes(prev => ({ ...prev, ...codeMap }))
 
         // Keep selectedSession synced
-        if (selectedSession) {
-          const updated = d.sessions.find((s: WASession) => s._id === selectedSession._id)
-          if (updated) setSelectedSession(updated)
+        if (selectedSessionRef.current) {
+          const updated = d.sessions.find((s: WASession) => s._id === selectedSessionRef.current?._id)
+          if (updated) selectSession(updated)
         }
       }
     } catch (err: any) {
@@ -166,17 +214,28 @@ export default function WhatsAppPage() {
   }
 
   const createSession = async () => {
-    if (!newSessionName.trim()) {
-      toast.error('Please enter a session or business account name')
-      return
+    const name = newSessionName.trim() || 'WhatsApp'
+    const phone = newSessionPhone.trim()
+    if (connectMethod === 'code') {
+      const digitsOnly = phone.replace(/[^0-9]/g, '')
+      if (digitsOnly.length < 7) {
+        toast.error('Enter your WhatsApp phone number (e.g. 018... or 88018...)')
+        return
+      }
     }
     setLoading(true)
     try {
-      const d: any = await whatsappApi.createSession(newSessionName)
+      const d: any = await whatsappApi.createSession(name, connectMethod === 'code' ? phone : undefined)
       setSessions(prev => [...prev.filter(s => s._id !== d.session._id), d.session])
-      setNewSessionName('')
+      if (connectMethod === 'code') {
+        setCodeBusy(d.session._id)
+        toast.success('Generating your 8-digit pairing code… Ready in ~10 seconds!')
+      } else {
+        toast.success('Session started! QR code will appear in seconds...')
+      }
+      setNewSessionName('WhatsApp')
+      setNewSessionPhone('')
       setShowNewSession(false)
-      toast.success('Session started! QR code will appear in seconds...')
       loadSessions(false)
     } catch (err: any) {
       toast.error(err.message)
@@ -189,6 +248,11 @@ export default function WhatsAppPage() {
   const disconnectSession = async (id: string) => {
     try {
       await whatsappApi.disconnect(id)
+      const target = sessions.find(s => s._id === id)
+      if (target) {
+        setPairingCodes(prev => { const n = { ...prev }; delete n[target.sessionName]; return n })
+        setQrCodes(prev => { const n = { ...prev }; delete n[target.sessionName]; return n })
+      }
       setSessions(prev =>
         prev.map(s => (s._id === id ? { ...s, status: 'disconnected', qrCode: null } : s))
       )
@@ -203,8 +267,8 @@ export default function WhatsAppPage() {
     try {
       await whatsappApi.deleteSession(id)
       setSessions(prev => prev.filter(s => s._id !== id))
-      if (selectedSession?._id === id) {
-        setSelectedSession(null)
+      if (selectedSessionRef.current?._id === id) {
+        selectSession(null)
         setMessages([])
       }
       toast.success('Session deleted')
@@ -213,14 +277,49 @@ export default function WhatsAppPage() {
     }
   }
 
+  // Mint an 8-char pairing code for this session (link-by-code, no QR scan). The
+  // code arrives over the `whatsapp-pairing-code` socket event, not in this reply.
+  const requestCode = async (session: WASession) => {
+    const phone = (pairingPhone[session.sessionName] || '').trim()
+    if (phone.replace(/[^0-9]/g, '').length < 7) {
+      toast.error('Enter your full phone number with country code (e.g. 8801712345678)')
+      return
+    }
+    setCodeBusy(session._id)
+    // The old QR is dead the moment we relaunch in code mode — clear both so a
+    // stale QR never sits next to the new code.
+    setPairingCodes(prev => { const n = { ...prev }; delete n[session.sessionName]; return n })
+    setQrCodes(prev => { const n = { ...prev }; delete n[session.sessionName]; return n })
+    try {
+      const res: any = await whatsappApi.requestPairingCode(session._id, phone)
+      toast.loading(res?.message || 'Generating your pairing code…', { id: 'wa-code' })
+      setTimeout(() => toast.dismiss('wa-code'), 4000)
+    } catch (err: any) {
+      toast.error(err.message || 'Could not generate a code')
+      setCodeBusy(null)
+    }
+  }
+
   const openCustomerChats = async (session: WASession) => {
-    setSelectedSession(session)
+    selectSession(session)
     try {
       const d: any = await whatsappApi.getMessages(session._id)
       setCustomers(d.customers || [])
       setMessages(d.messages || [])
+      setCustomerSearch('')
+      const lastActivity: Record<string, number> = {}
+      for (const message of d.messages || []) {
+        const contact = message.direction === 'incoming' ? message.from : message.to
+        const at = new Date(message.timestamp || 0).getTime()
+        if (contact && contact !== 'me' && Number.isFinite(at)) {
+          lastActivity[contact] = Math.max(lastActivity[contact] || 0, at)
+        }
+      }
+      setCustomerLastActivity(lastActivity)
       if (d.customers && d.customers.length > 0) {
-        setSelectedCustomer(d.customers[0])
+        selectCustomer(d.customers[0])
+      } else {
+        selectCustomer(null)
       }
     } catch (err: any) {
       toast.error(err.message)
@@ -228,7 +327,7 @@ export default function WhatsAppPage() {
   }
 
   const filterCustomerChat = async (session: WASession, contact: string) => {
-    setSelectedCustomer(contact)
+    selectCustomer(contact)
     try {
       const d: any = await whatsappApi.getMessages(session._id, contact)
       setMessages(d.messages || [])
@@ -278,7 +377,7 @@ export default function WhatsAppPage() {
         autoReplyMode: !session.autoReply ? 'always' : 'never',
       })
       setSessions(prev => prev.map(s => (s._id === session._id ? d.session : s)))
-      if (selectedSession?._id === session._id) setSelectedSession(d.session)
+      if (selectedSessionRef.current?._id === session._id) selectSession(d.session)
       toast.success(`AI Auto-reply ${!session.autoReply ? 'activated' : 'disabled'}`)
     } catch (err: any) {
       toast.error(err.message)
@@ -292,7 +391,7 @@ export default function WhatsAppPage() {
         customPrompt: promptDraft[session._id] ?? session.customPrompt ?? '',
       })
       setSessions(prev => prev.map(s => (s._id === session._id ? d.session : s)))
-      if (selectedSession?._id === session._id) setSelectedSession(d.session)
+      if (selectedSessionRef.current?._id === session._id) selectSession(d.session)
       toast.success('Reply settings saved')
     } catch (err: any) {
       toast.error(err.message)
@@ -302,6 +401,28 @@ export default function WhatsAppPage() {
   const activeMessages = selectedCustomer
     ? messages.filter(m => m.from === selectedCustomer || m.to === selectedCustomer)
     : messages
+  const visibleCustomers = customers
+    .filter(customer => customer.replace('@c.us', '').toLowerCase().includes(customerSearch.trim().toLowerCase()))
+    .sort((a, b) => (customerLastActivity[b] || 0) - (customerLastActivity[a] || 0))
+
+  const exportHistory = async () => {
+    if (!selectedSession) return
+    try {
+    const backup = await whatsappApi.exportHistory(selectedSession._id)
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `herovaai-whatsapp-${selectedSession._id}-${new Date().toISOString().slice(0, 10)}.json`
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    toast.success('WhatsApp history backup downloaded')
+    } catch (err: any) {
+    toast.error(err.message || 'Could not export WhatsApp history')
+    }
+  }
 
   return (
     <div className="space-y-5">
@@ -314,8 +435,8 @@ export default function WhatsAppPage() {
             <span className="badge badge-green">{sessions.filter(s => s.status === 'connected').length} live</span>
           </h1>
           <p className="mt-1 max-w-2xl text-[13px] text-dark-400">
-            Pair a number, let the assistant answer customers from your business memory, and read
-            every thread as it happens.
+            Link your shop number, switch on AI replies, then send a test message from another phone.
+            You can pause replies here at any time.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -330,30 +451,121 @@ export default function WhatsAppPage() {
 
       {/* Connect Form */}
       {showNewSession && (
-        <div className="card animate-fade-up p-5 border-brand-400/25">
-          <h3 className="flex items-center gap-2 text-[15px] font-semibold text-white">
-            <Smartphone className="h-4 w-4 text-brand-300" />
-            Connect a WhatsApp account
-          </h3>
-          <p className="mt-1 text-[12.5px] text-dark-400">
-            Give this number a label. A QR code is generated next — scan it from WhatsApp →
-            Linked Devices → Link a Device.
-          </p>
-          <div className="mt-4 flex flex-col gap-2 sm:flex-row">
-            <input
-              value={newSessionName}
-              onChange={e => setNewSessionName(e.target.value)}
-              placeholder="Account name (e.g. Sales desk)"
-              className="input-dark flex-1"
-              onKeyDown={e => e.key === 'Enter' && createSession()}
-            />
-            <button onClick={createSession} disabled={loading} className="btn-primary">
-              {loading ? 'Starting browser…' : 'Generate QR code'}
-            </button>
-            <button onClick={() => setShowNewSession(false)} className="btn-ghost">
-              Cancel
+        <div className="card animate-fade-up p-5 border-cyan-400/30 space-y-4 shadow-xl">
+          <div className="flex items-center justify-between">
+            <h3 className="flex items-center gap-2 text-[15px] font-semibold text-white">
+              <Smartphone className="h-4 w-4 text-cyan-300" />
+              Connect a WhatsApp Account
+            </h3>
+            <button onClick={() => setShowNewSession(false)} className="text-xs text-dark-400 hover:text-white transition">
+              <X className="h-4 w-4" />
             </button>
           </div>
+
+          {/* Connection Mode Selector */}
+          <div className="grid grid-cols-2 gap-2 p-1 rounded-xl bg-black/40 border border-white/10">
+            <button
+              type="button"
+              onClick={() => setConnectMethod('code')}
+              className={`flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-xs font-medium transition ${
+                connectMethod === 'code'
+                  ? 'bg-cyan-500/20 text-cyan-200 border border-cyan-400/40 shadow-sm'
+                  : 'text-dark-400 hover:text-dark-200'
+              }`}
+            >
+              <Smartphone className="h-3.5 w-3.5 text-cyan-400" />
+              <span>Link with Phone Number <span className="text-[10px] bg-cyan-400/20 text-cyan-200 px-1.5 py-0.5 rounded font-bold ml-1">EASIEST</span></span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setConnectMethod('qr')}
+              className={`flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-xs font-medium transition ${
+                connectMethod === 'qr'
+                  ? 'bg-brand-500/20 text-brand-200 border border-brand-400/40 shadow-sm'
+                  : 'text-dark-400 hover:text-dark-200'
+              }`}
+            >
+              <QrCode className="h-3.5 w-3.5 text-brand-400" />
+              <span>Scan QR Code</span>
+            </button>
+          </div>
+
+          {connectMethod === 'code' ? (
+            <div className="space-y-3 rounded-xl border border-cyan-400/20 bg-cyan-400/[0.04] p-4">
+              <div className="rounded-lg bg-black/30 p-2.5 border border-cyan-400/10">
+                <p className="text-[12px] font-medium text-cyan-200 mb-1">
+                  ✨ No camera scanning needed:
+                </p>
+                <ol className="text-[11.5px] text-dark-300 space-y-1 list-decimal list-inside">
+                  <li>Enter the WhatsApp number you want HerovaAi to use and click <strong>&quot;Get 8-Digit Pairing Code&quot;</strong></li>
+                  <li>On your phone, open WhatsApp → <strong>⋮ (Menu) → Linked Devices → Link a Device</strong></li>
+                  <li>Tap <strong>&quot;Link with phone number instead&quot;</strong> at the bottom</li>
+                  <li>Type the 8-digit code shown on screen — <strong>done!</strong></li>
+                </ol>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="block text-[11px] font-medium text-dark-300 mb-1">Account Label</label>
+                  <input
+                    value={newSessionName}
+                    onChange={e => setNewSessionName(e.target.value)}
+                    placeholder="e.g. Sales Desk or My Shop"
+                    className="input-dark w-full"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-dark-300 mb-1">WhatsApp Phone Number</label>
+                  <input
+                    type="tel"
+                    value={newSessionPhone}
+                    onChange={e => setNewSessionPhone(e.target.value)}
+                    placeholder="Your WhatsApp number, including country code"
+                    className="input-dark w-full"
+                    onKeyDown={e => e.key === 'Enter' && createSession()}
+                  />
+                  <p className="mt-1 text-[10.5px] text-dark-400">Use the number on the phone you want to link. Include your country code (for Bangladesh: 880…).</p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  onClick={createSession}
+                  disabled={loading}
+                  className="rounded-lg bg-cyan-500 hover:bg-cyan-400 text-black px-4 py-2 text-xs font-semibold shadow-md transition disabled:opacity-50"
+                >
+                  {loading ? 'Starting…' : 'Get 8-Digit Pairing Code'}
+                </button>
+                <button onClick={() => setShowNewSession(false)} className="btn-ghost">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-3 rounded-xl border border-brand-400/20 bg-brand-400/[0.04] p-4">
+              <p className="text-[12.5px] leading-relaxed text-dark-300">
+                A QR code will be generated on screen. On your phone, open WhatsApp → <strong>Linked Devices → Link a Device</strong>, then scan it.
+              </p>
+              <div>
+                <label className="block text-[11px] font-medium text-dark-300 mb-1">Account Label</label>
+                <input
+                  value={newSessionName}
+                  onChange={e => setNewSessionName(e.target.value)}
+                  placeholder="Optional label, e.g. Shop WhatsApp"
+                  className="input-dark w-full max-w-md"
+                  onKeyDown={e => e.key === 'Enter' && createSession()}
+                />
+              </div>
+              <div className="flex items-center gap-2 pt-1">
+                <button onClick={createSession} disabled={loading} className="btn-primary">
+                  {loading ? 'Starting browser…' : 'Generate QR Code'}
+                </button>
+                <button onClick={() => setShowNewSession(false)} className="btn-ghost">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -421,8 +633,8 @@ export default function WhatsAppPage() {
                   </button>
                 </div>
 
-                {/* QR Code Display */}
-                {session.status === 'qr_pending' && (
+                {/* QR Code Display — shown ONLY when NOT in phone pairing mode */}
+                {session.status === 'qr_pending' && !session.phoneNumber && !pairingCodes[session.sessionName] && !session.pairingCode && codeBusy !== session._id && (
                   <div className="flex flex-col items-center rounded-xl border border-brand-400/25 bg-brand-400/[0.04] p-3">
                     <p className="mb-2 flex items-center gap-1 text-xs font-medium text-brand-200">
                       <Clock className="h-3.5 w-3.5" aria-hidden /> Scan with WhatsApp
@@ -441,8 +653,97 @@ export default function WhatsAppPage() {
                       </div>
                     )}
                     <p className="mt-2 text-center text-[10.5px] text-dark-500">
-                      The code refreshes itself; scan the newest one.
+                      The code refreshes automatically; scan the newest one.
                     </p>
+                  </div>
+                )}
+
+                {/* Pairing Code Display (Link with Phone Number) */}
+                {session.status === 'qr_pending' && (
+                  <div className="rounded-xl border border-cyan-400/25 bg-cyan-400/[0.04] p-3.5 shadow-sm">
+                    <p className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-cyan-200">
+                      <Smartphone className="h-3.5 w-3.5 text-cyan-400" aria-hidden /> Link with Phone Number
+                    </p>
+                    {(() => {
+                      const activeCode = pairingCodes[session.sessionName] || session.pairingCode
+                      const isGenerating = codeBusy === session._id || (!activeCode && session.phoneNumber)
+
+                      if (isGenerating) {
+                        return (
+                          <div className="flex flex-col items-center gap-2.5 py-4">
+                            <span className="h-7 w-7 rounded-full border-2 border-cyan-400 border-t-transparent animate-spin" />
+                            <p className="text-[13px] font-semibold text-cyan-200">
+                              Generating 8-digit code{session.phoneNumber ? ` for ${session.phoneNumber}` : ''}…
+                            </p>
+                            <p className="text-[11px] text-dark-400">Takes about 10–15 seconds. Keep this page open.</p>
+                          </div>
+                        )
+                      }
+
+                      if (activeCode) {
+                        return (
+                          <div className="flex flex-col items-center gap-2.5 py-1">
+                            <p className="mono-num select-all rounded-xl border border-cyan-400/50 bg-black/60 px-5 py-2.5 text-[26px] font-extrabold tracking-[0.25em] text-cyan-100 shadow-inner">
+                              {activeCode.length === 8 ? `${activeCode.slice(0, 4)}-${activeCode.slice(4)}` : activeCode}
+                            </p>
+                            <div className="rounded-lg bg-black/40 p-2.5 border border-white/5 text-center">
+                              <p className="text-[11.5px] text-dark-200 font-medium">
+                                On your phone:
+                              </p>
+                              <p className="text-[11px] text-dark-300 mt-0.5">
+                                WhatsApp → <strong className="text-white">Linked devices</strong> → <strong className="text-white">Link a device</strong> → <strong className="text-cyan-300">&quot;Link with phone number instead&quot;</strong> → type this code.
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-2 mt-1">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  navigator.clipboard?.writeText(activeCode.length === 8 ? `${activeCode.slice(0, 4)}-${activeCode.slice(4)}` : activeCode)
+                                  toast.success('Pairing code copied!')
+                                }}
+                                className="rounded-lg bg-cyan-500/20 border border-cyan-400/40 px-3 py-1.5 text-xs font-semibold text-cyan-200 hover:bg-cyan-500/30 transition"
+                              >
+                                Copy code
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => requestCode(session)}
+                                disabled={codeBusy === session._id}
+                                className="rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-dark-300 hover:text-white transition disabled:opacity-50"
+                              >
+                                New code
+                              </button>
+                            </div>
+                          </div>
+                        )
+                      }
+
+                      return (
+                        <div className="flex flex-col gap-2">
+                          <p className="text-[11px] leading-relaxed text-dark-400">
+                            Enter your WhatsApp number to get an 8-digit code instead of scanning.
+                          </p>
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="tel"
+                              inputMode="numeric"
+                              value={pairingPhone[session.sessionName] || ''}
+                              onChange={e => setPairingPhone(prev => ({ ...prev, [session.sessionName]: e.target.value }))}
+                              placeholder="e.g. 01832123456 or 8801832123456"
+                              className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs text-white placeholder-dark-600 focus:border-cyan-400/50 focus:outline-none"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => requestCode(session)}
+                              disabled={codeBusy === session._id}
+                              className="flex-none rounded-lg bg-cyan-500/20 border border-cyan-400/40 px-3 py-1.5 text-[11px] font-semibold text-cyan-100 hover:bg-cyan-500/30 disabled:opacity-50"
+                            >
+                              {codeBusy === session._id ? 'Starting…' : 'Get code'}
+                            </button>
+                          </div>
+                        </div>
+                      )
+                    })()}
                   </div>
                 )}
 
@@ -450,7 +751,11 @@ export default function WhatsAppPage() {
                 {session.status === 'connected' && (
                   <div className="flex items-center gap-2 rounded-xl border border-emerald-500/20 bg-emerald-500/[0.07] px-3 py-2 text-xs text-emerald-300">
                     <CheckCircle2 className="h-4 w-4 flex-none" aria-hidden />
-                    <span>Connected — listening for customer DMs</span>
+                    <span>
+                      Number linked. {session.autoReply
+                        ? 'AI replies are on — send a test message from another phone.'
+                        : 'AI replies are still off. Switch them on below when you are ready, then test from another phone.'}
+                    </span>
                   </div>
                 )}
 
@@ -471,8 +776,12 @@ export default function WhatsAppPage() {
                   <div className="flex items-center gap-2">
                     <Bot className="h-4 w-4 text-brand-400" aria-hidden />
                     <div>
-                      <span className="block text-xs font-semibold text-white">AI auto-reply</span>
-                      <span className="text-[10.5px] text-dark-500">uses your memory &amp; persona</span>
+                      <span className="block text-xs font-semibold text-white">Reply to new customer messages</span>
+                      <span className="text-[10.5px] text-dark-400">
+                        {session.autoReply
+                          ? 'On — HerovaAi will reply using your business details. Switch off to pause.'
+                          : 'Off — no automatic replies are being sent.'}
+                      </span>
                     </div>
                   </div>
                   <button
@@ -536,11 +845,11 @@ export default function WhatsAppPage() {
         <div className="card mt-1 animate-fade-up overflow-hidden p-0">
           {/* Header */}
           <div className="flex items-center justify-between border-b border-white/[0.06] bg-black/20 p-4">
-            <div className="flex items-center gap-3">
+            <div className="flex min-w-0 items-center gap-3">
               <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-brand-500/15 text-brand-300">
                 <MessageSquare className="h-4 w-4" aria-hidden />
               </div>
-              <div>
+              <div className="min-w-0">
                 <h3 className="text-[13.5px] font-semibold text-white">
                   Customer chats &amp; AI replies —{' '}
                   <span className="text-brand-400">
@@ -554,12 +863,17 @@ export default function WhatsAppPage() {
                 </p>
               </div>
             </div>
-            <button
-              onClick={() => openCustomerChats(selectedSession)}
-              className="btn-ghost text-xs py-1.5"
-            >
-              <RefreshCw className="w-3 h-3" /> Refresh DMs
-            </button>
+            <div className="flex flex-none items-center gap-1.5">
+              <button type="button" onClick={exportHistory} className="btn-ghost text-xs py-1.5" title="Download the retained chat history as JSON">
+                <Download className="h-3 w-3" /> <span className="hidden sm:inline">Backup</span>
+              </button>
+              <button
+                onClick={() => openCustomerChats(selectedSession)}
+                className="btn-ghost text-xs py-1.5"
+              >
+                <RefreshCw className="w-3 h-3" /> <span className="hidden sm:inline">Refresh</span>
+              </button>
+            </div>
           </div>
 
           <div className="flex flex-col md:flex-row h-[500px]">
@@ -569,15 +883,29 @@ export default function WhatsAppPage() {
                 selectedCustomer ? 'hidden md:flex' : 'flex'
               }`}
             >
-              <div className="p-3 border-b border-white/8 text-xs font-semibold text-dark-300 uppercase tracking-wider flex items-center justify-between">
+              <div className="border-b border-white/8 p-3">
+                <div className="mb-2 flex items-center justify-between text-xs font-semibold uppercase tracking-wider text-dark-300">
                 <span>Customers ({customers.length})</span>
                 <span className="text-[10px] text-dark-400 md:hidden">Tap to view chat</span>
+                </div>
+                <label className="flex items-center gap-2 rounded-lg border border-white/10 bg-black/30 px-2.5 py-2">
+                  <Search className="h-3.5 w-3.5 flex-none text-dark-500" aria-hidden />
+                  <input
+                    value={customerSearch}
+                    onChange={event => setCustomerSearch(event.target.value)}
+                    placeholder="Find a customer"
+                    aria-label="Search customer conversations"
+                    className="min-w-0 flex-1 bg-transparent text-xs text-white outline-none placeholder:text-dark-500"
+                  />
+                </label>
               </div>
               <div className="flex-1 overflow-y-auto p-2 space-y-1">
                 {customers.length === 0 ? (
                   <p className="text-dark-500 text-xs text-center py-10">No customer DMs yet</p>
+                ) : visibleCustomers.length === 0 ? (
+                  <p className="text-dark-500 text-xs text-center py-10">No customers match that search</p>
                 ) : (
-                  customers.map(c => (
+                  visibleCustomers.map(c => (
                     <button
                       key={c}
                       onClick={() => filterCustomerChat(selectedSession, c)}
@@ -592,7 +920,9 @@ export default function WhatsAppPage() {
                         <p className="text-xs font-medium text-white truncate">
                           {c.replace('@c.us', '')}
                         </p>
-                        <p className="text-[10px] text-dark-400">Customer</p>
+                        <p className="text-[10px] text-dark-400">
+                          {customerLastActivity[c] ? new Date(customerLastActivity[c]).toLocaleDateString() : 'Customer'}
+                        </p>
                       </div>
                     </button>
                   ))
@@ -610,7 +940,7 @@ export default function WhatsAppPage() {
               <div className="p-3 border-b border-white/8 px-4 flex items-center justify-between text-xs text-dark-300">
                 <div className="flex items-center gap-2">
                   <button
-                    onClick={() => setSelectedCustomer(null)}
+                    onClick={() => selectCustomer(null)}
                     className="md:hidden text-brand-400 hover:text-white font-semibold text-xs flex items-center gap-1 mr-1"
                   >
                     ← Customers

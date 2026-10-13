@@ -2,15 +2,17 @@
 Description=HerovaAi Public Tunnel (Cloudflare quick tunnel to the gateway)
 After=network-online.target herovaai-gateway.service
 Wants=network-online.target
-StartLimitIntervalSec=120
-StartLimitBurst=8
+# 0 = no start rate limit: a DNS blip or a Cloudflare hiccup must never leave the
+# public site permanently offline. RestartSec below still spaces the retries out.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+Environment=PATH=/home/sahadat/.local/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=/home/sahadat/herovaai
 ExecStart=/bin/bash /home/sahadat/herovaai/scripts/tunnel-unit.sh
 Restart=always
-RestartSec=10
+RestartSec=15
 StandardOutput=append:/home/sahadat/herovaai/logs/tunnel-unit.log
 StandardError=append:/home/sahadat/herovaai/logs/tunnel-unit.log
 

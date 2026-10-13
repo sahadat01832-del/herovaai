@@ -6,6 +6,8 @@ const { authenticate } = require('../middleware/auth');
 const wppConnectService = require('../services/wppConnectService');
 const flowService = require('../services/flowService');
 const User = require('../models/User');
+const ChannelConnection = require('../models/ChannelConnection');
+const ScheduledPost = require('../models/ScheduledPost');
 const appSettings = require('../services/appSettings');
 
 // Which model answered is an admin-only record (/api/admin/whatsapp/...), so every session the
@@ -19,10 +21,83 @@ function forOwner(session) {
   return plain;
 }
 
+router.get('/analytics', authenticate, async (req, res) => {
+  try {
+    const [sessions, channels, scheduledCount] = await Promise.all([
+      WhatsAppSession.find({ userId: req.user._id })
+        .select('sessionName status totalMessagesReceived totalMessagesSent messages')
+        .lean(),
+      ChannelConnection.find({ userId: req.user._id })
+        .select('channel label status stats activity')
+        .lean(),
+      ScheduledPost.countDocuments({ userId: req.user._id, status: 'scheduled' }),
+    ]);
+
+    const now = new Date();
+    const firstDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 6));
+    const byDay = new Map();
+    for (let offset = 0; offset < 7; offset += 1) {
+      const day = new Date(firstDay);
+      day.setUTCDate(day.getUTCDate() + offset);
+      byDay.set(day.toISOString().slice(0, 10), { date: day.toISOString().slice(0, 10), incoming: 0, replies: 0 });
+    }
+    let recentCustomers = 0;
+    for (const session of sessions) {
+      const contacts = new Set();
+      for (const message of session.messages || []) {
+        const timestamp = new Date(message.timestamp);
+        const day = byDay.get(timestamp.toISOString().slice(0, 10));
+        if (!day) continue;
+        const customer = message.direction === 'incoming' ? message.from : message.to;
+        if (customer && customer !== 'me') contacts.add(customer);
+        if (message.direction === 'incoming') day.incoming += 1;
+        else if (message.aiGenerated) day.replies += 1;
+      }
+      recentCustomers += contacts.size;
+    }
+
+    const recentActivity = channels.flatMap((connection) => (connection.activity || [])
+      .filter((item) => new Date(item.at) >= firstDay)
+      .map((item) => ({ channel: connection.channel, kind: item.kind, ok: item.ok, at: item.at })));
+    const postsSent = channels.reduce((total, connection) => total + (connection.stats?.postsSent || 0), 0);
+    const channelReplies = channels.reduce((total, connection) => total + (connection.stats?.repliesSent || 0), 0);
+
+    res.json({
+      success: true,
+      range: { since: firstDay.toISOString(), through: now.toISOString() },
+      whatsapp: {
+        sessions: sessions.length,
+        connectedSessions: sessions.filter((session) => session.status === 'connected').length,
+        messagesReceived: sessions.reduce((total, session) => total + (session.totalMessagesReceived || 0), 0),
+        messagesSent: sessions.reduce((total, session) => total + (session.totalMessagesSent || 0), 0),
+        customersSeenInRecentHistory: recentCustomers,
+        days: Array.from(byDay.values()),
+      },
+      channels: {
+        connected: channels.filter((connection) => connection.status === 'connected').length,
+        postsSent,
+        repliesSent: channelReplies,
+        activityLast7Days: recentActivity.length,
+        failuresLast7Days: recentActivity.filter((item) => !item.ok).length,
+        scheduledPosts: scheduledCount,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ─── Get user's WhatsApp sessions ──────────────────────────────────────────
+// The message log is deliberately NOT part of this payload. The dashboard polls this
+// route every 3 seconds while a QR is on screen, and returning `messages` meant reading
+// and re-serialising a business's entire chat history every 3 seconds — a cost that grew
+// with success until the page crawled. The log has its own endpoint
+// (GET /sessions/:id/messages) and the counters below are what the list actually shows.
 router.get('/sessions', authenticate, async (req, res) => {
   try {
-    const sessions = await WhatsAppSession.find({ userId: req.user._id });
+    const sessions = await WhatsAppSession.find({ userId: req.user._id })
+      .select('-messages')
+      .lean();
     res.json({ success: true, sessions: sessions.map(forOwner) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -50,8 +125,13 @@ router.post('/sessions', authenticate, async (req, res) => {
       });
     }
 
-    const { sessionName } = req.body;
+    const { sessionName, phoneNumber } = req.body;
     if (!sessionName) return res.status(400).json({ success: false, message: 'Session name is required' });
+
+    let digits = String(phoneNumber || '').replace(/[^0-9]/g, '');
+    if (/^01[3-9]\d{8}$/.test(digits)) {
+      digits = '88' + digits;
+    }
 
     // Clean session name
     const cleanName = sessionName.trim().replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -84,6 +164,7 @@ router.post('/sessions', authenticate, async (req, res) => {
         userId: req.user._id,
         sessionName: fullSessionName,
         status: 'qr_pending',
+        phoneNumber: digits || null,
       });
     } else if (!live.active) {
       // No browser is running for this session, so "awaiting a scan" is the honest status for
@@ -91,6 +172,7 @@ router.post('/sessions', authenticate, async (req, res) => {
       // connect click must not downgrade a working session to qr_pending.
       session.status = 'qr_pending';
       session.qrCode = null;
+      if (digits) session.phoneNumber = digits;
       await session.save();
     }
 
@@ -116,7 +198,12 @@ router.post('/sessions', authenticate, async (req, res) => {
 
     // Start WPPConnect session. A failure to even start (missing library, unwritable profile)
     // is reported now; the scan-dependent outcome arrives later over the session record.
-    const started = await wppConnectService.startSession(fullSessionName, req.user._id, req.io);
+    const started = await wppConnectService.startSession(
+      fullSessionName,
+      req.user._id,
+      req.io,
+      digits ? { phoneNumber: digits } : {}
+    );
     if (!started.ok) {
       return res.status(503).json({ success: false, message: started.error, session: forOwner(session) });
     }
@@ -140,6 +227,27 @@ router.post('/sessions', authenticate, async (req, res) => {
 });
 
 // ─── Disconnect a session ──────────────────────────────────────────────────
+// ─── Pairing-code login ("link with a code" instead of scanning a QR) ─────
+// The login method is fixed when the session browser starts, so this closes any
+// browser mid-scan and relaunches it in phone-number mode; the 8-char code then
+// arrives over the `whatsapp-pairing-code` socket event.
+router.post('/sessions/:id/pairing-code', authenticate, async (req, res) => {
+  try {
+    const session = await WhatsAppSession.findOne({ _id: req.params.id, userId: req.user._id });
+    if (!session) return res.status(404).json({ success: false, message: 'Session not found' });
+    if (!appSettings.flag('whatsappEnabled')) {
+      return res.status(503).json({ success: false, message: 'Connecting WhatsApp numbers is paused by the administrator.' });
+    }
+    const { phoneNumber } = req.body || {};
+    const result = await wppConnectService.requestPairingCode(
+      session.sessionName, req.user._id, phoneNumber, req.io);
+    if (!result.ok) return res.status(400).json({ success: false, message: result.error });
+    res.json({ success: true, message: result.message || 'Generating your pairing code…' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.post('/sessions/:id/disconnect', authenticate, async (req, res) => {
   try {
     const session = await WhatsAppSession.findOne({ _id: req.params.id, userId: req.user._id });
@@ -148,6 +256,8 @@ router.post('/sessions/:id/disconnect', authenticate, async (req, res) => {
     await wppConnectService.closeSession(session.sessionName);
     session.status = 'disconnected';
     session.qrCode = null;
+    session.pairingCode = null;
+    session.pairingCodeAt = null;
     await session.save();
 
     res.json({ success: true, message: 'Session disconnected' });
@@ -360,7 +470,10 @@ router.get('/sessions/:id/customers/:customer/mute', authenticate, async (req, r
 });
 router.get('/sessions/:id/messages', authenticate, async (req, res) => {
   try {
-    const { contact } = req.query;
+    // The owner path sends `?from=` while the admin path sends `?contact=`; accept
+    // both so a per-customer click actually filters instead of returning the whole
+    // session log for every customer.
+    const contact = req.query.contact || req.query.from;
     const session = await WhatsAppSession.findOne({ _id: req.params.id, userId: req.user._id });
     if (!session) return res.status(404).json({ success: false, message: 'Session not found' });
 
@@ -388,6 +501,35 @@ router.get('/sessions/:id/messages', authenticate, async (req, res) => {
       customers: Array.from(customerSet),
       messages,
     });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.get('/sessions/:id/export', authenticate, async (req, res) => {
+  try {
+    const session = await WhatsAppSession.findOne({ _id: req.params.id, userId: req.user._id });
+    if (!session) return res.status(404).json({ success: false, message: 'Session not found' });
+    const exportedAt = new Date();
+    const label = String(session.sessionName.split('_').slice(1).join('_') || 'WhatsApp')
+      .replace(/[^a-zA-Z0-9_-]/g, '_');
+    const history = {
+      format: 'herovaai-whatsapp-history',
+      version: 1,
+      exportedAt: exportedAt.toISOString(),
+      note: 'This backup contains messages currently retained by HerovaAi for this number. It does not include WhatsApp login credentials or media file contents.',
+      session: {
+        label,
+        phoneNumber: session.phoneNumber || '',
+        createdAt: session.createdAt,
+        totalMessagesReceived: session.totalMessagesReceived || 0,
+        totalMessagesSent: session.totalMessagesSent || 0,
+      },
+      messages: forOwner(session).messages || [],
+    };
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="herovaai-whatsapp-${label}-${exportedAt.toISOString().slice(0, 10)}.json"`);
+    res.json(history);
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

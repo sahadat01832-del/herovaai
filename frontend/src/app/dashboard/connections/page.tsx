@@ -11,6 +11,7 @@ import { useAuth } from '@/contexts/AuthContext'
 import { cn } from '@/lib/cn'
 import { formatDateTime, relativeTime } from '@/lib/format'
 import { Badge, Button, CopyButton, EmptyState, InlineError, Skeleton } from '@/components/ui/primitives'
+import { EasyStart } from '@/components/dashboard/EasyStart'
 import { Field, Input, Switch, Textarea } from '@/components/ui/Field'
 import { Modal, ConfirmDialog } from '@/components/ui/Modal'
 import { Segmented } from '@/components/ui/Tabs'
@@ -48,18 +49,23 @@ const STATUS_BADGE: Record<string, { tone: 'green' | 'amber' | 'red' | 'slate'; 
 }
 
 export default function ConnectionsPage() {
-  const { user, refreshUser } = useAuth()
+  const { user, refreshUser, isAdmin } = useAuth()
   const [channels, setChannels] = useState<any[]>([])
   const [flowStatus, setFlowStatus] = useState<any>(null)
   const [flowModalOpen, setFlowModalOpen] = useState(false)
   const [flowConnecting, setFlowConnecting] = useState(false)
   const [flowConnectionId, setFlowConnectionId] = useState<string>('')
+  const [flowConnectStep, setFlowConnectStep] = useState<'idle' | 'waiting_session' | 'verifying'>('idle')
+  const [houseFlowAccountId, setHouseFlowAccountId] = useState<'ff2' | 'ff3' | 'ff1' | ''>('')
+  const [houseFlowConnectionId, setHouseFlowConnectionId] = useState('')
+  const [houseFlowConnecting, setHouseFlowConnecting] = useState(false)
   const [flowTab, setFlowTab] = useState<'extension' | 'cookies'>('extension')
   const [cookiesInput, setCookiesInput] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [open, setOpen] = useState<any>(null)
   const [busy, setBusy] = useState('')
+  const [youtubeResult, setYoutubeResult] = useState<{ tone: 'ok' | 'warn'; text: string } | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -83,6 +89,32 @@ export default function ConnectionsPage() {
 
   useEffect(() => { void load() }, [load])
 
+  // Google sends the YouTube connection back here with a short result code. Say what
+  // happened in plain words — "failed" on its own sends people hunting for a button
+  // that was never wrong. The message is a banner, not only a toast: a toast can be
+  // missed while the page is still mounting, and this is the one result the person
+  // actually needs to read.
+  useEffect(() => {
+    const result = new URLSearchParams(window.location.search).get('youtube')
+    if (!result) return
+    const messages: Record<string, { tone: 'ok' | 'warn'; text: string }> = {
+      connected: { tone: 'ok', text: 'YouTube is connected — uploads and comment replies are live.' },
+      failed: { tone: 'warn', text: 'Google did not finish the YouTube connection. Try again, or paste a token in the YouTube card below.' },
+      expired: { tone: 'warn', text: 'That YouTube connection link expired. Press “Connect YouTube with Google” again.' },
+      address: { tone: 'warn', text: 'Google refused because it has not been told about this address yet. An administrator can add it in Google Cloud Console → Credentials (the exact two values are in Settings → Security). Until then, paste a token in the YouTube card, or use the other platforms.' },
+      unconfigured: { tone: 'warn', text: 'One-click Google sign-in is not set up on this deployment, so the YouTube button cannot work yet. The token route in the YouTube card still works.' },
+    }
+    const message = messages[result] || { tone: 'warn' as const, text: 'The YouTube connection did not complete.' }
+    setYoutubeResult(message)
+    if (message.tone === 'ok') toast.success(message.text)
+    else toast.error(message.text)
+
+    // Drop the code so a refresh does not repeat the message.
+    const url = new URL(window.location.href)
+    url.searchParams.delete('youtube')
+    window.history.replaceState({}, '', url.toString())
+  }, [])
+
   // Keep the open panel in step with the fresh list after any change.
   useEffect(() => {
     if (!open) return
@@ -98,6 +130,124 @@ export default function ConnectionsPage() {
   }
 
   const isPersonalFlowActive = user?.flowAccountStatus === 'connected'
+  const connectedHouseFlowIds: string[] = flowStatus?.houseAccounts?.ids || []
+  const sharedImagePoolReady = connectedHouseFlowIds.length > 0
+  const flowUnavailableAccount = flowStatus?.accounts?.accounts?.find(
+    (account: any) => account.connectionStatus === 'access_unavailable',
+  )
+
+  const finishPersonalFlowConnection = useCallback(async (connectionId: string) => {
+    setFlowConnectStep('verifying')
+    setFlowConnecting(true)
+    try {
+      toast.loading('Flow session received — verifying your account…', { id: 'fl-conn' })
+      await flowApi.completeConnect({ connectionId })
+      toast.success('Google Flow connected. Nano Banana is ready when your account has generation access.', { id: 'fl-conn' })
+      setFlowConnectionId('')
+      setFlowConnectStep('idle')
+      if (refreshUser) await refreshUser()
+      await load()
+      setFlowModalOpen(false)
+    } catch (err: any) {
+      setFlowConnectionId('')
+      setFlowConnectStep('idle')
+      toast.error(err.message || 'Flow could not verify this session. Start Connect again and send the session from the extension.', { id: 'fl-conn' })
+    } finally {
+      setFlowConnecting(false)
+    }
+  }, [load, refreshUser])
+
+  // The bridge only receives a session after the user explicitly clicks
+  // “Connect Flow” in the installed extension. Once that handoff is visible,
+  // complete the existing account verification automatically.
+  useEffect(() => {
+    if (!flowModalOpen || flowConnectStep !== 'waiting_session' || !flowConnectionId) return
+
+    let active = true
+    let checking = false
+    const deadline = Date.now() + 5 * 60 * 1000
+    let timer: ReturnType<typeof setTimeout>
+
+    const pollBridge = async () => {
+      if (!active || checking) return
+      checking = true
+      try {
+        const status: any = await flowApi.getStatus()
+        if (!active) return
+        if (status?.bridge?.queuedSession) {
+          const connectionId = flowConnectionId
+          setFlowConnectionId('')
+          await finishPersonalFlowConnection(connectionId)
+          return
+        }
+      } catch {
+        // The bridge status can briefly be unavailable while Flow starts; retry
+        // within the same bounded handshake window instead of failing silently.
+      } finally {
+        checking = false
+      }
+
+      if (!active) return
+      if (Date.now() >= deadline) {
+        setFlowConnectionId('')
+        setFlowConnectStep('idle')
+        toast.error('Connection timed out. Start again, then click Connect Flow in the extension within five minutes.', { id: 'fl-conn' })
+        return
+      }
+      timer = setTimeout(pollBridge, 2500)
+    }
+
+    timer = setTimeout(pollBridge, 1000)
+    return () => {
+      active = false
+      clearTimeout(timer)
+    }
+  }, [flowModalOpen, flowConnectStep, flowConnectionId, finishPersonalFlowConnection])
+
+  const beginHouseFlowConnect = async (accountId: 'ff2' | 'ff3' | 'ff1') => {
+    setHouseFlowConnecting(true)
+    setHouseFlowAccountId(accountId)
+    setHouseFlowConnectionId('')
+    try {
+      const response: any = await flowApi.beginHouseConnect(accountId)
+      const result = response?.result?.result || response?.result || response
+      const connectionId = result?.connectionId
+      if (!connectionId) {
+        if (result?.status === 'ALREADY_CONNECTED') {
+          toast.success(`${accountId.toUpperCase()} is already connected.`)
+          await load()
+          return
+        }
+        throw new Error(response?.message || 'Flow did not start the account handshake.')
+      }
+      setHouseFlowConnectionId(connectionId)
+      toast.success(`${accountId.toUpperCase()} handshake started. Follow the steps shown below.`)
+    } catch (err: any) {
+      setHouseFlowAccountId('')
+      toast.error(err.message || 'Could not start the shared-account handshake.')
+    } finally {
+      setHouseFlowConnecting(false)
+    }
+  }
+
+  const completeHouseFlowConnect = async () => {
+    if (!houseFlowAccountId || !houseFlowConnectionId) return
+    setHouseFlowConnecting(true)
+    try {
+      await flowApi.completeHouseConnect({
+        accountId: houseFlowAccountId,
+        connectionId: houseFlowConnectionId,
+      })
+      toast.success(`${houseFlowAccountId.toUpperCase()} is connected to the shared image pool.`)
+      setHouseFlowAccountId('')
+      setHouseFlowConnectionId('')
+      await load()
+    } catch (err: any) {
+      toast.error(err.message || 'Could not verify this Google Flow account.')
+    } finally {
+      setHouseFlowConnecting(false)
+    }
+  }
 
   return (
     <div className="space-y-5">
@@ -146,9 +296,9 @@ export default function ConnectionsPage() {
             </span>
             <div>
               <div className="flex items-center gap-2">
-                <h2 className="text-base font-semibold text-white">Google Flow AI (MCP System)</h2>
+                <h2 className="text-base font-semibold text-white">Google Flow Video (MCP)</h2>
                 <Badge tone={isPersonalFlowActive ? 'green' : (flowStatus?.ready ? 'green' : 'amber')}>
-                  {isPersonalFlowActive ? 'personal quota active' : (flowStatus?.ready ? 'ready for generation' : 'connection needed')}
+                  {isPersonalFlowActive ? 'personal video quota active' : (flowStatus?.ready ? 'ready for video' : 'connection needed')}
                 </Badge>
                 {isPersonalFlowActive && (
                   <span className="rounded-full bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 text-[10px] font-mono text-emerald-300">
@@ -157,20 +307,92 @@ export default function ConnectionsPage() {
                 )}
               </div>
               <p className="mt-1 max-w-2xl text-[13px] leading-relaxed text-dark-300">
-                Generate ultra high quality AI video (Veo 3.1 & Omni Flash) and images (Nano Banana) directly via your Google subscription without paid generation API keys. Operated smoothly with local MCP tool automation.
+                {sharedImagePoolReady
+                  ? 'AI images try HerovaAi’s shared Flow accounts first, then your connected personal Flow account if the shared pool cannot serve a request. Personal fallback may use your Google Flow allowance; HerovaAi’s image limits are 10/day on Free, 100 per billing cycle on Pro, and unlimited on Enterprise.'
+                  : isPersonalFlowActive
+                    ? 'The shared Google Flow image pool is offline. Images will try your connected personal Flow account before HerovaAi’s backup engine; using your personal account may consume its Google Flow allowance. HerovaAi’s image quota still applies.'
+                    : 'The shared Google Flow image pool is offline. Images will try HerovaAi’s configured backup engine; if unavailable, chat will explain the issue so you can retry. Connect your personal Flow account to try Nano Banana before the backup; this may use your Google Flow allowance.'}
               </p>
+              {flowUnavailableAccount && !isPersonalFlowActive ? (
+                <div className="mt-3 max-w-2xl rounded-xl border border-amber-500/30 bg-amber-500/[0.08] p-3 text-[12px] leading-relaxed text-amber-100" role="alert">
+                  <p className="font-semibold">Your saved Google session is not connected to the Flow workspace.</p>
+                  <p className="mt-1 text-amber-100/80">
+                    {flowUnavailableAccount.lastValidationError || 'Google Flow did not verify this account for generation.'}
+                    {' '}Sign in with a Google account that can open the Flow creation workspace, then use <strong>Connect Flow for Video</strong> and approve the session in the browser extension. The bridge being online does not mean the account is ready.
+                  </p>
+                </div>
+              ) : null}
+              {isAdmin ? (
+                <div className="mt-4 rounded-xl border border-white/[0.08] bg-black/20 p-3.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <p className="text-xs font-semibold text-white">Shared image accounts</p>
+                      <p className="mt-0.5 text-[11px] text-dark-400">Failover order: FF2 → FF3 → FF1. Connect each with its matching Google account.</p>
+                    </div>
+                    <Badge tone={connectedHouseFlowIds.length === 3 ? 'green' : 'amber'}>
+                      {connectedHouseFlowIds.length}/3 ready
+                    </Badge>
+                  </div>
+                  <div className="mt-3 grid gap-2 sm:grid-cols-3">
+                    {([
+                      ['ff2', 'FF2 · Primary'],
+                      ['ff3', 'FF3 · Backup 1'],
+                      ['ff1', 'FF1 · Backup 2'],
+                    ] as const).map(([accountId, label]) => {
+                      const connected = connectedHouseFlowIds.includes(accountId)
+                      return (
+                        <div key={accountId} className="flex items-center justify-between gap-2 rounded-lg border border-white/[0.06] bg-white/[0.025] px-3 py-2">
+                          <span className="text-xs text-dark-200">{label}</span>
+                          <div className="flex items-center gap-2">
+                            <span className={`text-[10px] ${connected ? 'text-emerald-300' : 'text-amber-300'}`}>
+                              {connected ? 'connected' : 'not connected'}
+                            </span>
+                            {!connected ? (
+                              <Button
+                                variant="secondary"
+                                size="sm"
+                                loading={houseFlowConnecting && houseFlowAccountId === accountId}
+                                disabled={houseFlowConnecting || Boolean(houseFlowConnectionId)}
+                                onClick={() => void beginHouseFlowConnect(accountId)}
+                              >
+                                Connect
+                              </Button>
+                            ) : null}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                  {houseFlowConnectionId && houseFlowAccountId ? (
+                    <div className="mt-3 rounded-lg border border-cyan-500/20 bg-cyan-500/[0.06] p-3">
+                      <p className="text-[11px] leading-relaxed text-cyan-100">
+                        Make sure Chromium is signed into the {houseFlowAccountId.toUpperCase()} Google account. Open Flow Login Bridge → <strong>Connect Flow</strong>, wait for “Session sent”, then verify below.
+                      </p>
+                      <div className="mt-2 flex justify-end">
+                        <Button
+                          variant="primary"
+                          size="sm"
+                          loading={houseFlowConnecting}
+                          onClick={() => void completeHouseFlowConnect()}
+                        >
+                          Verify {houseFlowAccountId.toUpperCase()}
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
               <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-dark-400">
                 <span className="rounded-lg bg-white/[0.04] px-2.5 py-1 font-mono text-[11px] text-cyan-300 border border-white/[0.08]">
-                  ContentBot ↔ Google Flow MCP (Port 37421)
+                  ContentBot ↔ Google Flow MCP
                 </span>
                 {flowStatus?.bridge?.running && (
                   <span className="rounded-lg bg-emerald-500/10 px-2.5 py-1 text-emerald-400 text-[11px] font-medium border border-emerald-500/20">
-                    Bridge Online (port {flowStatus.bridge.port})
+                    {flowStatus?.ready
+                      ? `Bridge online (port ${flowStatus.bridge.port})`
+                      : 'Local bridge running · account not verified'}
                   </span>
                 )}
-                <span className="rounded-lg bg-emerald-500/10 px-2.5 py-1 text-emerald-300 text-[11px] font-medium border border-emerald-500/20">
-                  Image: Nano Banana 2 (2.1)
-                </span>
                 <span className="rounded-lg bg-cyan-500/10 px-2.5 py-1 text-cyan-300 text-[11px] font-medium border border-cyan-500/20">
                   Video: Omni Flash 1.1
                 </span>
@@ -195,11 +417,41 @@ export default function ConnectionsPage() {
               onClick={() => setFlowModalOpen(true)}
               icon={<Sparkles className="h-3.5 w-3.5" />}
             >
-              {isPersonalFlowActive ? 'Manage Flow Account' : (flowStatus?.ready ? 'Manage Flow' : 'Connect Flow Account')}
+              {isPersonalFlowActive ? 'Manage Flow Video Account' : (flowStatus?.ready ? 'Manage Flow' : 'Connect Flow for Video')}
             </Button>
           </div>
         </div>
       </div>
+
+      {youtubeResult ? (
+        <div
+          className={cn(
+            'flex items-start gap-3 rounded-2xl border px-4 py-3 text-[12.5px] leading-relaxed',
+            youtubeResult.tone === 'ok'
+              ? 'border-emerald-500/25 bg-emerald-500/[0.06] text-emerald-100'
+              : 'border-amber-500/25 bg-amber-500/[0.06] text-amber-100',
+          )}
+          role="status"
+        >
+          <Info className="mt-0.5 h-4 w-4 flex-none" aria-hidden />
+          <p className="flex-1">{youtubeResult.text}</p>
+          <button
+            type="button"
+            onClick={() => setYoutubeResult(null)}
+            className="flex-none text-[11px] font-semibold uppercase tracking-wide opacity-70 hover:opacity-100"
+          >
+            Dismiss
+          </button>
+        </div>
+      ) : null}
+
+      <EasyStart
+        imageAccountsReady={flowStatus ? sharedImagePoolReady : null}
+        onOpenChannel={(id) => {
+          const channel = channels.find(c => c.id === id)
+          if (channel) openPanel(channel)
+        }}
+      />
 
       {loading && channels.length === 0 ? (
         <div className="grid gap-4 lg:grid-cols-3">
@@ -278,20 +530,31 @@ export default function ConnectionsPage() {
         open={flowModalOpen}
         onClose={() => setFlowModalOpen(false)}
         size="lg"
-        title="Connect Google Flow AI (Personal Quota)"
+        title="Connect Google Flow"
       >
         <div className="space-y-4">
-          {/* Default Cloud Pool reassurance */}
-          <div className="rounded-xl border border-emerald-500/25 bg-emerald-500/[0.07] p-3.5 text-xs">
-            <div className="flex items-center gap-2 font-semibold text-emerald-300">
-              <Sparkles className="w-4 h-4 text-emerald-400" />
-              <span>Default Cloud Engine is Active &amp; Ready</span>
+          {/* Shared Flow serves images first; the personal account is the image failover and video account. */}
+          {Boolean(flowStatus?.freeForEveryone) ? (
+            <div className="rounded-xl border border-emerald-500/25 bg-emerald-500/[0.07] p-3.5 text-xs">
+              <div className="flex items-center gap-2 font-semibold text-emerald-300">
+                <Sparkles className="w-4 h-4 text-emerald-400" />
+                <span>Shared Nano Banana Pro image pool is ready</span>
+              </div>
+              <p className="mt-1 text-dark-300 leading-relaxed text-[11.5px]">
+                Your image allowance is 10/day on Free, 100 per billing cycle on Pro, or unlimited on Enterprise. Images use the shared pool first; if it cannot serve a request, your connected personal Google Flow account may be tried and use its allowance. Your personal connection also serves video.
+              </p>
             </div>
-            <p className="mt-1 text-dark-300 leading-relaxed text-[11.5px]">
-              You can generate images &amp; videos right now with <strong>Nano Banana 2</strong> and <strong>Omni Flash 1.1</strong> without connecting any personal account.
-              Connecting below is optional — only do this if you want generations to consume your <em>own personal Google account quota</em>.
-            </p>
-          </div>
+          ) : (
+            <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.07] p-3.5 text-xs">
+              <div className="flex items-center gap-2 font-semibold text-amber-200">
+                <Sparkles className="w-4 h-4 text-amber-300" />
+                <span>Shared image pool is not connected</span>
+              </div>
+              <p className="mt-1 text-dark-300 leading-relaxed text-[11.5px]">
+                Images try your connected personal Google Flow account before HerovaAi’s backup engine; using it may consume your Google Flow allowance. HerovaAi’s quota is 10/day on Free, 100 per billing cycle on Pro, and unlimited on Enterprise. Video also uses this personal account.
+              </p>
+            </div>
+          )}
 
           {/* Connection Method Tabs */}
           <div className="flex rounded-xl bg-white/[0.04] p-1 border border-white/5">
@@ -345,56 +608,80 @@ export default function ConnectionsPage() {
                   <span>Click <strong>Load unpacked</strong> and select the unzipped extension folder.</span>
                 </li>
                 <li className="flex gap-2">
-                  <span className="flex h-5 w-5 flex-none items-center justify-center rounded-full bg-brand-500/20 text-brand-300 font-bold text-[10px]">4</span>
-                  <span>Open your Google Flow tab &rarr; click the extension icon in your toolbar &rarr; click <strong>Connect Flow</strong> &rarr; then click &ldquo;Verify &amp; Complete&rdquo; below.</span>
+                  <span className="flex h-5 w-5 flex-none items-center justify-center rounded-full bg-sky-500/20 text-sky-300 font-bold text-[10px]">4</span>
+                  <span>Click <strong>Open Flow &amp; start connection</strong> below. HerovaAi will open Flow in a new tab and arm the secure, temporary connection. If a popup is blocked, <a href="https://labs.google/fx/tools/flow" target="_blank" rel="noreferrer" className="text-brand-300 underline">open Flow here</a>.</span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="flex h-5 w-5 flex-none items-center justify-center rounded-full bg-brand-500/20 text-brand-300 font-bold text-[10px]">5</span>
+                  <span>Sign in to Google in the Flow tab if asked, then click the Flow Login Bridge extension and <strong>Connect Flow</strong>. HerovaAi detects “Session sent” and verifies automatically; Google may ask you to choose the account.</span>
                 </li>
               </ol>
 
-              <div className="flex items-center justify-end gap-2 pt-2 border-t border-white/5">
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  loading={flowConnecting}
-                  onClick={async () => {
-                    setFlowConnecting(true)
-                    try {
-                      toast.loading('Starting handshake...', { id: 'fl-conn' })
-                      const res: any = await flowApi.beginConnect()
-                      const cId = res?.result?.connectionId || res?.connectionId || ''
-                      if (cId) setFlowConnectionId(cId)
-                      toast.success('Handshake armed! Click Connect Flow in the extension, then press Verify.', { id: 'fl-conn' })
-                      await load()
-                    } catch (err: any) {
-                      toast.error(err.message || 'Handshake failed', { id: 'fl-conn' })
-                    } finally {
-                      setFlowConnecting(false)
-                    }
-                  }}
-                >
-                  1. Begin Handshake
-                </Button>
+              {flowConnectStep !== 'idle' ? (
+                <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/[0.06] px-3 py-2 text-[11.5px] text-cyan-100" role="status" aria-live="polite">
+                  {flowConnectStep === 'waiting_session'
+                    ? 'Waiting for the Flow Login Bridge extension to send your signed-in session…'
+                    : 'Session received. Verifying Google Flow and waiting for any account chooser…'}
+                </div>
+              ) : null}
+
+              <div className="flex flex-wrap items-center justify-end gap-2 pt-2 border-t border-white/5">
                 <Button
                   variant="primary"
                   size="sm"
                   loading={flowConnecting}
                   onClick={async () => {
+                    // Open synchronously in the click handler to avoid popup
+                    // blockers, then arm the local bridge before asking for the
+                    // user’s explicit extension handoff.
+                    const flowWindow = window.open('https://labs.google/fx/tools/flow', '_blank')
                     setFlowConnecting(true)
                     try {
-                      toast.loading('Verifying Flow session & binding personal quota...', { id: 'fl-conn' })
-                      await flowApi.completeConnect({ connectionId: flowConnectionId })
-                      toast.success('Google Flow connected! Personal quota is active.', { id: 'fl-conn' })
-                      if (refreshUser) await refreshUser()
+                      toast.loading('Opening Flow and preparing a secure connection…', { id: 'fl-conn' })
+                      const res: any = await flowApi.beginConnect()
+                      const result = res?.result?.result || res?.result || res
+                      const cId = result?.connectionId || ''
+                      if (result?.status === 'ALREADY_CONNECTED') {
+                        toast.success('Google Flow is already connected.', { id: 'fl-conn' })
+                        if (refreshUser) await refreshUser()
+                        await load()
+                        setFlowModalOpen(false)
+                        return
+                      }
+                      if (!cId) throw new Error(result?.message || 'Flow did not return a connection request.')
+                      setFlowConnectionId(cId)
+                      setFlowConnectStep('waiting_session')
+                      if (!flowWindow) {
+                        toast('Popup blocked — open Flow using the link above, then use the extension.', { id: 'fl-conn' })
+                      } else {
+                        toast.success('Flow opened. Sign in if needed, then click Connect Flow in the extension; verification will run automatically.', { id: 'fl-conn' })
+                      }
                       await load()
-                      setFlowModalOpen(false)
                     } catch (err: any) {
-                      toast.error(err.message || 'Verification failed. Did you click Connect Flow in the extension?', { id: 'fl-conn' })
+                      flowWindow?.close()
+                      toast.error(err.message || 'Handshake failed', { id: 'fl-conn' })
                     } finally {
                       setFlowConnecting(false)
                     }
                   }}
+                  disabled={flowConnectStep !== 'idle'}
                 >
-                  2. Verify &amp; Complete
+                  Open Flow &amp; start connection
                 </Button>
+                {flowConnectStep !== 'idle' ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={flowConnecting}
+                    onClick={() => {
+                      setFlowConnectionId('')
+                      setFlowConnectStep('idle')
+                      toast('Flow connection cancelled.', { id: 'fl-conn' })
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                ) : null}
               </div>
             </div>
           ) : (
@@ -720,20 +1007,25 @@ function ChannelPanel({
                     <div className="p-3.5 rounded-xl bg-red-500/10 border border-red-500/20 text-xs text-red-200 space-y-2 mb-2">
                       <div className="font-semibold text-white flex items-center gap-1.5">
                         <Youtube className="w-4 h-4 text-red-400" />
-                        <span>Fast 60-Second YouTube Connection:</span>
+                        <span>Permanent YouTube connection (no Console address needed):</span>
                       </div>
                       <p className="text-[11.5px] text-dark-300 leading-relaxed">
-                        1. Open Google OAuth Playground with scopes <code className="text-cyan-300 font-mono">youtube.upload</code> and <code className="text-cyan-300 font-mono">youtube.force-ssl</code>.<br />
-                        2. Click Authorize APIs &amp; Exchange code for tokens.<br />
-                        3. Paste the generated Access Token below and click Save &amp; Test.
+                        This route does <strong>not</strong> need the redirect-URI in Google Cloud Console, so it keeps working even when the
+                        public address changes. Use your own client id &amp; secret (the pair already saved in Settings → Security):
                       </p>
+                      <ol className="list-decimal ml-4 space-y-1 text-[11.5px] text-dark-300 leading-relaxed">
+                        <li>Open the OAuth Playground (button below).</li>
+                        <li>Top-right gear ⚙ → tick <strong>Use your own OAuth credentials</strong> → paste the client id &amp; secret → Close.</li>
+                        <li>Authorize <code className="text-cyan-300 font-mono">youtube.upload</code> and <code className="text-cyan-300 font-mono">youtube.force-ssl</code>, then <strong>Exchange authorization code for tokens</strong>.</li>
+                        <li>Copy <strong>both</strong> the Access token <em>and</em> the Refresh token below, plus the same client id &amp; secret → <strong>Save &amp; Test</strong>. The refresh token makes it renew itself forever.</li>
+                      </ol>
                       <a
                         href="https://developers.google.com/oauthplayground"
                         target="_blank"
                         rel="noreferrer"
                         className="inline-flex items-center gap-1.5 text-xs font-semibold text-red-300 underline hover:text-white"
                       >
-                        ⚡ 1-Click: Open Google OAuth Playground <ArrowUpRight className="w-3.5 h-3.5" />
+                        ⚡ Open Google OAuth Playground <ArrowUpRight className="w-3.5 h-3.5" />
                       </a>
                     </div>
                   )}

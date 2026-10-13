@@ -18,9 +18,26 @@ const path = require('path');
 const GRAPH = 'https://graph.facebook.com/v21.0';
 const TELEGRAM = 'https://api.telegram.org';
 const YOUTUBE = 'https://www.googleapis.com/youtube/v3';
+const TIKTOK = 'https://open.tiktokapis.com/v2';
 const TIMEOUT = 20000;
 
 const cred = (connection, key) => String(connection?.credentials?.[key] ?? '').trim();
+
+/**
+ * Remember what we published and its platform id.
+ *
+ * Comment polling has to know *where* to look: YouTube finds a channel's own
+ * threads by itself, but Facebook and TikTok only hand back comments per post or
+ * per video. The publisher writes the id here and the connection is saved right
+ * after, so the next poll reads the real comments instead of guessing.
+ */
+function rememberMedia(connection, { id, kind, url = '' }) {
+  if (!id || !connection) return;
+  const list = Array.isArray(connection.meta?.recentMedia) ? connection.meta.recentMedia : [];
+  const next = list.filter((item) => item.id !== String(id));
+  next.push({ id: String(id), kind, url, at: new Date().toISOString() });
+  connection.meta = { ...(connection.meta || {}), recentMedia: next.slice(-10) };
+}
 
 const http = (method, url, { params, data, headers } = {}) =>
   axios({ method, url, params, data, headers, timeout: TIMEOUT, validateStatus: () => true });
@@ -104,15 +121,92 @@ async function facebookPagePublish(connection, text, { mediaUrl, imageUrl } = {}
   const pageId = cred(connection, 'pageId');
   if (!token || !pageId) return { ok: false, message: 'Page ID and Page token are required.' };
   const media = mediaUrl || imageUrl;
-  if (media && !/\.(mp4|webm|mov)(\?|$)/i.test(media)) {
+  if (media && /\.(mp4|webm|mov|mkv|m4v)(\?|$)/i.test(media)) {
+    // Video / Reel: Meta fetches the file itself from the public URL (file_url), so
+    // a large video never streams through this process. A failed video is reported
+    // as a failure — never silently downgraded to a text-only post.
+    const res = await http('POST', `${GRAPH}/${pageId}/videos`, {
+      data: { file_url: media, description: text.slice(0, 5000), access_token: token },
+    });
+    if (res.status === 200 && res.data?.id) {
+      rememberMedia(connection, { id: res.data.id, kind: 'video', url: media });
+      return { ok: true, message: 'Uploaded video to your Page', id: res.data.id };
+    }
+    return failure(res);
+  }
+  if (media) {
     try {
       const res = await http('POST', `${GRAPH}/${pageId}/photos`, { data: { url: media, caption: text.slice(0, 5000), access_token: token } });
-      if (res.status === 200 && res.data?.id) return { ok: true, message: 'Published photo to your Page', id: res.data.id };
+      if (res.status === 200 && res.data?.id) {
+        rememberMedia(connection, { id: res.data.id, kind: 'photo', url: media });
+        return { ok: true, message: 'Published photo to your Page', id: res.data.id };
+      }
     } catch {}
   }
   const res = await http('POST', `${GRAPH}/${pageId}/feed`, { data: { message: text.slice(0, 5000), access_token: token } });
   if (res.status !== 200 || !res.data?.id) return failure(res);
+  rememberMedia(connection, { id: res.data.id, kind: 'text' });
   return { ok: true, message: 'Published to your Page', id: res.data.id };
+}
+
+/**
+ * Comments viewers left on the Page's own recent posts.
+ *
+ * Reads a handful of the newest posts we published this session; when nothing is
+ * remembered yet it falls back to the Page feed, so a connection that pre-dates
+ * the tracking still starts answering. Comments written by the Page itself are
+ * dropped — answering your own comment is how a bot talks to itself forever.
+ */
+async function facebookPageNewComments(connection, { since } = {}) {
+  const token = cred(connection, 'pageToken');
+  const pageId = cred(connection, 'pageId');
+  if (!token || !pageId) return { ok: false, message: 'Page ID and Page token are required.', comments: [] };
+
+  const sinceMs = since ? new Date(since).getTime() : 0;
+  const remembered = (connection.meta?.recentMedia || []).filter((item) => item.id).slice(-5);
+  const targets = remembered.length ? remembered.map((item) => item.id) : [null];
+
+  const comments = [];
+  for (const target of targets) {
+    const res = target
+      ? await http('GET', `${GRAPH}/${target}/comments`, {
+        params: { fields: 'id,message,from,created_time,parent', limit: 25, access_token: token },
+      })
+      : await http('GET', `${GRAPH}/${pageId}/feed`, {
+        params: { fields: 'id,comments.limit(25){id,message,from,created_time,parent}', limit: 5, access_token: token },
+      });
+    if (res.status !== 200) return { ...failure(res), comments };
+
+    const rows = target
+      ? (res.data?.data || [])
+      : (res.data?.data || []).flatMap((post) => post.comments?.data || []);
+
+    for (const row of rows) {
+      if (row.from?.id && String(row.from.id) === String(pageId)) continue; // our own reply
+      if (sinceMs && new Date(row.created_time || 0).getTime() <= sinceMs) continue;
+      comments.push({
+        id: row.id,
+        text: row.message || '',
+        authorDisplayName: row.from?.name || 'a follower',
+        authorChannelId: { value: row.from?.id || 'viewer' },
+        publishedAt: row.created_time,
+        postId: target || '',
+      });
+    }
+  }
+  return { ok: true, message: `${comments.length} new comment(s)`, comments };
+}
+
+/** Reply under one comment (pages_manage_engagement). */
+async function facebookCommentReply(connection, { parentId, text }) {
+  const token = cred(connection, 'pageToken');
+  if (!token) return { ok: false, message: 'The Page access token is missing or expired.' };
+  if (!parentId) return { ok: false, message: 'No comment id to answer.' };
+  const res = await http('POST', `${GRAPH}/${parentId}/comments`, {
+    data: { message: text.slice(0, 8000), access_token: token },
+  });
+  if (res.status !== 200 || !res.data?.id) return failure(res);
+  return { ok: true, message: 'Replied to the comment', id: res.data.id };
 }
 
 async function messengerTest(connection) {
@@ -163,17 +257,42 @@ const instagramReply = messengerReply; // DMs ride the same Send API
 
 /* ──────────────────────────────── YouTube ─────────────────────────────── */
 
-/** Renew the access token when a refresh token + client id/secret exist. */
+/**
+ * The access token to call YouTube with right now.
+ *
+ * Three cases, cheapest first:
+ *
+ *   • a token we know is still valid (the one-click connect records when it dies) is
+ *     used as-is — otherwise every upload and comment reply pays for an extra round
+ *     trip to Google for nothing;
+ *   • a refresh token with the client id/secret renews it, and the new expiry is
+ *     remembered on the connection so the next call takes the cheap path;
+ *   • anything else (a hand-pasted access token, or a refresh Google just refused)
+ *     falls back to whatever token is stored.
+ */
 async function youtubeAccessToken(connection) {
+  const stored = cred(connection, 'accessToken');
+  const expiresAt = Number(connection?.meta?.youtubeTokenExpiresAt || 0);
+  // Two minutes of slack: a token that expires mid-upload is worse than one extra call.
+  if (stored && expiresAt && Date.now() + 120000 < expiresAt) return stored;
+
   const refresh = cred(connection, 'refreshToken');
   const clientId = cred(connection, 'clientId');
   const clientSecret = cred(connection, 'clientSecret');
-  if (!refresh || !clientId || !clientSecret) return cred(connection, 'accessToken');
+  if (!refresh || !clientId || !clientSecret) return stored;
+
   const res = await http('POST', 'https://oauth2.googleapis.com/token', {
     data: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, refresh_token: refresh, grant_type: 'refresh_token' }).toString(),
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
   });
-  return res.data?.access_token || cred(connection, 'accessToken');
+  const token = res.data?.access_token;
+  if (!token) return stored;
+
+  connection.meta = {
+    ...(connection.meta || {}),
+    youtubeTokenExpiresAt: Date.now() + (Number(res.data?.expires_in || 3500) * 1000),
+  };
+  return token;
 }
 
 async function youtubeTest(connection) {
@@ -320,6 +439,7 @@ async function youtubePublishVideo(connection, text, { mediaUrl, imageUrl } = {}
 
     const shortUrl = `https://www.youtube.com/shorts/${videoId}`;
     const watchUrl = `https://youtu.be/${videoId}`;
+    rememberMedia(connection, { id: videoId, kind: 'video', url: shortUrl });
 
     return {
       ok: true,
@@ -423,16 +543,111 @@ async function tiktokPublish(connection, text, { mediaUrl, imageUrl } = {}) {
     });
 
     if (res.status === 200 && res.data?.data?.publish_id) {
+      const publishId = res.data.data.publish_id;
+      // A publish id is not a video id. The status endpoint is what converts one
+      // into the other, and `tiktokNewComments` below does that lookup lazily —
+      // right after posting, TikTok is still transcoding and has no video id yet.
+      rememberMedia(connection, { id: publishId, kind: 'publish' });
       return {
         ok: true,
-        message: 'Published to TikTok! Publish ID: ' + res.data.data.publish_id,
-        id: res.data.data.publish_id,
+        message: 'Sent to TikTok for publishing (publish id ' + publishId + '). TikTok finishes processing it in a minute or two.',
+        id: publishId,
       };
     }
     return failure(res);
   } catch (err) {
     return { ok: false, message: `TikTok publish failed: ${err.message}` };
   }
+}
+
+/** TikTok answers everything with { data, error: { code, message } }. */
+function tiktokFailure(res) {
+  const error = res?.data?.error || {};
+  const message = error.message || error.code || `HTTP ${res?.status}`;
+  return { ok: false, message: String(message).slice(0, 300), status: res?.status || 0, code: error.code || '' };
+}
+
+/**
+ * Turn a publish id into the public video id (needed to read its comments).
+ * TikTok only fills the field in once the post is live, so "not yet" is normal
+ * and reported as such rather than as a failure to connect.
+ */
+async function tiktokResolveVideoId(connection, publishId) {
+  const token = cred(connection, 'accessToken');
+  const res = await http('POST', `${TIKTOK}/post/publish/status/fetch/`, {
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json; charset=UTF-8' },
+    data: { publish_id: publishId },
+  });
+  if (res.status !== 200 || res.data?.error?.code !== 'ok') return { ok: false, message: tiktokFailure(res).message };
+  const data = res.data?.data || {};
+  // TikTok's own typo (`publicaly_available_post_id`) is the field that carries it.
+  // It is documented as a list but has been seen as a bare string, and taking the
+  // first character of a string would produce a plausible-looking wrong video id.
+  const raw = data.publicaly_available_post_id ?? data.publicly_available_post_id ?? data.post_id ?? [];
+  const id = Array.isArray(raw) ? String(raw[0] || '') : String(raw || '');
+  if (!id) return { ok: false, message: `TikTok has not made the post public yet (status ${data.status || 'PROCESSING'}).` };
+  return { ok: true, videoId: id };
+}
+
+/**
+ * Comments on our recent TikTok videos. Needs the Creator access token — the
+ * webhook bridge can publish but cannot read comments back.
+ */
+async function tiktokNewComments(connection, { since } = {}) {
+  const token = cred(connection, 'accessToken');
+  if (!token) return { ok: false, message: 'Reading TikTok comments needs a Creator access token (a webhook bridge can only publish).', comments: [] };
+
+  const videos = [];
+  for (const item of (connection.meta?.recentMedia || []).slice(-5)) {
+    if (item.kind === 'video') { videos.push(item.id); continue; }
+    if (item.kind !== 'publish') continue;
+    const resolved = await tiktokResolveVideoId(connection, item.id);
+    if (resolved.ok) {
+      // Upgrade the record so the next poll skips the lookup entirely.
+      connection.meta = {
+        ...(connection.meta || {}),
+        recentMedia: (connection.meta.recentMedia || []).map((row) =>
+          (row.id === item.id ? { ...row, kind: 'video', id: resolved.videoId, publishId: item.id } : row)),
+      };
+      videos.push(resolved.videoId);
+    }
+  }
+  if (!videos.length) return { ok: true, message: 'No live TikTok video to read comments from yet.', comments: [] };
+
+  const sinceMs = since ? new Date(since).getTime() : 0;
+  const comments = [];
+  for (const videoId of videos.slice(-3)) {
+    const res = await http('GET', `${TIKTOK}/comment/list/`, {
+      params: { video_id: videoId, max_count: 20, fields: 'id,text,create_time,parent_comment_id,likes' },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (res.status !== 200 || res.data?.error?.code !== 'ok') return { ...tiktokFailure(res), comments };
+    for (const row of res.data?.data?.comments || []) {
+      if (sinceMs && new Date(row.create_time || 0).getTime() <= sinceMs) continue;
+      comments.push({
+        id: row.id,
+        videoId,
+        text: row.text || '',
+        authorDisplayName: row.display_name || 'a viewer',
+        authorChannelId: { value: row.id },
+        publishedAt: row.create_time,
+      });
+    }
+  }
+  return { ok: true, message: `${comments.length} new comment(s)`, comments };
+}
+
+/** Reply under one TikTok comment. Needs the Comment API granted to your app. */
+async function tiktokCommentReply(connection, { parentId, videoId, text }) {
+  const token = cred(connection, 'accessToken');
+  if (!token) return { ok: false, message: 'The TikTok access token is missing or expired.' };
+  if (!parentId || !videoId) return { ok: false, message: 'TikTok needs both the video id and the comment id to reply.' };
+  const res = await http('POST', `${TIKTOK}/comment/reply/create/`, {
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json; charset=UTF-8' },
+    data: { video_id: videoId, comment_id: parentId, text: text.slice(0, 500) },
+  });
+  if (res.status !== 200 || res.data?.error?.code !== 'ok') return tiktokFailure(res);
+  return { ok: true, message: 'Replied to the TikTok comment', id: res.data?.data?.comment_id || '' };
 }
 
 /* ───────────────────────────── Generic webhook ─────────────────────────── */
@@ -514,10 +729,20 @@ const REPLIERS = {
   messenger: messengerReply,
   instagram: instagramReply,
   youtube: youtubeReply,
+  facebook_page: facebookCommentReply,
+  tiktok: tiktokCommentReply,
 };
 
-const testerFor = (channel) => TESTERS[channel] || null;
-const publisherFor = (channel) => PUBLISHERS[channel] || null;
+const testerFor = (channel) => {
+  const fn = TESTERS[channel] || null;
+  if (!fn) return null;
+  return fn;
+};
+
+const publisherFor = (channel) => {
+  return PUBLISHERS[channel] || null;
+};
+
 const replierFor = (channel) => REPLIERS[channel] || null;
 
 module.exports = {
@@ -529,6 +754,9 @@ module.exports = {
   telegramRemoveWebhook,
   youtubeAccessToken,
   youtubeNewComments,
+  facebookPageNewComments,
+  tiktokNewComments,
+  rememberMedia,
   metaSignatureOk,
   telegramSecretOk,
 };

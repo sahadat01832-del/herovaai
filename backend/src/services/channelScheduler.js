@@ -6,13 +6,16 @@
  *   • Daily post   — for every channel with auto-posting on, once per local day,
  *                    at or after the owner's chosen time. Guarded on
  *                    `lastPostAt` falling on a previous day, not on the tick fire.
- *   • YouTube      — new comments are answered through the same AI path as chat,
- *                    walking forward from the last comment it saw.
+ *   • Comments     — YouTube, Facebook Page posts and TikTok videos have no
+ *                    webhook here, so their new comments are read on a timer and
+ *                    answered through the same AI path as chat, walking forward
+ *                    from the last comment it saw.
  *
  * Everything it does lands in the connection's activity list, so "it posted
  * daily" is a claim the owner can check instead of trust.
  */
 const ChannelConnection = require('../models/ChannelConnection');
+const ScheduledPost = require('../models/ScheduledPost');
 const channelService = require('./channelService');
 const adapters = require('./channels/adapters');
 const appSettings = require('./appSettings');
@@ -62,14 +65,76 @@ async function runDailyPosts(now) {
   }
 }
 
-/** YouTube has no webhooks for comments here; poll the channel's own threads. */
-async function runYoutubeComments(now, { minGapMs = 5 * 60 * 1000 } = {}) {
-  const connections = await ChannelConnection.find({ channel: 'youtube', 'automations.autoReply': true, status: 'connected' });
+async function runScheduledPosts(now) {
+  if (!appSettings.flag('autoPosts')) return;
+
+  // A claimed post is never automatically retried: after a process crash the
+  // platform may already have accepted it, so retrying could publish twice.
+  await ScheduledPost.updateMany(
+    { status: 'processing', processingAt: { $lt: new Date(now.getTime() - 30 * 60 * 1000) } },
+    { $set: { status: 'failed', resultMessage: 'The publisher stopped before confirming delivery. Check the platform before scheduling it again.' } },
+  );
+
+  for (let count = 0; count < 10; count += 1) {
+    const post = await ScheduledPost.findOneAndUpdate(
+      { status: 'scheduled', scheduledAt: { $lte: now } },
+      { $set: { status: 'processing', processingAt: now } },
+      { sort: { scheduledAt: 1 }, new: true },
+    );
+    if (!post) break;
+
+    const connection = await ChannelConnection.findOne({
+      _id: post.connectionId,
+      userId: post.userId,
+      channel: post.channel,
+      status: 'connected',
+    });
+    if (!connection) {
+      post.status = 'failed';
+      post.resultMessage = 'The platform is no longer connected. Reconnect it and schedule this post again.';
+      await post.save();
+      continue;
+    }
+
+    const result = await channelService.publishToConnection(connection, {
+      text: post.text,
+      mediaUrl: post.mediaUrl || undefined,
+    });
+    post.status = result.ok ? 'published' : 'failed';
+    post.resultMessage = String(result.message || (result.ok ? 'Published' : 'Publishing failed')).slice(0, 500);
+    post.publishedAt = result.ok ? new Date() : null;
+    await post.save();
+  }
+}
+
+/**
+ * Which channels have public comments worth answering, and how to read them.
+ *
+ * WhatsApp, Messenger, Instagram DMs and Telegram push their messages to us;
+ * these three have no webhook here, so we ask them politely on a timer. Each
+ * entry is the function that returns `{ comments: [...] }` — one shape for all of
+ * them, so the reply loop below stays platform-agnostic.
+ */
+const COMMENT_FEEDS = {
+  youtube: (connection) => adapters.youtubeNewComments(connection, { since: connection.meta?.lastCommentAt }),
+  facebook_page: (connection) => adapters.facebookPageNewComments(connection, { since: connection.meta?.lastCommentAt }),
+  tiktok: (connection) => adapters.tiktokNewComments(connection, { since: connection.meta?.lastCommentAt }),
+};
+
+/** Poll every channel that has a comment feed and answer what is new. */
+async function runCommentReplies(now, { minGapMs = 5 * 60 * 1000 } = {}) {
+  const connections = await ChannelConnection.find({
+    channel: { $in: Object.keys(COMMENT_FEEDS) },
+    'automations.autoReply': true,
+    status: 'connected',
+  });
   for (const connection of connections) {
+    const feedFor = COMMENT_FEEDS[connection.channel];
+    if (!feedFor) continue;
     const lastCheck = connection.meta?.lastCommentCheckAt ? new Date(connection.meta.lastCommentCheckAt) : null;
     if (lastCheck && now - lastCheck < minGapMs) continue;
 
-    const feed = await adapters.youtubeNewComments(connection, { since: connection.meta?.lastCommentAt });
+    const feed = await feedFor(connection);
     connection.meta = { ...(connection.meta || {}), lastCommentCheckAt: now };
     if (!feed.ok) {
       connection.pushActivity('error', false, `Could not read comments: ${feed.message}`);
@@ -80,9 +145,11 @@ async function runYoutubeComments(now, { minGapMs = 5 * 60 * 1000 } = {}) {
     for (const comment of feed.comments || []) {
       const reply = await channelService.handleInbound(connection, {
         senderId: comment.authorChannelId?.value || comment.authorDisplayName || 'commenter',
-        text: comment.textDisplay || comment.textOriginal || '',
+        text: comment.textDisplay || comment.textOriginal || comment.text || '',
         history: [],
-        replyTo: { parentId: comment.id },
+        // parentId is the comment being answered; videoId is what TikTok also
+        // needs to place the reply. Platforms that do not care simply ignore it.
+        replyTo: { parentId: comment.id, videoId: comment.videoId },
       });
       if (reply.replied) {
         connection.meta = { ...(connection.meta || {}), lastCommentAt: new Date().toISOString() };
@@ -101,7 +168,8 @@ async function tick() {
   const now = new Date();
   try {
     await runDailyPosts(now);
-    await runYoutubeComments(now);
+    await runScheduledPosts(now);
+    await runCommentReplies(now);
   } catch (err) {
     console.warn(`[channels] scheduler tick failed: ${err.message}`);
   } finally {
@@ -123,4 +191,4 @@ function stop() {
   timer = null;
 }
 
-module.exports = { start, stop, tick, postIsDue, localDay, _internal: { runDailyPosts, runYoutubeComments } };
+module.exports = { start, stop, tick, postIsDue, localDay, _internal: { runDailyPosts, runScheduledPosts, runCommentReplies } };

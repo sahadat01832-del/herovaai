@@ -12,6 +12,7 @@
  * amount + currency + tran_id against what we created.
  */
 const axios = require('axios');
+const publicUrl = require('./publicUrl');
 
 const isSandbox = () => String(process.env.SSLCOMMERZ_SANDBOX || 'true').toLowerCase() !== 'false';
 const baseUrl = () => (isSandbox()
@@ -44,8 +45,10 @@ function priceFor(tier) {
 
 /**
  * Open a checkout session. Returns { GatewayPageURL } or throws.
- * success/fail/cancel URLs must be absolute: derived from BACKEND_URL so the
- * gateway can call home on localhost, LAN or the public tunnel unchanged.
+ * success/fail/cancel URLs must be absolute, and must be the address that is
+ * reachable *right now* — on localhost, the LAN, or the public tunnel, whose
+ * hostname changes when it restarts. Pinning today's checkout to a stored
+ * hostname is how a customer pays and the order never confirms.
  */
 async function initPayment({ tranId, amount, currency, customer, productName }) {
   const { storeId, storePasswd } = credentials();
@@ -54,7 +57,7 @@ async function initPayment({ tranId, amount, currency, customer, productName }) 
     err.status = 503;
     throw err;
   }
-  const apiBase = (process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`).replace(/\/+$/, '');
+  const apiBase = publicUrl.publicOrigin();
   const params = new URLSearchParams({
     store_id: storeId,
     store_passwd: storePasswd,

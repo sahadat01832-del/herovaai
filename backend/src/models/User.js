@@ -24,7 +24,7 @@ const UserSchema = new mongoose.Schema({
     model: { type: String, default: 'local' }, // 'local' | 'contentbot' | 'api'
     temperature: { type: Number, default: 0.7 },
     systemPrompt: { type: String, default: '' },
-    flowImageModel: { type: String, default: 'nano-banana-2' }, // nano-banana-2 (2.1), nano-banana-pro, nano-banana-2-lite
+    flowImageModel: { type: String, default: 'nano-banana-pro' }, // Nano Banana Pro is the shared image-generation default
     flowVideoModel: { type: String, default: 'omni-flash' },    // omni-flash (1.1), veo-3-1-quality, veo-3-1-fast
     flowAspectRatio: { type: String, default: '16:9' },
   },

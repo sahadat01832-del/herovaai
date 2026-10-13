@@ -354,6 +354,10 @@ router.get('/api-keys', async (req, res) => {
     const [keys, inventory] = await Promise.all([keyVault.savedKeys(), Promise.resolve(keyVault.inventory())]);
 
     const configuredProviders = inventory.filter(p => p.configured > 0);
+    // The vault also holds the agent-platform key and the Google sign-in pair, which are
+    // not AI providers. The dashboard reports the AI gateway on its own so "1/3" never
+    // reads as two missing model providers when the one that matters is configured.
+    const gateways = inventory.filter(p => p.group === 'Gateway');
     res.json({
       success: true,
       providers: keyVault.PROVIDERS,
@@ -362,6 +366,8 @@ router.get('/api-keys', async (req, res) => {
       summary: {
         providersConfigured: configuredProviders.length,
         providersTotal: inventory.length,
+        aiGatewayConfigured: gateways.filter(p => p.configured > 0).length,
+        aiGatewayTotal: gateways.length,
         savedKeys: keys.length,
         enabledKeys: keys.filter(k => k.enabled).length,
         failingKeys: keys.filter(k => k.lastTestStatus === 'failed').length,

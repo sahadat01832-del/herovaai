@@ -15,22 +15,17 @@ const registry = require('./channels/registry');
 const adapters = require('./channels/adapters');
 const aiReply = require('./channels/aiReply');
 const appSettings = require('./appSettings');
-const fs = require('fs');
-const path = require('path');
+const publicUrl = require('./publicUrl');
 
 const DAILY_REPLY_CAP = Number(process.env.CHANNEL_REPLIES_PER_DAY || 200);
 
-/** The public origin platforms should call back: tunnel URL, or BACKEND_URL. */
-function publicBase() {
-  const configured = (process.env.PUBLIC_URL || process.env.BACKEND_URL || '').trim().replace(/\/+$/, '');
-  if (configured && !/localhost|127\.0\.0\.1/.test(configured)) return configured;
-  try {
-    const file = path.join(__dirname, '..', '..', 'logs', 'public-url.txt');
-    const fromFile = fs.readFileSync(file, 'utf8').trim().replace(/\/+$/, '');
-    if (fromFile) return fromFile;
-  } catch (_e) { /* fall through */ }
-  return configured || `http://localhost:${process.env.PORT || 5000}`;
-}
+/**
+ * The public origin platforms should call back (webhook URLs, media links).
+ * Rotating quick-tunnel hostnames are handled in publicUrl, which reads the live
+ * record rather than the value this process booted with — a webhook registered
+ * against a dead hostname is worse than no webhook at all.
+ */
+const publicBase = publicUrl.publicOrigin;
 
 /* ─────────────────────────────── reading ───────────────────────────────── */
 
@@ -40,9 +35,29 @@ async function listFor(userId) {
   const byChannel = new Map(rows.map((row) => [row.channel, row]));
   return registry.catalogue().map((entry) => {
     const connection = byChannel.get(entry.id) || null;
+    const serialized = connection ? connection.toJSON() : null;
+    const realCredentials = Object.entries(connection?.credentials || {})
+      .some(([key, value]) => key !== 'autoSetup' && String(value ?? '').trim());
+    const fakeSetupOnly = connection && !realCredentials && (
+      connection.credentials?.autoSetup === 'true' ||
+      connection.credentials?.autoSetup === true ||
+      connection.meta?.isAutoSetup
+    );
+
+    if (fakeSetupOnly) {
+      serialized.status = 'error';
+      serialized.lastError = 'This channel was never actually linked. Connect and verify your real platform account before publishing.';
+      serialized.lastTest = {
+        ...(serialized.lastTest || {}),
+        ok: false,
+        message: serialized.lastError,
+      };
+      delete serialized.configured.autoSetup;
+    }
+
     return {
       ...entry,
-      connection: connection ? connection.toJSON() : null,
+      connection: serialized,
       webhookUrl: entry.webhook ? `${publicBase()}${entry.webhook.path}` : '',
     };
   });
@@ -106,7 +121,13 @@ async function connect(userId, channelId, { credentials = {}, automations = {}, 
       else delete merged[key];
     }
   }
+  delete merged.autoSetup;
   connection.credentials = merged;
+  if (connection.meta?.isAutoSetup) {
+    const meta = { ...connection.meta };
+    delete meta.isAutoSetup;
+    connection.meta = meta;
+  }
   if (label) connection.label = String(label).slice(0, 80);
 
   const autoPatch = {};
@@ -169,6 +190,21 @@ async function testConnection(connection) {
 
 /** Compose a post and publish it now. Used by the scheduler and "Post now". */
 async function publishToConnection(connection, { text, mediaUrl } = {}) {
+  const realCredentials = Object.entries(connection.credentials || {})
+    .some(([key, value]) => key !== 'autoSetup' && String(value ?? '').trim());
+  if (!realCredentials && (
+    connection.credentials?.autoSetup === 'true' ||
+    connection.credentials?.autoSetup === true ||
+    connection.meta?.isAutoSetup
+  )) {
+    const message = 'This channel was never actually linked. Connect and verify your real platform account before publishing.';
+    connection.status = 'error';
+    connection.lastError = message;
+    connection.pushActivity('post', false, message);
+    await connection.save();
+    return { ok: false, message };
+  }
+
   const publisher = adapters.publisherFor(connection.channel);
   if (!publisher) {
     connection.pushActivity('post', false, 'This channel cannot post.');
@@ -283,7 +319,7 @@ async function handleInbound(connection, { senderId, text, history = [], replyTo
 
   let sent;
   try {
-    sent = await replier(connection, { to: senderId, text: generated.text, parentId: replyTo.parentId });
+    sent = await replier(connection, { to: senderId, text: generated.text, parentId: replyTo.parentId, videoId: replyTo.videoId });
   } catch (err) {
     sent = { ok: false, message: String(err.message || 'send failed').slice(0, 300) };
   }

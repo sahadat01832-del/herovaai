@@ -14,6 +14,7 @@
  */
 const axios = require('axios');
 const ApiKey = require('../models/ApiKey');
+const publicUrl = require('./publicUrl');
 
 const PROBE_TIMEOUT_MS = Number(process.env.KEY_PROBE_TIMEOUT_MS || 9000);
 
@@ -37,24 +38,6 @@ function openAIProbe(url, extraHeaders = {}) {
     const started = Date.now();
     const res = await axios.get(url, {
       headers: { Authorization: `Bearer ${value}`, ...extraHeaders },
-      timeout: PROBE_TIMEOUT_MS,
-      validateStatus: () => true,
-    });
-    return { status: res.status, latencyMs: Date.now() - started, ok: res.status >= 200 && res.status < 300 };
-  };
-}
-
-/**
- * Gemini is special: Google rejects `?key=` when an Authorization header rides along, and the
- * `AQ.` keys in this deployment are OAuth-style and only work through the Bearer form.
- */
-function geminiProbe() {
-  return async (value) => {
-    const started = Date.now();
-    const isOAuth = String(value).startsWith('AQ.');
-    const url = 'https://generativelanguage.googleapis.com/v1beta/models';
-    const res = await axios.get(isOAuth ? url : `${url}?key=${encodeURIComponent(value)}`, {
-      headers: isOAuth ? { Authorization: `Bearer ${value}` } : {},
       timeout: PROBE_TIMEOUT_MS,
       validateStatus: () => true,
     });
@@ -95,8 +78,10 @@ function googleOAuthProbe() {
     const looksLikeId = /\.apps\.googleusercontent\.com$/.test(String(value || '').trim());
     const clientId = looksLikeId ? String(value).trim() : firstKey(['GOOGLE_CLIENT_ID']);
     const clientSecret = looksLikeId ? firstKey(['GOOGLE_CLIENT_SECRET']) : String(value || '').trim();
+    // Resolved now, not at boot: the tunnel this redirect URI points at changes
+    // hostname when it restarts, and Google only accepts the exact registered URI.
     const redirectUri = (process.env.GOOGLE_CALLBACK_URL || '').trim()
-      || `${(process.env.BACKEND_URL || 'http://localhost:5000').replace(/\/+$/, '')}/api/auth/google/callback`;
+      || `${publicUrl.publicOrigin()}/api/auth/google/callback`;
 
     if (!clientId || !clientSecret) {
       return {
@@ -148,124 +133,25 @@ function googleOAuthProbe() {
 
 // ─── Provider registry ─────────────────────────────────────────────────────
 /**
- * One entry per provider: the .env slots a key can fill, where to read its documentation, and
- * how to prove a key works. `envNames` order matters — it is the priority order the pools use.
+ * One entry per slot the dashboard can hold, test and rotate: the .env names it fills, where to
+ * read its documentation, and how to prove it works. `envNames` order matters — it is the
+ * priority order the pools use.
+ *
+ * OmniRoute is the only AI provider listed, because it is the only one this deployment has:
+ * the gateway fronts Groq, Gemini, Cohere and everyone else, so adding their keys here would
+ * offer slots that no code path may spend. The other two entries are not models — the agent
+ * platform key and the Google sign-in pair — and stay for the features that need them.
  */
 const PROVIDERS = [
   {
-    id: 'gemini', label: 'Google Gemini', group: 'Multimodal',
-    setupUrl: 'https://aistudio.google.com/app/apikey',
-    envNames: ['GEMINI_API_KEY', ...Array.from({ length: 6 }, (_, i) => `GEMINI_API_KEY_${i + 2}`)],
-    placeholder: 'AIza… (API key) or AQ.… (OAuth)',
-    probe: geminiProbe(),
-  },
-  {
-    id: 'agens', label: 'Agnes AI Hub', group: 'Multimodal',
-    setupUrl: 'https://apihub.agnes-ai.com',
-    envNames: ['AGENS_API_KEY', ...Array.from({ length: 5 }, (_, i) => `AGENS_API_KEY_${i + 2}`), 'AGNES_API_KEY'],
-    placeholder: 'sk-…',
-    probe: openAIProbe('https://apihub.agnes-ai.com/v1/models'),
-  },
-  {
-    id: 'groq', label: 'Groq', group: 'Fast inference',
-    setupUrl: 'https://console.groq.com/keys',
-    envNames: ['GROQ_API_KEY'],
-    placeholder: 'gsk_…',
-    probe: openAIProbe('https://api.groq.com/openai/v1/models'),
-  },
-  {
-    id: 'openrouter', label: 'OpenRouter', group: 'Aggregator',
-    setupUrl: 'https://openrouter.ai/keys',
-    envNames: ['OPENROUTER_API_KEY', 'OPENROUTER_API_KEY_2'],
-    placeholder: 'sk-or-v1-…',
-    probe: openAIProbe('https://openrouter.ai/api/v1/models'),
-  },
-  {
-    id: 'openai', label: 'OpenAI', group: 'Frontier',
-    setupUrl: 'https://platform.openai.com/api-keys',
-    envNames: ['OPENAI_API_KEY'],
-    placeholder: 'sk-proj-…',
-    probe: openAIProbe('https://api.openai.com/v1/models'),
-  },
-  {
-    id: 'deepseek', label: 'DeepSeek', group: 'Frontier',
-    setupUrl: 'https://platform.deepseek.com/api_keys',
-    envNames: ['DEEPSEEK_API_KEY', 'DEEPSEEK_API_KEY_2'],
-    placeholder: 'sk-…',
-    probe: openAIProbe('https://api.deepseek.com/models'),
-  },
-  {
-    id: 'cohere', label: 'Cohere', group: 'Frontier',
-    setupUrl: 'https://dashboard.cohere.com/api-keys',
-    envNames: ['COHERE_API_KEY', 'CB_COHERE_API_KEY'],
-    placeholder: '…',
-    probe: openAIProbe('https://api.cohere.com/v1/models'),
-  },
-  {
-    id: 'unorouter', label: 'UnoRouter', group: 'Aggregator',
-    setupUrl: '',
-    envNames: ['UNOROUTER_API_KEY', 'CB_UNOROUTER_API_KEY'],
-    placeholder: 'sk-…',
-    probe: openAIProbe('https://api.unorouter.com/v1/models'),
-  },
-  {
-    id: 'llm7', label: 'LLM7', group: 'Aggregator',
-    setupUrl: '',
-    envNames: ['LLM7_API_KEY'],
-    placeholder: '…',
-    probe: openAIProbe('https://api.llm7.io/v1/models'),
-  },
-  {
-    id: 'ollama_cloud', label: 'Ollama Cloud', group: 'Aggregator',
-    setupUrl: 'https://ollama.com/settings/keys',
-    envNames: ['OLLAMA_CLOUD_API_KEY', 'OLLAMA_API_KEY'],
-    placeholder: '…',
-    probe: openAIProbe('https://ollama.com/v1/models'),
-  },
-  {
-    id: 'opencode_zen', label: 'OpenCode Zen', group: 'Aggregator',
-    setupUrl: '',
-    envNames: ['OPENCODE_ZEN_API_KEY', 'OPENCODE_ZEN_API_KEY_2'],
-    placeholder: 'oc_sk_…',
-    probe: openAIProbe('https://opencode.ai/zen/v1/models'),
-  },
-  // ── Verified 2026-10-08: keys valid, /models answers. Chat is account-gated
-  // (top-up / check-in / plan) so these carry no catalog models until the
-  // account condition clears — registered here so dashboard probes tell the truth.
-  {
-    id: 'apertis', label: 'Apertis', group: 'Aggregator',
-    setupUrl: 'https://api.apertis.ai',
-    envNames: ['APERTIS_API_KEY'],
-    placeholder: 'sk-…',
-    probe: openAIProbe('https://api.apertis.ai/v1/models'),
-  },
-  {
-    id: 'apinex', label: 'APInex', group: 'Aggregator',
-    setupUrl: 'https://apinex.bond',
-    envNames: ['APINEX_API_KEY'],
-    placeholder: 'sk-apx…',
-    probe: openAIProbe('https://api.apinex.bond/v1/models'),
-  },
-  {
-    id: 'orcarouter', label: 'OrcaRouter', group: 'Aggregator',
-    setupUrl: 'https://api.orcarouter.ai',
-    envNames: ['ORCAROUTER_API_KEY'],
-    placeholder: 'sk-orca-…',
-    probe: openAIProbe('https://api.orcarouter.ai/v1/models'),
-  },
-  {
-    id: 'airforce', label: 'Airforce', group: 'Aggregator',
-    setupUrl: 'https://api.airforce/dashboard',
-    envNames: ['AIRFORCE_API_KEY'],
-    placeholder: 'sk-air-…',
-    probe: openAIProbe('https://api.airforce/v1/models'),
-  },
-  {
-    id: 'apmix', label: 'Apmix', group: 'Aggregator',
-    setupUrl: 'https://apmix.ai/dashboard/billing',
-    envNames: ['APMIX_API_KEY', 'APMIX_API_KEY_2'],
-    placeholder: 'apx_live_…',
-    probe: openAIProbe('https://api.apmix.ai/v1/models'),
+    // The one AI credential this deployment runs on. Everything the catalog can
+    // serve is a free model behind this gateway.
+    id: 'omniroute', label: 'OmniRoute (local AI gateway)', group: 'Gateway',
+    setupUrl: 'https://www.omniroute.online/',
+    envNames: ['OMNIROUTE_API_KEY'],
+    placeholder: 'omni-…',
+    probe: openAIProbe(
+      `${(process.env.OMNIROUTE_BASE_URL || 'http://127.0.0.1:20128/v1').replace(/\/+$/, '')}/models`),
   },
   {
     id: 'contentbot', label: 'Agent platform', group: 'Internal',

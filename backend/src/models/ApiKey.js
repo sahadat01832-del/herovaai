@@ -4,9 +4,10 @@ const mongoose = require('mongoose');
  * A provider API key saved at runtime by an admin.
  *
  * `envName` is deliberate: the vault treats a saved key as a *better* value for the same slot
- * that backend/.env would fill (GEMINI_API_KEY_3, GROQ_API_KEY, …). That keeps one naming
- * scheme for both sources, so a key can be rotated from the dashboard without touching the
- * file and the .env value still acts as the fallback.
+ * that backend/.env would fill (today that is OMNIROUTE_API_KEY, plus the agent-platform and
+ * Google sign-in slots — see keyVault.PROVIDERS). That keeps one naming scheme for both
+ * sources, so a key can be rotated from the dashboard without touching the file and the
+ * .env value still acts as the fallback.
  *
  * The raw value is `select: false` — it is never returned by a list query, so a careless
  * `res.json({ keys })` cannot leak it.

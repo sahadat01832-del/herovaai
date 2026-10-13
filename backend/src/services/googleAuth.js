@@ -17,6 +17,7 @@
  * error, never a token delivered to the wrong place.
  */
 
+const axios = require('axios');
 const passport = require('passport');
 const jwt = require('jsonwebtoken');
 const { Strategy: GoogleStrategy } = require('passport-google-oauth20');
@@ -48,6 +49,28 @@ const isPlaceholder = (value) => {
 };
 
 const envFrontendUrl = () => (process.env.FRONTEND_URL || 'http://localhost:3001').replace(/\/+$/, '');
+
+/**
+ * A pinned public origin for the OAuth callback, when the operator has one.
+ *
+ * Google only accepts a redirect_uri that was registered character-for-character,
+ * and a Cloudflare quick tunnel hands out a fresh hostname on every reboot — so
+ * the request-derived redirect URI silently stops working each time the box
+ * restarts. Setting GOOGLE_CALLBACK_ORIGIN (e.g. a named-tunnel hostname or a
+ * real domain that fronts this same gateway) makes every sign-in use ONE stable
+ * redirect URI no matter which mirror the visitor arrived on. Register that one
+ * address in Google Cloud Console once and it keeps working across reboots.
+ *
+ * The post-login return still goes to the visitor's actual origin (frontendUrl),
+ * so pinning only stabilises what Google sees — never where the user lands.
+ */
+const pinnedOrigin = () => {
+  const value = String(process.env.GOOGLE_CALLBACK_ORIGIN || '').trim().replace(/\/+$/, '');
+  // A bare host is allowed; default to https (that is what gets registered).
+  if (!value) return '';
+  if (/^https?:\/\//.test(value)) return value;
+  return `https://${value}`;
+};
 
 const header = (req, name) => {
   const value = req && req.headers ? req.headers[name] : undefined;
@@ -83,6 +106,11 @@ function frontendUrl(req) {
  * which is what the status endpoint used to report.
  */
 function callbackUrlFor(req) {
+  // A pinned stable origin wins over everything: it is the one address that was
+  // registered in Google Cloud Console and survives tunnel-hostname churn.
+  const pin = pinnedOrigin();
+  if (pin) return `${pin}/api/auth/google/callback`;
+
   const configured = (process.env.GOOGLE_CALLBACK_URL || '').trim();
   const origin = requestOrigin(req);
   if (!origin) {
@@ -114,8 +142,26 @@ function credentials() {
 function setupSteps(req) {
   const redirect = callbackUrlFor(req);
   const origin = frontendUrl(req);
+  const pin = pinnedOrigin();
   const localRedirect = `${envFrontendUrl()}/api/auth/google/callback`;
-  const steps = [
+  const steps = [];
+
+  // A rotating quick-tunnel hostname is the #1 cause of "Google refused this
+  // address": it changes on every reboot, so a URI registered today breaks after
+  // the next restart. Say so, and point at the fix, before the click-list.
+  if (!pin && /\.trycloudflare\.com$/i.test(new URL(redirect).hostname)) {
+    steps.push({
+      title: 'This address changes on every reboot — pin a stable one',
+      detail:
+        'The public hostname is a Cloudflare quick tunnel, so it is reissued whenever this PC restarts and ' +
+        'Google stops accepting the old redirect URI with it. For a sign-in button that never breaks, point ' +
+        'GOOGLE_CALLBACK_ORIGIN at one fixed address (a named Cloudflare tunnel or a real domain fronting this ' +
+        'same app) and register that once — it keeps working across reboots. Until then, re-copy the two values ' +
+        'below after each restart.',
+    });
+  }
+
+  steps.push(
     {
       title: 'Create an OAuth client',
       detail: 'Google Cloud Console → APIs & Services → Credentials → Create credentials → OAuth client ID → Web application.',
@@ -131,7 +177,7 @@ function setupSteps(req) {
       detail: `Under "Authorised redirect URIs" add ${redirect} — it must match character for character.`,
       value: redirect,
     },
-  ];
+  );
   if (localRedirect !== redirect) {
     steps.push({
       title: 'Add the localhost URI too (optional)',
@@ -154,17 +200,110 @@ function setupSteps(req) {
 
 function status(req) {
   const { configured, clientId, source } = credentials();
+  const pin = pinnedOrigin();
   return {
     configured,
     // A placeholder from .env is not a credential worth previewing.
     clientIdMasked: configured ? keyVault.mask(clientId) : '',
     source,
     redirectUri: callbackUrlFor(req),
-    javascriptOrigin: frontendUrl(req),
+    // With a pin, the address to register in Google is the pinned origin (it is
+    // the canonical front for this app); without one, whatever host was used.
+    javascriptOrigin: pin || frontendUrl(req),
+    requestOrigin: frontendUrl(req),
+    pinned: Boolean(pin),
+    pinnedOrigin: pin,
     signInPath: '/api/auth/google',
     slots: [CLIENT_ID_SLOT, CLIENT_SECRET_SLOT],
     steps: setupSteps(req),
   };
+}
+
+/* ─────────────── does Google accept this redirect URI right now? ───────── */
+
+/**
+ * Google refuses an unregistered `redirect_uri` *before* the callback runs, so the
+ * visitor is stranded on Google's error page and never comes back to us. That is
+ * exactly what a rotating tunnel hostname produces — the button looks fine and the
+ * only person who finds out is the customer.
+ *
+ * So we ask Google first, and when it says no, send the visitor back to our own
+ * sign-in page with the one instruction that fixes it: add this exact URI in Google
+ * Cloud Console. The answer is cached per (client, redirect URI) so the probe costs
+ * at most one request every few minutes.
+ *
+ * Fails open: if Google cannot be reached at all, sign-in proceeds. A transient
+ * network problem must never be what disables a working button.
+ */
+const PROBE_TTL_MS = Number(process.env.GOOGLE_REDIRECT_PROBE_TTL_MS || 10 * 60 * 1000);
+const probeCache = new Map();
+
+async function redirectUriAccepted(req) {
+  const { clientId, configured } = credentials();
+  if (!configured) return { ok: false, reason: 'not-configured', redirectUri: callbackUrlFor(req) };
+
+  const redirectUri = callbackUrlFor(req);
+  const origin = frontendUrl(req);
+  const cacheKey = `${clientId}|${redirectUri}`;
+  const cached = probeCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < PROBE_TTL_MS) return cached.result;
+
+  const authorize = `https://accounts.google.com/o/oauth2/v2/auth?${new URLSearchParams({
+    response_type: 'code',
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    scope: 'profile email',
+  }).toString()}`;
+
+  let result;
+  try {
+    const res = await axios.get(authorize, { timeout: 8000, maxRedirects: 0, validateStatus: () => true });
+    const body = String(res.data || '');
+    const location = String(res.headers?.location || '');
+
+    // Google answers a mismatch two different ways depending on who is asking:
+    // 400 with the words in the body, or — the usual server-side shape — a 302 to
+    // /signin/oauth/error?authError=<base64 protobuf>, where "redirect_uri_mismatch"
+    // is only visible base64-encoded. Both have to be recognised, or the check
+    // silently passes bad URIs through to the visitor.
+    const mismatch =
+      /redirect_uri_mismatch/i.test(body) ||
+      /ZWRpcmVjdF91cmlfbWlzbWF0Y2g/i.test(location) ||
+      /redirect_uri_mismatch/i.test(decodeURIComponent(location));
+
+    // Any other sign-in error page means Google will refuse the click anyway.
+    const refusedPage = /\/signin\/oauth\/error/.test(location);
+
+    if (mismatch) {
+      result = {
+        ok: false,
+        reason: 'redirect-uri-mismatch',
+        redirectUri,
+        message:
+          'Google sign-in is not switched on for this address yet, so it cannot be used. ' +
+          `In Google Cloud Console → APIs & Services → Credentials, add ${redirectUri} as an ` +
+          'authorised redirect URI and ' + origin + ' as an authorised JavaScript origin, then try again. ' +
+          'Email and password sign-in works right now.',
+      };
+    } else if (refusedPage) {
+      result = {
+        ok: false,
+        reason: 'google-refused',
+        redirectUri,
+        message:
+          'Google refused this sign-in request, so the button cannot be used right now. ' +
+          'The usual cause is that this address is not registered for the OAuth client — an ' +
+          `administrator can check the client id and secret in Settings → Security (${location}).`,
+      };
+    } else {
+      result = { ok: true, redirectUri };
+    }
+  } catch (_err) {
+    result = { ok: true, unchecked: true, redirectUri }; // fail open
+  }
+
+  probeCache.set(cacheKey, { at: Date.now(), result });
+  return result;
 }
 
 /* ────────────────────────── strategy registration ─────────────────────── */
@@ -249,6 +388,36 @@ function strategyFor(req) {
   return name;
 }
 
+/**
+ * The strategy for "connect my YouTube channel", which is deliberately *not* the
+ * sign-in strategy.
+ *
+ * Sign-in resolves a User from the Google profile. Connecting a channel must not:
+ * an owner who signed up with an email address may well connect a different
+ * Google account, and creating a User row for it would be wrong (and would make
+ * that Google account look like a customer). So this strategy hands the tokens
+ * straight back as `info` and resolves nobody.
+ */
+const registeredYoutube = new Map();
+
+function youtubeStrategyFor(req) {
+  const { clientId, clientSecret, configured } = credentials();
+  if (!configured) return null;
+
+  const callbackURL = callbackUrlFor(req);
+  const fingerprint = `${clientId}|${clientSecret.length}|${callbackURL}`;
+  const name = `youtube:${strategyNameFor({ clientId, clientSecret, callbackURL }).name}`;
+  if (registeredYoutube.get(name) === fingerprint) return name;
+
+  passport.use(name, new GoogleStrategy(
+    { clientID: clientId, clientSecret, callbackURL, passReqToCallback: true },
+    (_req, accessToken, refreshToken, profile, done) =>
+      done(null, { youtubeConnect: true }, { accessToken, refreshToken, profile })
+  ));
+  registeredYoutube.set(name, fingerprint);
+  return name;
+}
+
 /** Backwards-compatible readiness check; with no request it uses the configured URL. */
 const isReady = (req) => Boolean(strategyFor(req));
 
@@ -259,26 +428,46 @@ function invalidate() {
 
 /* ───────────────────────────── CSRF state ─────────────────────────────── */
 
-/** A signed, expiring state value Google echoes back untouched. */
-function issueState() {
+/**
+ * A signed, expiring state value Google echoes back untouched.
+ *
+ * `extra` carries non-secret claims a flow needs on the way back — today the
+ * `purpose` ('signin' or 'youtube') and the owner the connection belongs to. It
+ * is signed, so a caller cannot put someone else's id in it.
+ */
+function issueState(extra = {}) {
   return jwt.sign(
-    { n: require('crypto').randomBytes(16).toString('hex') },
+    { n: require('crypto').randomBytes(16).toString('hex'), ...extra },
     process.env.JWT_SECRET || 'fallback-secret',
     { expiresIn: STATE_TTL }
   );
 }
 
-/** True when the state came from this server and has not expired. */
-function checkState(state) {
+/** The claims of a state that came from this server, or null. */
+function readState(state) {
   const value = String(state || '');
-  if (!value) return false;
+  if (!value) return null;
   try {
-    const payload = jwt.verify(value, process.env.JWT_SECRET || 'fallback-secret');
-    return Boolean(payload && payload.n);
+    return jwt.verify(value, process.env.JWT_SECRET || 'fallback-secret') || null;
   } catch (_err) {
-    return false;
+    return null;
   }
 }
+
+/** True when the state came from this server and has not expired. */
+function checkState(state) {
+  const payload = readState(state);
+  return Boolean(payload && payload.n);
+}
+
+/**
+ * The scopes a one-click YouTube connection needs: upload (publish) and
+ * force-ssl (read and answer comments).
+ */
+const YOUTUBE_SCOPES = [
+  'https://www.googleapis.com/auth/youtube.upload',
+  'https://www.googleapis.com/auth/youtube.force-ssl',
+];
 
 module.exports = {
   CLIENT_ID_SLOT,
@@ -286,7 +475,10 @@ module.exports = {
   credentials,
   status,
   setupSteps,
+  pinnedOrigin,
+  redirectUriAccepted,
   strategyFor,
+  youtubeStrategyFor,
   ensureStrategy: strategyFor,
   isReady,
   invalidate,
@@ -294,6 +486,8 @@ module.exports = {
   frontendUrl,
   requestOrigin,
   issueState,
+  readState,
   checkState,
   isPlaceholder,
+  YOUTUBE_SCOPES,
 };

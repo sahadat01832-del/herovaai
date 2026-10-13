@@ -36,8 +36,16 @@ domain costs money).
 
 ## What changes in the app
 
-Nothing in code: every URL that matters is already request-derived
-(`googleAuth.callbackUrlFor`, `frontendBase`, `site.ts`), so the app serves
-any hostname with zero reconfiguration. Only the registered values above
-(the ones external parties pin: Google, the .env fallbacks) get one final
-edit.
+Almost nothing: request-derived URLs (`googleAuth.callbackUrlFor`,
+`frontendBase`, `site.ts`) already serve any hostname. Stored-origin URLs are
+resolved per request by `backend/src/services/publicUrl.js`, which prefers the
+tunnel's live record (`logs/public-url.txt`) over the `PUBLIC_URL`/`BACKEND_URL`
+value the process read at boot — so a webhook URL or a payment callback never
+points at yesterday's hostname, even before a restart. Only the values external
+parties pin (Google OAuth redirect URIs, Meta's callback URL, TikTok's) need one
+final edit — and once the hostname is stable, they stay valid.
+
+Until this step is done, a quick-tunnel rotation still invalidates the redirect
+URIs registered inside Google/Meta/TikTok consoles, because those are stored on
+their side and only the owner can change them. `docs/CHANNELS.md` lists which
+consoles need which URL.

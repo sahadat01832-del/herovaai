@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter, usePathname } from 'next/navigation'
 import Link from 'next/link'
 import {
-  Activity, Banknote, BarChart3, Brain, ChevronLeft, ChevronRight, CreditCard, KeyRound, LayoutDashboard,
+  Activity, Banknote, BarChart3, Brain, CalendarClock, ChevronLeft, ChevronRight, CreditCard, KeyRound, LayoutDashboard,
   LogOut, Megaphone, Menu, MessageSquare, Plug, Plus, Search, Settings, Shield, SlidersHorizontal,
   Smartphone, Sparkles, Users, X, Zap,
 } from 'lucide-react'
@@ -32,6 +32,8 @@ interface NavItem {
   icon: typeof LayoutDashboard
   label: string
   hint: string
+  /** Render as a plain <a target="_blank"> (another app on this origin). */
+  external?: boolean
 }
 
 const WORKSPACE: NavItem[] = [
@@ -39,7 +41,10 @@ const WORKSPACE: NavItem[] = [
   { href: '/dashboard/chat',          icon: MessageSquare,   label: 'Chat',         hint: 'Ask a local or cloud model' },
   { href: '/dashboard/memory',        icon: Brain,           label: 'AI Memory',    hint: 'Business profile and persona' },
   { href: '/dashboard/whatsapp',      icon: Smartphone,      label: 'WhatsApp',     hint: 'Sessions and auto-reply' },
+  { href: '/studio',                  icon: Megaphone,       label: 'WhatsApp Studio', hint: 'Bulk send, scheduler, poster — opens in a new tab', external: true },
   { href: '/dashboard/connections',   icon: Plug,            label: 'Connections',  hint: 'Facebook, Messenger, Instagram, YouTube' },
+  { href: '/dashboard/analytics',     icon: BarChart3,        label: 'Analytics',    hint: 'Messages, publishing and activity' },
+  { href: '/dashboard/publishing',    icon: CalendarClock,    label: 'Publishing',   hint: 'Scheduled posts and delivery status' },
 ]
 
 const ACCOUNT: NavItem[] = [
@@ -48,6 +53,7 @@ const ACCOUNT: NavItem[] = [
 ]
 
 const ADMIN: NavItem[] = [
+  { href: '/dashboard/flow',           icon: Sparkles,    label: 'Flow Studio',  hint: 'Generate images with Google Flow' },
   { href: '/dashboard/admin/controls', icon: SlidersHorizontal, label: 'Controls', hint: 'Switches, limits and the audit trail' },
   { href: '/dashboard/admin/usage',    icon: Activity,     label: 'Usage',        hint: 'Who is being answered, and what is left' },
   { href: '/dashboard/admin/users',    icon: Users,       label: 'Users & Plans', hint: 'Accounts and tiers' },
@@ -59,9 +65,9 @@ const ADMIN: NavItem[] = [
 const MOBILE_NAV = [
   { href: '/dashboard/chat',         icon: MessageSquare, label: 'Chat' },
   { href: '/dashboard/whatsapp',     icon: Smartphone,    label: 'WhatsApp' },
+  { href: '/dashboard/analytics',    icon: BarChart3,     label: 'Analytics' },
   { href: '/dashboard/connections',  icon: Plug,          label: 'Channels' },
   { href: '/dashboard/subscription', icon: CreditCard,    label: 'Plans' },
-  { href: '/dashboard/memory',       icon: Brain,         label: 'Memory' },
   { href: '/dashboard/settings',     icon: Settings,      label: 'Settings' },
 ]
 
@@ -129,33 +135,56 @@ function Rail({ collapsed, onNavigate, showLabels }: {
   const renderItem = (item: NavItem, tone: 'default' | 'admin' = 'default') => {
     const Icon = item.icon
     const active = isActive(pathname, item.href)
-    const link = (
+    const shared = {
+      'data-active': active,
+      onClick: onNavigate,
+      className: cn(
+        'group relative flex items-center gap-3 rounded-xl px-3 py-2.5 text-[13px] font-medium transition-all duration-200',
+        active
+          ? 'bg-gradient-to-r from-brand-400/[0.16] to-brand-400/[0.04] text-brand-200'
+          : tone === 'admin'
+            ? 'text-dark-400 hover:bg-white/[0.04] hover:text-brand-100'
+            : 'text-dark-400 hover:bg-white/[0.04] hover:text-white'
+      ),
+    }
+    const icon = (
+      <Icon
+        className={cn(
+          'h-4 w-4 flex-none transition-colors',
+          active ? 'text-brand-300' : 'text-dark-500 group-hover:text-dark-200'
+        )}
+        aria-hidden
+      />
+    )
+    const label = showLabels ? <span className="truncate">{item.label}</span> : null
+    const dot = active && showLabels ? (
+      <span className="ml-auto h-1.5 w-1.5 flex-none rounded-full bg-brand-300/80" aria-hidden />
+    ) : null
+
+    // External entries are other apps on this origin — a Next <Link> would try
+    // to client-route them and 404, so render a real anchor that opens a tab.
+    const link = item.external ? (
+      <a
+        key={item.href}
+        href={item.href}
+        target="_blank"
+        rel="noopener noreferrer"
+        {...shared}
+      >
+        {icon}
+        {label}
+        {dot}
+      </a>
+    ) : (
       <Link
         key={item.href}
         href={item.href}
-        data-active={active}
-        onClick={onNavigate}
         aria-current={active ? 'page' : undefined}
-        className={cn(
-          'group relative flex items-center gap-3 rounded-xl px-3 py-2.5 text-[13px] font-medium transition-all duration-200',
-          active
-            ? 'bg-gradient-to-r from-brand-400/[0.16] to-brand-400/[0.04] text-brand-200'
-            : tone === 'admin'
-              ? 'text-dark-400 hover:bg-white/[0.04] hover:text-brand-100'
-              : 'text-dark-400 hover:bg-white/[0.04] hover:text-white'
-        )}
+        {...shared}
       >
-        <Icon
-          className={cn(
-            'h-4 w-4 flex-none transition-colors',
-            active ? 'text-brand-300' : 'text-dark-500 group-hover:text-dark-200'
-          )}
-          aria-hidden
-        />
-        {showLabels ? <span className="truncate">{item.label}</span> : null}
-        {active && showLabels ? (
-          <span className="ml-auto h-1.5 w-1.5 flex-none rounded-full bg-brand-300/80" aria-hidden />
-        ) : null}
+        {icon}
+        {label}
+        {dot}
       </Link>
     )
 
@@ -387,9 +416,14 @@ function Topbar({ collapsed, onOpenDrawer, onOpenPalette, quota }: {
                     <Settings className="h-3.5 w-3.5" aria-hidden /> Settings & API keys
                   </Link>
                   {isAdmin ? (
-                    <Link href="/dashboard/admin/api-keys" role="menuitem" className="flex items-center gap-2.5 rounded-xl px-3 py-2 text-[12.5px] text-dark-300 transition-colors hover:bg-white/[0.05] hover:text-white">
-                      <KeyRound className="h-3.5 w-3.5" aria-hidden /> Provider key vault
-                    </Link>
+                    <>
+                      <Link href="/dashboard/flow" role="menuitem" className="flex items-center gap-2.5 rounded-xl px-3 py-2 text-[12.5px] text-dark-300 transition-colors hover:bg-white/[0.05] hover:text-white">
+                        <Sparkles className="h-3.5 w-3.5" aria-hidden /> Google Flow Studio
+                      </Link>
+                      <Link href="/dashboard/admin/api-keys" role="menuitem" className="flex items-center gap-2.5 rounded-xl px-3 py-2 text-[12.5px] text-dark-300 transition-colors hover:bg-white/[0.05] hover:text-white">
+                        <KeyRound className="h-3.5 w-3.5" aria-hidden /> Provider key vault
+                      </Link>
+                    </>
                   ) : null}
                   <Link href="/dashboard/subscription" role="menuitem" className="flex items-center gap-2.5 rounded-xl px-3 py-2 text-[12.5px] text-dark-300 transition-colors hover:bg-white/[0.05] hover:text-white">
                     <Sparkles className="h-3.5 w-3.5" aria-hidden /> Plan & quota
@@ -585,9 +619,5 @@ function Shell({ children }: { children: React.ReactNode }) {
 }
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
-  return (
-    <AuthProvider>
-      <Shell>{children}</Shell>
-    </AuthProvider>
-  )
+  return <Shell>{children}</Shell>
 }

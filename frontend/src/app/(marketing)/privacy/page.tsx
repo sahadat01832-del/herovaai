@@ -79,9 +79,11 @@ export default function PrivacyPage() {
           <li>
             <strong className="font-medium text-dark-200">AI providers.</strong> Replies are written
             by an AI model you choose. A <em>local</em> model runs on the same machine and keeps the
-            text there. A <em>cloud</em> model — for example Groq or Google Gemini, as listed in
-            the model picker — receives the message text needed to produce the reply, under that
-            provider's own terms.
+            text there. A <em>gateway</em> model — the free models listed in the picker, such as
+            Google Gemini or Groq — is answered through this deployment's own AI gateway, which
+            forwards only the message text needed to produce the reply to whichever provider serves
+            it, under that provider's own terms. This deployment holds no AI account of yours and
+            is never charged to you for these replies.
           </li>
           <li>
             <strong className="font-medium text-dark-200">Google (optional).</strong> If you sign in

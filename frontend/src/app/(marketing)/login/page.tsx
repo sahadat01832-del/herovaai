@@ -21,7 +21,7 @@ import { Suspense } from 'react'
    ══════════════════════════════════════════════════════════════════════════ */
 
 function LoginForm() {
-  const { login } = useAuth()
+  const { user, login } = useAuth()
   const router = useRouter()
   const searchParams = useSearchParams()
   const [email, setEmail] = useState('')
@@ -31,6 +31,13 @@ function LoginForm() {
   const [oauthError, setOauthError] = useState<string | null>(null)
   const [googleReady, setGoogleReady] = useState<boolean | null>(null)
   const [fieldError, setFieldError] = useState<{ email?: string; password?: string; form?: string }>({})
+
+  // If already authenticated, redirect straight to dashboard
+  useEffect(() => {
+    if (user || (typeof window !== 'undefined' && localStorage.getItem('token'))) {
+      router.replace('/dashboard')
+    }
+  }, [user, router])
 
   // Ask the server whether the Google button can work before showing it, so a
   // click never dead-ends on a half-configured deployment.
@@ -162,7 +169,7 @@ function LoginForm() {
             )
             return
           }
-          window.location.href = `${getApiUrl()}/auth/google`
+          window.location.href = `${getApiUrl()}/auth/google?return_to=${encodeURIComponent(window.location.origin)}`
         }}
       />
     </AuthShell>
@@ -171,10 +178,8 @@ function LoginForm() {
 
 export default function LoginPage() {
   return (
-    <AuthProvider>
-      <Suspense fallback={<AuthSplash />}>
-        <LoginForm />
-      </Suspense>
-    </AuthProvider>
+    <Suspense fallback={<AuthSplash />}>
+      <LoginForm />
+    </Suspense>
   )
 }

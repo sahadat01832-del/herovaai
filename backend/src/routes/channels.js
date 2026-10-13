@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { authenticate, optionalAuth } = require('../middleware/auth');
 const ChannelConnection = require('../models/ChannelConnection');
+const ScheduledPost = require('../models/ScheduledPost');
 const registry = require('../services/channels/registry');
 const adapters = require('../services/channels/adapters');
 const channelService = require('../services/channelService');
@@ -29,6 +30,101 @@ router.get('/', optionalAuth, async (req, res) => {
   }
 });
 
+router.get('/scheduled-posts', authenticate, async (req, res) => {
+  try {
+    const posts = await ScheduledPost.find({ userId: req.user._id })
+      .sort({ scheduledAt: -1 })
+      .limit(100)
+      .lean();
+    res.json({ success: true, posts });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/scheduled-posts', authenticate, async (req, res) => {
+  try {
+    const channel = String(req.body?.channelId || '').trim();
+    const text = String(req.body?.text || '').trim();
+    const mediaUrl = String(req.body?.mediaUrl || '').trim();
+    const scheduledAt = new Date(req.body?.scheduledAt);
+    const definition = registry.channel(channel);
+    if (!definition || !definition.capabilities.autoPost || !adapters.publisherFor(channel)) {
+      return res.status(409).json({ success: false, message: 'This platform cannot publish scheduled posts.' });
+    }
+    if (!text || text.length > 5000) {
+      return res.status(400).json({ success: false, message: 'Add post text (up to 5,000 characters).' });
+    }
+    if (!Number.isFinite(scheduledAt.getTime())) {
+      return res.status(400).json({ success: false, message: 'Choose a valid date and time.' });
+    }
+    const delay = scheduledAt.getTime() - Date.now();
+    if (delay < 2 * 60 * 1000 || delay > 90 * 24 * 60 * 60 * 1000) {
+      return res.status(400).json({ success: false, message: 'Schedule a post at least 2 minutes and no more than 90 days from now.' });
+    }
+    if (mediaUrl) {
+      const base = new URL(channelService.publicBase());
+      let target;
+      try {
+        target = new URL(mediaUrl, base);
+      } catch {
+        return res.status(400).json({ success: false, message: 'The media link is invalid. Select media created or hosted by HerovaAi.' });
+      }
+      if (
+        target.origin !== base.origin ||
+        !/^\/api\/media\/[A-Za-z0-9._-]+$/.test(target.pathname) ||
+        target.pathname.includes('..')
+      ) {
+        return res.status(400).json({ success: false, message: 'Scheduled media must be a HerovaAi media link.' });
+      }
+    }
+
+    const connection = await ChannelConnection.findOne({
+      userId: req.user._id,
+      channel,
+      status: 'connected',
+    });
+    if (!connection) {
+      return res.status(409).json({ success: false, message: 'Connect and test this platform before scheduling a post.' });
+    }
+    const hasRealCredentials = Object.entries(connection.credentials || {})
+      .some(([key, value]) => key !== 'autoSetup' && String(value ?? '').trim());
+    if (!hasRealCredentials && (connection.credentials?.autoSetup || connection.meta?.isAutoSetup)) {
+      return res.status(409).json({ success: false, message: 'This platform connection needs to be verified again before scheduling.' });
+    }
+
+    const post = await ScheduledPost.create({
+      userId: req.user._id,
+      connectionId: connection._id,
+      channel,
+      text,
+      mediaUrl,
+      scheduledAt,
+    });
+    res.status(201).json({ success: true, post });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.delete('/scheduled-posts/:id', authenticate, async (req, res) => {
+  try {
+    const post = await ScheduledPost.findOne({
+      _id: req.params.id,
+      userId: req.user._id,
+      status: 'scheduled',
+    });
+    if (!post) {
+      return res.status(404).json({ success: false, message: 'This scheduled post was not found or has already started.' });
+    }
+    post.status = 'cancelled';
+    await post.save();
+    res.json({ success: true, post });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.post('/:id/connect', authenticate, async (req, res) => {
   try {
     const { connection, test } = await channelService.connect(req.user._id, req.params.id, req.body || {});
@@ -41,6 +137,26 @@ router.post('/:id/connect', authenticate, async (req, res) => {
   } catch (err) {
     res.status(err.status || 500).json({ success: false, message: err.message });
   }
+});
+
+// Kept as an explicit rejection for older clients. A display name does not
+// authenticate a social account, so this endpoint must never create a connection.
+router.post('/:id/auto-setup', authenticate, async (req, res) => {
+  res.status(409).json({
+    success: false,
+    code: 'REAL_PLATFORM_AUTH_REQUIRED',
+    message: 'A channel cannot be connected by entering its name. Use the verified sign-in or credential steps for this platform.',
+  });
+});
+
+// Kept as an explicit rejection for older clients; never report unlinked
+// platforms as ready to publish.
+router.post('/auto-setup-all', authenticate, async (req, res) => {
+  res.status(409).json({
+    success: false,
+    code: 'REAL_PLATFORM_AUTH_REQUIRED',
+    message: 'Each social platform must be linked and verified separately. No platforms were connected.',
+  });
 });
 
 router.post('/:id/test', authenticate, async (req, res) => {

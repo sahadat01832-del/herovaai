@@ -75,11 +75,12 @@ export async function apiRequest<T>(
   endpoint: string,
   options: RequestInit = {}
 ): Promise<T> {
-  const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null
+  const token = getToken()
+  const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData
   const res = await fetch(`${getApiUrl()}${endpoint}`, {
     ...options,
     headers: {
-      'Content-Type': 'application/json',
+      ...(!isFormData ? { 'Content-Type': 'application/json' } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...options.headers,
     },
@@ -103,28 +104,61 @@ export async function apiRequest<T>(
   return data as T
 }
 
+export async function apiUpload<T>(endpoint: string, body: FormData): Promise<T> {
+  const token = getToken()
+  const headers: Record<string, string> = {}
+  if (token) headers.Authorization = ['Bearer', token].join(' ')
+  const res = await fetch(`${getApiUrl()}${endpoint}`, {
+    method: 'POST',
+    body,
+    headers,
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.message || 'Upload failed')
+  return data
+}
+
 export function getToken(): string | null {
   if (typeof window === 'undefined') return null
-  return localStorage.getItem('token')
+  let token = localStorage.getItem('token')
+  if (!token) {
+    // Check cookie fallback
+    const match = document.cookie.match(/(?:^|;\s*)token=([^;]+)/)
+    if (match) {
+      token = decodeURIComponent(match[1])
+      localStorage.setItem('token', token)
+    }
+  }
+  return token
 }
 
 export function setToken(token: string): void {
-  if (typeof window !== 'undefined') localStorage.setItem('token', token)
+  if (typeof window !== 'undefined') {
+    localStorage.setItem('token', token)
+    // 7-day persistent cookie
+    document.cookie = `token=${encodeURIComponent(token)}; path=/; max-age=604800; SameSite=Lax`
+  }
 }
 
 export function removeToken(): void {
   if (typeof window !== 'undefined') {
     localStorage.removeItem('token')
     localStorage.removeItem('user')
+    document.cookie = 'token=; path=/; max-age=0'
   }
 }
 
 export function getUser(): User | null {
   if (typeof window === 'undefined') return null
   const u = localStorage.getItem('user')
-  return u ? JSON.parse(u) : null
+  if (u) {
+    try { return JSON.parse(u) } catch {}
+  }
+  return null
 }
 
 export function setUser(user: User): void {
-  if (typeof window !== 'undefined') localStorage.setItem('user', JSON.stringify(user))
+  if (typeof window !== 'undefined') {
+    localStorage.setItem('user', JSON.stringify(user))
+  }
 }

@@ -25,11 +25,15 @@ export const viewport: Viewport = {
   colorScheme: 'dark',
 }
 
+import { AuthProvider } from '@/contexts/AuthContext'
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" suppressHydrationWarning>
       <body className="bg-animated min-h-screen">
-        {children}
+        <AuthProvider>
+          {children}
+        </AuthProvider>
         <Toaster
           position="top-right"
           gutter={10}

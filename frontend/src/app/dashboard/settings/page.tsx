@@ -7,7 +7,7 @@ import {
   Lock, RefreshCw, Save, Server, ShieldCheck, Sparkles, ImageIcon, Video, Trash2, User, Zap,
 } from 'lucide-react'
 import { useAuth } from '@/contexts/AuthContext'
-import { adminApi, authApi, userApi } from '@/lib/api'
+import { adminApi, authApi, flowApi, userApi } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { formatDateTime, relativeTime } from '@/lib/format'
 import { Button, Card, CardHeader, Badge, CopyButton, InlineError, Skeleton, StatusDot, Tooltip } from '@/components/ui/primitives'
@@ -220,18 +220,29 @@ function ProfileTab({ onDone }: { onDone: () => Promise<void> }) {
 
 function MediaTab({ onDone }: { onDone: () => Promise<void> }) {
   const { user } = useAuth()
-  const [imageModel, setImageModel] = useState('nano-banana-2')
+  const [imageModel, setImageModel] = useState('nano-banana-pro')
   const [videoModel, setVideoModel] = useState('omni-flash')
   const [aspectRatio, setAspectRatio] = useState('16:9')
   const [saving, setSaving] = useState(false)
+  const [flowStatus, setFlowStatus] = useState<any>(null)
 
   useEffect(() => {
     if (!user) return
     const cs = (user as any).chatSettings || {}
-    setImageModel(cs.flowImageModel || 'nano-banana-2')
+    setImageModel(cs.flowImageModel || 'nano-banana-pro')
     setVideoModel(cs.flowVideoModel || 'omni-flash')
     setAspectRatio(cs.flowAspectRatio || '16:9')
   }, [user])
+
+  useEffect(() => {
+    let active = true
+    flowApi.getStatus()
+      .then((status) => { if (active) setFlowStatus(status) })
+      .catch(() => { if (active) setFlowStatus({ success: false }) })
+    return () => { active = false }
+  }, [])
+
+  const imagePoolReady = flowStatus?.success === true && (flowStatus?.houseAccounts?.count || 0) > 0
 
   const save = async () => {
     setSaving(true)
@@ -256,23 +267,51 @@ function MediaTab({ onDone }: { onDone: () => Promise<void> }) {
     <Card className="max-w-2xl space-y-6 p-6">
       <CardHeader
         icon={<Sparkles className="h-4 w-4 text-emerald-400" />}
-        title="Google Flow Media Generation Defaults"
-        description="Choose your default models for AI image and video synthesis via Google Flow MCP. Zero API billing — operated via your linked Google Flow session."
+        title="AI Image & Google Flow Video Defaults"
+        description={imagePoolReady
+          ? 'Images try HerovaAi’s shared Flow pool first, then your connected personal Flow account if needed. Personal Flow use may consume your Google Flow allowance. Your HerovaAi image allowance is 10/day on Free, 100 per billing cycle on Pro, or unlimited on Enterprise.'
+          : flowStatus?.success === false
+            ? 'Could not check the shared Google Flow account pool. Check Connections for the latest status; a personal account is not a substitute for the shared image pool.'
+            : flowStatus === null
+              ? 'Checking whether HerovaAi’s shared Google Flow account pool is ready.'
+              : 'Images try the selected Nano Banana model in Flow first, then Nano Banana 2.1 through the backup gateway, and Agnes last. Flow fallback may use your Google allowance; HerovaAi’s image limit is 10/day on Free, 100 per billing cycle on Pro, and unlimited on Enterprise.'}
       />
 
       <div className="space-y-5">
-        {/* Image Model Selection */}
+        <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/[0.05] p-4">
+          <p className="flex items-center gap-1.5 text-xs font-semibold text-white">
+            <ImageIcon className="h-3.5 w-3.5 text-emerald-400" />
+            {flowStatus === null
+              ? 'Checking image service'
+              : imagePoolReady
+                ? `Google Flow · ${imageModel === 'nano-banana-2' ? 'Nano Banana 2.1' : 'Nano Banana Pro'}`
+                : (user?.flowAccountStatus === 'connected'
+                  ? 'Google Flow · personal account fallback'
+                  : 'Nano Banana 2.1 → Agnes backup')}
+          </p>
+          <p className="mt-1 text-[11px] leading-relaxed text-dark-400">
+            {flowStatus?.success === false
+              ? 'Shared Flow account status is unavailable. Check Connections before trying image generation.'
+              : imagePoolReady
+                ? 'Free includes 10 successful images each day. Pro includes 100 per billing cycle and Enterprise is unlimited. HerovaAi uses its shared Flow accounts; you do not need to connect your personal Google account or provide an API key.'
+                : flowStatus === null
+                  ? 'Checking whether the shared Flow account pool is ready.'
+                  : (user?.flowAccountStatus === 'connected'
+                    ? 'Your selected Flow model is tried first. If Flow cannot serve the image, Nano Banana 2.1 is tried before the Agnes fallback.'
+                    : 'Nano Banana Pro is the default Flow model. If Flow is unavailable, Nano Banana 2.1 is tried first, followed by Agnes.')}
+          </p>
+        </div>
+
+        {/* Default Image Model */}
         <div>
           <label className="block text-xs font-semibold text-white mb-2 flex items-center gap-1.5">
-            <ImageIcon className="w-3.5 h-3.5 text-emerald-400" />
+            <ImageIcon className="h-3.5 w-3.5 text-emerald-400" />
             Default Image Model
           </label>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
             {[
-              { id: 'nano-banana-2', name: 'Nano Banana 2 (2.1)', badge: 'Default', desc: 'Fastest high-detail photorealism, sharp textures & creative styling' },
-              { id: 'nano-banana-pro', name: 'Nano Banana Pro', badge: 'High Quality', desc: 'Maximum aesthetic fidelity, studio lighting & complex composition' },
-              { id: 'nano-banana-2-lite', name: 'Nano Banana 2 Lite', badge: 'Lightweight', desc: 'Low-latency generation for rapid ideation and previews' },
-              { id: 'ui-default', name: 'Workspace Default', badge: 'Auto', desc: 'Auto-select active image model in Flow workspace session' },
+              { id: 'nano-banana-pro', name: 'Nano Banana Pro', badge: 'Default', desc: 'Use Flow Pro first when a verified Flow account is available.' },
+              { id: 'nano-banana-2', name: 'Nano Banana 2.1', badge: 'Fast', desc: 'Use Flow 2.1 first when a verified Flow account is available.' },
             ].map(m => (
               <button
                 type="button"
@@ -293,6 +332,9 @@ function MediaTab({ onDone }: { onDone: () => Promise<void> }) {
               </button>
             ))}
           </div>
+          <p className="mt-2 text-[11px] leading-relaxed text-dark-400">
+            If Flow accounts cannot serve the request, Nano Banana 2.1 is tried first, then Agnes. Backup availability depends on the server-side image gateway.
+          </p>
         </div>
 
         {/* Video Model Selection */}
@@ -357,22 +399,22 @@ function MediaTab({ onDone }: { onDone: () => Promise<void> }) {
           </div>
         </div>
 
-        {/* Personal Google Flow Account & Quota Isolation */}
+        {/* Optional Google Flow account for video */}
         <div className="p-4 rounded-xl border border-white/10 bg-black/40 space-y-2">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold text-white flex items-center gap-1.5">
               <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
-              Personal Google Flow Account & Quota
+              Optional Google Flow Account for Video
             </span>
             <Badge tone={(user as any)?.flowAccountStatus === 'connected' ? 'green' : 'amber'}>
-              {(user as any)?.flowAccountStatus === 'connected' ? 'Personal Quota Active' : 'Shared System Session'}
+              {(user as any)?.flowAccountStatus === 'connected' ? 'Connected for Video' : 'Not connected'}
             </Badge>
           </div>
           <p className="text-[12px] text-dark-300 leading-relaxed">
             {(user as any)?.flowAccountStatus === 'connected' ? (
-              <>Linked as <strong className="text-white font-mono">{(user as any)?.flowAccountId}</strong> ({(user as any)?.flowAccountLabel || user?.name}). Media generations automatically consume your own Google subscription quota without sharing limits.</>
+              <>Linked as <strong className="text-white font-mono">{(user as any)?.flowAccountId}</strong> ({(user as any)?.flowAccountLabel || user?.name}). Google Flow video generations can use this account.</>
             ) : (
-              <>Currently using the server's shared default session. Connect your personal Google account to consume your own Flow quota independently.</>
+              <>Connect a personal Flow account for video, or as a fallback for images when HerovaAi’s shared pool is unavailable. Image generation through your personal account may use its Google Flow allowance{flowStatus?.success === true && !imagePoolReady ? '; the shared image pool is currently disconnected' : ''}.</>
             )}
           </p>
           <div className="pt-2 flex items-center justify-between">
@@ -380,7 +422,7 @@ function MediaTab({ onDone }: { onDone: () => Promise<void> }) {
               href="/dashboard/connections"
               className="text-xs text-brand-400 hover:text-brand-300 underline inline-flex items-center gap-1"
             >
-              {(user as any)?.flowAccountStatus === 'connected' ? 'Manage Account in Connections' : 'Link Your Flow Account Now'} <ArrowUpRight className="w-3 h-3" />
+              {(user as any)?.flowAccountStatus === 'connected' ? 'Manage Flow in Connections' : 'Connect personal Flow for Video'} <ArrowUpRight className="w-3 h-3" />
             </Link>
           </div>
         </div>
@@ -675,7 +717,7 @@ function ProviderVaultSummary() {
       <CardHeader
         icon={<Layers className="h-4 w-4" />}
         title="Provider keys"
-        description="Keys that power the cloud models — administered centrally."
+        description="The OmniRoute gateway key behind every free cloud model — administered centrally."
         action={
           <Link href="/dashboard/admin/api-keys" className="btn-ghost btn-sm">
             Open vault
@@ -875,6 +917,8 @@ function GoogleSignInCard({ isAdmin }: { isAdmin: boolean }) {
   const [busy, setBusy] = useState<string | null>(null)
   const [testing, setTesting] = useState(false)
   const [verdict, setVerdict] = useState<{ ok: boolean; message: string } | null>(null)
+  const [probing, setProbing] = useState(false)
+  const [probe, setProbe] = useState<{ ok: boolean; reason?: string; message: string } | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -919,6 +963,27 @@ function GoogleSignInCard({ isAdmin }: { isAdmin: boolean }) {
       setVerdict({ ok: false, message: err?.message || 'The test could not run' })
     } finally {
       setTesting(false)
+    }
+  }
+
+  // Live check of the redirect URI itself: have Google validate the exact address
+  // before the owner clicks the button, so a mismatch is caught here instead of
+  // stranding a visitor on Google's error page.
+  const probeAddress = async () => {
+    setProbing(true)
+    setProbe(null)
+    try {
+      const data: any = await authApi.googleStatus(true)
+      const rc = data?.redirectCheck || {}
+      setProbe({
+        ok: Boolean(rc.ok),
+        reason: rc.reason,
+        message: rc.message || (rc.ok ? 'Google accepts this redirect address right now.' : 'Google did not clearly answer — try again.'),
+      })
+    } catch (err: any) {
+      setProbe({ ok: false, message: err?.message || 'The check could not run' })
+    } finally {
+      setProbing(false)
     }
   }
 
@@ -1049,6 +1114,36 @@ function GoogleSignInCard({ isAdmin }: { isAdmin: boolean }) {
               if Google sign-in should be available.
             </p>
           )}
+
+          {/* Live redirect-address check + rotation warning */}
+          <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-dark-500">Is this address accepted by Google?</p>
+            {status.pinned ? (
+              <p className="mt-2 text-[11.5px] leading-relaxed text-emerald-200">
+                A stable address is pinned ({status.pinnedOrigin}), so Google keeps accepting sign-in across reboots.
+              </p>
+            ) : /\.trycloudflare\.com$/i.test(status.redirectUri || '') ? (
+              <p className="mt-2 text-[11.5px] leading-relaxed text-amber-200">
+                This public address is a Cloudflare quick tunnel — it is <span className="font-semibold text-amber-100">reissued on every reboot</span>,
+                after which Google refuses the old URI until you re-copy the two values below. Pin a fixed address
+                (<code className="font-mono">GOOGLE_CALLBACK_ORIGIN</code>) to make sign-in survive restarts.
+              </p>
+            ) : null}
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <Button size="sm" variant="ghost" icon={<Zap className="h-3.5 w-3.5" />} loading={probing} onClick={probeAddress}>
+                Test with Google
+              </Button>
+            </div>
+            {probe ? (
+              <p className={cn(
+                'mt-2 flex items-start gap-2 rounded-xl border p-3 text-[12px] leading-relaxed',
+                probe.ok ? 'border-emerald-400/25 bg-emerald-400/[0.06] text-emerald-100' : 'border-red-400/25 bg-red-400/[0.06] text-red-100'
+              )}>
+                {probe.ok ? <Check className="mt-0.5 h-3.5 w-3.5 flex-none" /> : <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-none" />}
+                {probe.message}
+              </p>
+            ) : null}
+          </div>
 
           <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3">
             <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-dark-500">If signs-in fail</p>

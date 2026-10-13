@@ -54,10 +54,27 @@ const WhatsAppSessionSchema = new mongoose.Schema({
   totalMessagesSent: { type: Number, default: 0 },
   messages: [WhatsAppMessageSchema],
   qrCode: { type: String, default: null },
+  // One-time "Link with phone number" pairing code (8 chars) and when it was
+  // minted, as an alternative to scanning the QR. Null unless a code was asked
+  // for; the phone enters it under Settings → Linked Devices → Link a Device.
+  pairingCode: { type: String, default: null },
+  pairingCodeAt: { type: Date, default: null },
   lastActive: { type: Date, default: null },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
 }, { timestamps: true });
+
+// Embedded history, bounded. Left unbounded it marches toward Mongo's 16 MB
+// document cap (writes start failing, messages silently stop being recorded) and
+// every owner/admin read loads a whole archive. Totals live in the counters
+// above, so only the oldest of the recent thread is dropped.
+const MESSAGE_HISTORY_LIMIT = 500;
+WhatsAppSessionSchema.pre('save', function limitMessageHistory(next) {
+  if (this.isModified('messages') && this.messages.length > MESSAGE_HISTORY_LIMIT) {
+    this.messages = this.messages.slice(-MESSAGE_HISTORY_LIMIT);
+  }
+  next();
+});
 
 WhatsAppSessionSchema.index({ userId: 1 });
 WhatsAppSessionSchema.index({ status: 1 });

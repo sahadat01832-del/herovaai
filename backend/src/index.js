@@ -8,6 +8,7 @@ const { createServer } = require('http');
 const { Server } = require('socket.io');
 const passport = require('passport');
 const session = require('express-session');
+const rateLimit = require('express-rate-limit');
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -19,7 +20,9 @@ const userRoutes = require('./routes/user');
 const paymentRoutes = require('./routes/payments');
 const channelRoutes = require('./routes/channels');
 const flowRoutes = require('./routes/flow');
+const googleFlowRoutes = require('./routes/googleFlow');
 const platformRoutes = require('./routes/platform');
+const MongoSessionStore = require('./services/mongoSessionStore');
 
 // Import passport config
 require('./config/passport');
@@ -72,12 +75,42 @@ app.use(morgan('dev'));
 // (an HMAC of the bytes they sent), so verifying a webhook signature after the
 // JSON parser has reserialised the object would always fail.
 const keepRaw = (req, _res, buf) => { if (buf?.length) req.rawBody = buf; };
-app.use(express.json({ limit: '10mb', verify: keepRaw }));
-app.use(express.urlencoded({ extended: true, verify: keepRaw }));
+
+// Per-IP throttle for the whole API, ahead of the body parsers so a throttled
+// caller is never buffered into memory first. 300 requests/minute is far above
+// what a real dashboard session uses, and well below what it takes to make the
+// app an amplifier. Delivery webhooks and payment callbacks are exempt: those
+// are machine-to-machine, and throttling one would drop a customer's message or
+// a paid order.
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.API_RATE_LIMIT_PER_MIN || 300),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests — please slow down for a moment.' },
+  skip: (req) => {
+    const path = req.path.startsWith('/api') ? req.path.slice(4) : req.path;
+    return path === '/health'
+      || path.startsWith('/channels/webhook')
+      || path.startsWith('/payments/callback')
+      || path === '/payments/nagad/callback';
+  },
+});
+app.use('/api', apiLimiter);
+
+// Chat carries attachments as base64, so it keeps the large parser; every other
+// route stays at 1 MB — a stray 10 MB body must not be buffered into RAM on any
+// endpoint, least of all the unauthenticated ones.
+app.use('/api/chat', express.json({ limit: '10mb', verify: keepRaw }));
+app.use(express.json({ limit: '1mb', verify: keepRaw }));
+app.use(express.urlencoded({ extended: true, limit: '1mb', verify: keepRaw }));
+// Sessions live in MongoDB, not in this process's heap: MemoryStore leaks, never
+// frees an entry, and logs everyone out on restart (see mongoSessionStore).
 app.use(session({
   secret: process.env.SESSION_SECRET || 'fallback-secret',
   resave: false,
   saveUninitialized: false,
+  store: new MongoSessionStore({ ttlMs: 7 * 24 * 60 * 60 * 1000 }),
   cookie: { secure: false, maxAge: 7 * 24 * 60 * 60 * 1000 },
 }));
 app.use(passport.initialize());
@@ -97,6 +130,7 @@ app.use('/api/payments', paymentRoutes);
 // Channel connections + the platform webhooks (Meta, Telegram) that call home.
 app.use('/api/channels', channelRoutes);
 app.use('/api/flow', flowRoutes);
+app.use('/api/google-flow', googleFlowRoutes);
 // Public switches only (notice banner, is checkout open) — safe without a login.
 app.use('/api/platform', platformRoutes);
 app.use('/api/media', (req, res, next) => {
@@ -104,8 +138,19 @@ app.use('/api/media', (req, res, next) => {
   flowRoutes(req, res, next);
 });
 
-// Health check
-app.get('/api/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date() }));
+// Deep health: lets the gateway and any uptime monitor tell "process is up"
+// apart from "database is up". A healthy process with a dead database cannot
+// serve anyone, and saying "ok" anyway would hide exactly that outage.
+app.get('/api/health', (_req, res) => {
+  const dbUp = mongoose.connection.readyState === 1;
+  res.status(dbUp ? 200 : 503).json({
+    status: dbUp ? 'ok' : 'degraded',
+    db: dbUp ? 'up' : 'down',
+    uptimeSec: Math.round(process.uptime()),
+    memMb: Math.round(process.memoryUsage().rss / 1048576),
+    timestamp: new Date(),
+  });
+});
 
 // ─── Socket.IO ──────────────────────────────────────────────────────────────
 const setupSocketIO = require('./services/socketService');
@@ -120,8 +165,54 @@ app.use((err, _req, res, _next) => {
   });
 });
 
+// ─── Boot guards ────────────────────────────────────────────────────────────
+// A deployed instance must never run on the fallback secrets that keep local
+// development frictionless: anyone who can read this repository could then sign
+// a token for any account. Production refuses to boot; development only warns.
+const insecureDefaults = [];
+for (const name of ['JWT_SECRET', 'SESSION_SECRET']) {
+  const value = process.env[name];
+  if (!value || value === 'fallback-secret') insecureDefaults.push(`${name} is missing (built-in fallback in use)`);
+}
+if (!process.env.MONGODB_URI) insecureDefaults.push('MONGODB_URI is missing (defaults to a local database)');
+if (insecureDefaults.length) {
+  const lines = insecureDefaults.map((line) => `   • ${line}`).join('\n');
+  if (process.env.NODE_ENV === 'production') {
+    console.error(`❌ Refusing to start in production with insecure defaults:\n${lines}\n   Set real values in backend/.env, then restart.`);
+    process.exit(1);
+  }
+  console.warn(`⚠️  Insecure defaults (acceptable in development only):\n${lines}`);
+}
+
+// ─── Graceful shutdown ──────────────────────────────────────────────────────
+// systemd stops this unit with SIGTERM. Draining first means an in-flight AI
+// reply finishes, Socket.IO clients get a clean disconnect, and Mongo closes its
+// sockets instead of the process vanishing mid-write. The timer is the safety
+// net for anything that refuses to finish.
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`⏹  ${signal} received — draining connections…`);
+  const force = setTimeout(() => {
+    console.error('⏹  drain timed out — exiting anyway');
+    process.exit(1);
+  }, 12000);
+  force.unref();
+  try { io.close(); } catch (_e) { /* never listened */ }
+  try { await mongoose.connection.close(false); } catch (_e) { /* already closed */ }
+  console.log('⏹  clean exit');
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
 // ─── Connect & Start ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
+// Loopback by default: the gateway (which the tunnel exposes) is the only way in,
+// so the API is not also reachable directly over Wi-Fi/Tailscale. Set
+// BACKEND_HOST=0.0.0.0 deliberately if a trusted client on the LAN needs it.
+const HOST = process.env.BACKEND_HOST || '127.0.0.1';
 
 async function startServer() {
   // A short selection timeout used to drop the app onto a throwaway in-memory
@@ -207,8 +298,8 @@ async function startServer() {
   // request — start it only once the database is really up.
   require('./services/channelScheduler').start();
 
-  httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
+  httpServer.listen(PORT, HOST, () => {
+    console.log(`🚀 Server running on http://${HOST}:${PORT}`);
     console.log(`📡 Socket.IO ready`);
   });
 }

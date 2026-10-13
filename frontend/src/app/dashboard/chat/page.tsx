@@ -7,12 +7,14 @@ import {
   CreditCard, FileText, ChevronDown, ChevronUp, Check,
   Brain, Cloud, Cpu, MessageSquare, Search, Settings2, Square
 } from 'lucide-react'
-import { chatApi } from '@/lib/api'
+import { chatApi, flowApi } from '@/lib/api'
+import { getApiUrl } from '@/lib/auth'
 import { useAuth } from '@/contexts/AuthContext'
 import toast from 'react-hot-toast'
 import ReactMarkdown from 'react-markdown'
 import Link from 'next/link'
 import { PushPostModal } from '@/components/PushPostModal'
+import { downloadMedia } from '@/lib/download'
 
 interface Attachment { name: string; mimeType: string; data: string; size: number }
 interface Artifact   { title: string; type: string; code: string; language: string }
@@ -29,9 +31,21 @@ interface AIModel {
   availability?: string; servable?: boolean; pricing?: { prompt: number; completion: number } | null
 }
 
+/**
+ * A readable name for a model id the API did not describe.
+ *
+ * Every id is `omniroute/<upstream>/<model>`, so the last segment is the model the
+ * customer actually picked — showing the full path here would leak routing detail into
+ * the UI and read as noise next to the friendly names the API normally supplies.
+ */
+const prettyModelName = (id: string) => {
+  const bare = id.includes('/') ? id.slice(id.lastIndexOf('/') + 1) : id
+  return bare.replace(/[-_]/g, ' ').replace(/\b[a-z]/g, c => c.toUpperCase())
+}
+
 const SKILL_OPTIONS = [
   { id: 'general',    name: 'General AI',    icon: Bot,       desc: 'Conversational assistant',        color: 'text-cyan-400' },
-  { id: 'flow',       name: 'Google Flow',    icon: Sparkles,  desc: 'Veo videos & Nano images',       color: 'text-emerald-400' },
+  { id: 'flow',       name: 'AI Media',       icon: Sparkles,  desc: 'Plan-based image limits & Flow video', color: 'text-emerald-400' },
   { id: 'webapp',     name: 'Web App',        icon: Globe,     desc: 'Single-file HTML/Tailwind apps', color: 'text-blue-400' },
   { id: 'game',       name: 'HTML5 Game',     icon: Gamepad2,  desc: 'Playable canvas games',          color: 'text-purple-400' },
   { id: 'program',    name: 'Code Tool',      icon: Code2,     desc: 'Scripts & utilities',            color: 'text-green-400' },
@@ -48,10 +62,14 @@ export default function ChatPage() {
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
   const [mode, setMode] = useState<'api' | 'local' | 'contentbot'>('api')
-  const [selectedModel, setSelectedModel] = useState<string>('nvidia/nemotron-3.5-lightning:free')
+  // Only a first guess: the model list below replaces it with the recommended
+  // free model of whatever the API actually serves (see the loaders at 118/127).
+  const [selectedModel, setSelectedModel] = useState<string>('omniroute/gemini/gemini-2.5-flash')
   const [selectedSkill, setSelectedSkill] = useState<string>('general')
   const [models, setModels] = useState<AIModel[]>([])
   const [lmStudioOnline, setLmStudioOnline] = useState(false)
+  const [modelsError, setModelsError] = useState('')
+  const [modelsSignedOut, setModelsSignedOut] = useState(false)
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [tokenQuota, setTokenQuota] = useState<any>(null)
   const [activeArtifact, setActiveArtifact] = useState<Artifact | null>(null)
@@ -64,10 +82,11 @@ export default function ChatPage() {
   const [skillPickerOpen, setSkillPickerOpen] = useState(false)
   const [modePickerOpen, setModePickerOpen] = useState(false)
 
-  // Google Flow Media Settings (Nano Banana 2 & Omni Flash 1.1 Defaults)
-  const [flowModel, setFlowModel] = useState<string>('nano-banana-2')
+  // App image service plus Google Flow video settings.
+  const [flowModel, setFlowModel] = useState<string>('nano-banana-pro')
   const [flowAspectRatio, setFlowAspectRatio] = useState<string>('16:9')
   const [flowMediaType, setFlowMediaType] = useState<'image' | 'video'>('image')
+  const [flowPoolStatus, setFlowPoolStatus] = useState<{ success?: boolean; houseAccounts?: { count?: number } } | null>(null)
 
   // Push Post with AI (Auto-Publish to Social Channels)
   const [pushPostOpen, setPushPostOpen] = useState(false)
@@ -84,9 +103,26 @@ export default function ChatPage() {
 
   useEffect(() => {
     loadConversations(); loadModels(); loadQuota()
-    const handleLeave = () => { try { navigator.sendBeacon('/api/chat/lm-studio/unload') } catch {} chatApi.unloadModel().catch(() => {}) }
+    // Real page-leave: hand the RAM back, but keep the LM Studio daemon alive for
+    // 90s so a reload re-uses it instead of paying a cold restart. keepalive lets
+    // the request survive the page going away.
+    const handleLeave = () => {
+      try {
+        fetch(`${getApiUrl()}/chat/lm-studio/unload`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ stopServer: true, graceSeconds: 90 }),
+          keepalive: true,
+        }).catch(() => {})
+      } catch {}
+    }
     window.addEventListener('beforeunload', handleLeave)
-    return () => { window.removeEventListener('beforeunload', handleLeave); chatApi.unloadModel().catch(() => {}) }
+    // Tab switch inside the dashboard: free the MODEL but keep the server alive,
+    // so returning to chat is instant instead of a 90s-grace cold restart.
+    return () => {
+      window.removeEventListener('beforeunload', handleLeave)
+      chatApi.unloadModel(undefined, { stopServer: false }).catch(() => {})
+    }
   }, [])
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, sending])
@@ -105,22 +141,53 @@ export default function ChatPage() {
   useEffect(() => {
     if ((user as any)?.chatSettings) {
       const cs = (user as any).chatSettings
-      if (cs.flowImageModel) setFlowModel(cs.flowImageModel)
+      setFlowModel(cs.flowImageModel || 'nano-banana-pro')
       if (cs.flowAspectRatio) setFlowAspectRatio(cs.flowAspectRatio)
     }
   }, [user])
+
+  useEffect(() => {
+    if (selectedSkill !== 'flow') return
+    let active = true
+    const refresh = () => {
+      if (document.visibilityState === 'hidden') return
+      flowApi.getStatus()
+        .then(status => { if (active) setFlowPoolStatus(status) })
+        .catch(() => { if (active) setFlowPoolStatus({ success: false }) })
+    }
+    refresh()
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', refresh)
+    return () => {
+      active = false
+      window.removeEventListener('focus', refresh)
+      document.removeEventListener('visibilitychange', refresh)
+    }
+  }, [selectedSkill])
+
+  const sharedImagePoolReady = flowPoolStatus?.success === true && (flowPoolStatus.houseAccounts?.count || 0) > 0
 
   const loadQuota = async () => { try { const r: any = await chatApi.getQuota(); if (r.success) setTokenQuota(r.quota) } catch {} }
 
   const loadModels = async () => {
     try {
       const d: any = await chatApi.getModels()
-      if (d.models) {
-        setModels(d.models); setLmStudioOnline(Boolean(d.lmStudioOnline))
-        const avail = d.models.filter((m: AIModel) => m.source === mode)
-        if (avail.length > 0) setSelectedModel((avail.find((m: AIModel) => m.id === selectedModel) || avail[0]).id)
+      // An expired JWT makes the API answer with its anonymous view, which carries no
+      // `models` key at all. That used to surface as an empty "No models available"
+      // picker — indistinguishable from a broken site, so it is named for what it is.
+      if (!Array.isArray(d.models)) {
+        setModels([]); setModelsSignedOut(true)
+        setModelsError('Your session expired, so the free models are hidden.')
+        return
       }
-    } catch {}
+      setModels(d.models); setLmStudioOnline(Boolean(d.lmStudioOnline))
+      setModelsError(''); setModelsSignedOut(false)
+      const avail = d.models.filter((m: AIModel) => m.source === mode)
+      if (avail.length > 0) setSelectedModel((avail.find((m: AIModel) => m.id === selectedModel) || avail[0]).id)
+    } catch (err: any) {
+      setModels([])
+      setModelsError(err?.message || 'Could not load the free models.')
+    }
   }
 
   useEffect(() => {
@@ -195,6 +262,7 @@ export default function ChatPage() {
         {
           flowModel,
           flowAspectRatio,
+          flowMediaType,
         }
       )
       setMessages(prev => [...prev, d.aiMessage]); loadQuota()
@@ -233,6 +301,8 @@ export default function ChatPage() {
 
   const currentModels = models.filter(m => m.source === mode)
   const currentModelObj = models.find(m => m.id === selectedModel)
+  // Name before id: the picker and the header should never show a raw routing path.
+  const modelLabel = currentModelObj?.name || prettyModelName(selectedModel)
   const activeSkillObj  = SKILL_OPTIONS.find(s => s.id === selectedSkill) || SKILL_OPTIONS[0]
   const SkillIcon = activeSkillObj.icon
 
@@ -339,7 +409,7 @@ export default function ChatPage() {
               <Zap className="w-3.5 h-3.5 text-white" />
             </div>
             <div className="min-w-0">
-              <p className="text-xs font-semibold text-white truncate">{currentModelObj?.name || selectedModel}</p>
+              <p className="text-xs font-semibold text-white truncate">{modelLabel}</p>
               <p className="text-[10px] text-dark-600 truncate hidden sm:block">{activeSkillObj.name} · {mode.toUpperCase()}</p>
             </div>
           </div>
@@ -365,14 +435,14 @@ export default function ChatPage() {
                 </div>
               </div>
               <h3 className="text-xl font-bold gradient-text mb-1">Ready to chat</h3>
-              <p className="text-dark-500 text-sm mb-1">{currentModelObj?.name || selectedModel}</p>
+              <p className="text-dark-500 text-sm mb-1">{modelLabel}</p>
               <p className="text-dark-700 text-xs mb-6 max-w-xs">
                 {mode === 'api' ? 'All models free · 1M tokens / 7 days' : 'Local models · No quota · Auto RAM-free'}
               </p>
               {/* Quick starters */}
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-w-lg w-full text-left">
                 {[
-                  { skill: 'flow', icon: Sparkles, text: 'Google Flow Video/Photo', color: 'text-emerald-400', bg: 'rgba(16,185,129,0.08)', border: 'rgba(16,185,129,0.22)' },
+                  { skill: 'flow', icon: Sparkles, text: 'AI Images & Flow Video', color: 'text-emerald-400', bg: 'rgba(16,185,129,0.08)', border: 'rgba(16,185,129,0.22)' },
                   { skill: 'game', icon: Gamepad2, text: 'Build a Flappy Bird clone', color: 'text-purple-400', bg: 'rgba(124,58,237,0.07)', border: 'rgba(124,58,237,0.18)' },
                   { skill: 'webapp', icon: Globe, text: 'Create a web app UI', color: 'text-blue-400', bg: 'rgba(6,182,212,0.06)', border: 'rgba(6,182,212,0.18)' },
                   { skill: 'visualizer', icon: BarChart3, text: 'Build a data dashboard', color: 'text-amber-400', bg: 'rgba(245,158,11,0.06)', border: 'rgba(245,158,11,0.18)' },
@@ -424,17 +494,35 @@ export default function ChatPage() {
                                     alt={alt || 'Generated Media'}
                                     className="rounded-xl border border-white/10 max-h-96 object-cover shadow-lg"
                                   />
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setPushPostMediaUrl(s)
-                                      setPushPostPrompt(messages[i - 1]?.content || '')
-                                      setPushPostOpen(true)
-                                    }}
-                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-black bg-gradient-to-r from-emerald-400 to-cyan-400 hover:opacity-90 shadow transition-all cursor-pointer"
-                                  >
-                                    <Send className="w-3.5 h-3.5" /> 🚀 Push Post with AI
-                                  </button>
+                                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => downloadMedia(s, '1k', 'herova_image')}
+                                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-dark-200 bg-white/[0.06] hover:bg-white/[0.12] border border-white/10 shadow transition-all cursor-pointer"
+                                      title="Download Original High Resolution (1K HD)"
+                                    >
+                                      <Download className="w-3.5 h-3.5 text-emerald-400" /> ⬇ 1K (HD)
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => downloadMedia(s, '2k', 'herova_image')}
+                                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-brand-200 bg-brand-500/20 hover:bg-brand-500/30 border border-brand-400/30 shadow transition-all cursor-pointer"
+                                      title="Upscale & Download 2K Ultra HD (2048px)"
+                                    >
+                                      <Sparkles className="w-3.5 h-3.5 text-brand-300" /> ⬆ 2K (Ultra HD)
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setPushPostMediaUrl(s)
+                                        setPushPostPrompt(messages[i - 1]?.content || '')
+                                        setPushPostOpen(true)
+                                      }}
+                                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-black bg-gradient-to-r from-emerald-400 to-cyan-400 hover:opacity-90 shadow transition-all cursor-pointer"
+                                    >
+                                      <Send className="w-3.5 h-3.5" /> 🚀 Push Post with AI
+                                    </button>
+                                  </div>
                                 </div>
                               )
                             }
@@ -455,17 +543,26 @@ export default function ChatPage() {
                                   controls
                                   className="rounded-xl border border-white/10 max-h-80 w-full object-cover shadow-lg bg-black"
                                 />
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setPushPostMediaUrl(vUrl)
-                                    setPushPostPrompt(messages[i - 1]?.content || '')
-                                    setPushPostOpen(true)
-                                  }}
-                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-black bg-gradient-to-r from-cyan-400 to-emerald-400 hover:opacity-90 shadow transition-all cursor-pointer"
-                                >
-                                  <Send className="w-3.5 h-3.5" /> 🚀 Push Video Post with AI
-                                </button>
+                                <div className="flex flex-wrap items-center gap-2 pt-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => downloadMedia(vUrl, '1k', 'herova_video')}
+                                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-dark-200 bg-white/[0.06] hover:bg-white/[0.12] border border-white/10 shadow transition-all cursor-pointer"
+                                  >
+                                    <Download className="w-3.5 h-3.5 text-cyan-400" /> ⬇ Download Video
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setPushPostMediaUrl(vUrl)
+                                      setPushPostPrompt(messages[i - 1]?.content || '')
+                                      setPushPostOpen(true)
+                                    }}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-black bg-gradient-to-r from-cyan-400 to-emerald-400 hover:opacity-90 shadow transition-all cursor-pointer"
+                                  >
+                                    <Send className="w-3.5 h-3.5" /> 🚀 Push Video Post with AI
+                                  </button>
+                                </div>
                               </div>
                             )
                           }
@@ -502,7 +599,7 @@ export default function ChatPage() {
 
                   {msg.role === 'assistant' && (
                     <p className="text-[10px] text-dark-700 font-mono pt-1" style={{ borderTop: '1px solid rgba(255,255,255,0.04)' }}>
-                      {msg.model || selectedModel}{msg.tokens ? ` · ${msg.tokens.toLocaleString()} tokens` : ''}
+                      {msg.model ? prettyModelName(msg.model) : modelLabel}{msg.tokens ? ` · ${msg.tokens.toLocaleString()} tokens` : ''}
                     </p>
                   )}
                 </div>
@@ -581,7 +678,7 @@ export default function ChatPage() {
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-all w-full max-w-xs"
                 style={{ background: 'rgba(124,58,237,0.12)', border: '1px solid rgba(124,58,237,0.3)', color: '#c4b5fd' }}>
                 <Sparkles className="w-3.5 h-3.5 text-brand-400 flex-shrink-0" />
-                <span className="truncate">{currentModelObj?.name || selectedModel}</span>
+                <span className="truncate">{modelLabel}</span>
                 <ChevronUp className={`w-3.5 h-3.5 flex-shrink-0 ml-auto transition-transform ${modelPickerOpen ? '' : 'rotate-180'}`} />
               </button>
 
@@ -614,9 +711,19 @@ export default function ChatPage() {
                     </div>
                   ))}
                   {currentModels.length === 0 && (
-                    <p className="text-center text-dark-500 text-xs py-6">
-                      {mode === 'local' ? '⚠️ LM Studio offline — try Cloud API mode' : 'No models available'}
-                    </p>
+                    <div className="px-4 py-6 text-center">
+                      <p className="text-dark-500 text-xs">
+                        {modelsError || (mode === 'local'
+                          ? '⚠️ LM Studio is offline — switch to Cloud API mode'
+                          : 'No models available right now')}
+                      </p>
+                      {modelsSignedOut && (
+                        <Link href="/login"
+                          className="mt-2 inline-block text-[11px] font-semibold text-brand-300 hover:text-white">
+                          Sign in again
+                        </Link>
+                      )}
+                    </div>
                   )}
                 </div>
               )}
@@ -652,12 +759,13 @@ export default function ChatPage() {
             </div>
           </div>
 
-          {/* ── Google Flow Media Controls (active when Flow skill is chosen) ── */}
+          {/* ── AI media controls (active when AI Media is chosen) ── */}
           {selectedSkill === 'flow' && (
-            <div className="mx-3 mb-2 px-3 py-2 rounded-xl flex flex-wrap items-center justify-between gap-2 border border-emerald-500/25 bg-emerald-950/25 text-xs animate-fade-in shadow-inner">
+            <>
+              <div className="mx-3 mb-2 px-3 py-2 rounded-xl flex flex-wrap items-center justify-between gap-2 border border-emerald-500/25 bg-emerald-950/25 text-xs animate-fade-in shadow-inner">
               <div className="flex flex-wrap items-center gap-2.5">
                 <span className="flex items-center gap-1 font-semibold text-emerald-400">
-                  <Sparkles className="w-3.5 h-3.5" /> Google Flow
+                  <Sparkles className="w-3.5 h-3.5" /> AI Media
                 </span>
 
                 {/* Media Type Toggle */}
@@ -666,7 +774,7 @@ export default function ChatPage() {
                     type="button"
                     onClick={() => {
                       setFlowMediaType('image')
-                      if (flowModel.includes('omni') || flowModel.includes('veo')) setFlowModel('nano-banana-2')
+                      setFlowModel((user as any)?.chatSettings?.flowImageModel || 'nano-banana-pro')
                     }}
                     className={`px-2 py-0.5 rounded text-[11px] font-medium transition-all ${
                       flowMediaType === 'image' ? 'bg-emerald-500 text-black font-semibold shadow-sm' : 'text-dark-400 hover:text-white'
@@ -678,7 +786,7 @@ export default function ChatPage() {
                     type="button"
                     onClick={() => {
                       setFlowMediaType('video')
-                      if (flowModel.includes('banana')) setFlowModel('omni-flash')
+                      if (!flowModel.includes('omni') && !flowModel.includes('veo')) setFlowModel('omni-flash')
                     }}
                     className={`px-2 py-0.5 rounded text-[11px] font-medium transition-all ${
                       flowMediaType === 'video' ? 'bg-cyan-500 text-black font-semibold shadow-sm' : 'text-dark-400 hover:text-white'
@@ -688,31 +796,34 @@ export default function ChatPage() {
                   </button>
                 </div>
 
-                {/* Model Selector */}
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[11px] text-dark-400">Model:</span>
-                  <select
-                    value={flowModel}
-                    onChange={e => setFlowModel(e.target.value)}
-                    className="bg-black/70 border border-emerald-500/30 rounded-lg px-2.5 py-1 text-xs text-white focus:outline-none focus:border-emerald-400"
-                  >
-                    {flowMediaType === 'image' ? (
-                      <>
-                        <option value="nano-banana-2">Nano Banana 2 (2.1) — Default</option>
-                        <option value="nano-banana-pro">Nano Banana Pro — Max Quality</option>
-                        <option value="nano-banana-2-lite">Nano Banana 2 Lite — Fast</option>
-                        <option value="ui-default">Workspace Default</option>
-                      </>
-                    ) : (
-                      <>
-                        <option value="omni-flash">Omni Flash 1.1 — Default Video</option>
-                        <option value="veo-3-1-quality">Veo 3.1 Quality — Cinematic</option>
-                        <option value="veo-3-1-fast">Veo 3.1 Fast — Quick Clips</option>
-                        <option value="ui-default">Workspace Default</option>
-                      </>
-                    )}
-                  </select>
-                </div>
+                {flowMediaType === 'image' ? (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] text-dark-400">Image model:</span>
+                    <select
+                      aria-label="Image generation model"
+                      value={flowModel}
+                      onChange={e => setFlowModel(e.target.value)}
+                      className="bg-black/70 border border-emerald-500/30 rounded-lg px-2.5 py-1 text-xs text-white focus:outline-none focus:border-emerald-400"
+                    >
+                      <option value="nano-banana-pro">Nano Banana Pro — default</option>
+                      <option value="nano-banana-2">Nano Banana 2.1</option>
+                    </select>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] text-dark-400">Model:</span>
+                    <select
+                      value={flowModel}
+                      onChange={e => setFlowModel(e.target.value)}
+                      className="bg-black/70 border border-emerald-500/30 rounded-lg px-2.5 py-1 text-xs text-white focus:outline-none focus:border-emerald-400"
+                    >
+                      <option value="omni-flash">Omni Flash 1.1 — Default Video</option>
+                      <option value="veo-3-1-quality">Veo 3.1 Quality — Cinematic</option>
+                      <option value="veo-3-1-fast">Veo 3.1 Fast — Quick Clips</option>
+                      <option value="ui-default">Workspace Default</option>
+                    </select>
+                  </div>
+                )}
 
                 {/* Ratio Selector */}
                 <div className="flex items-center gap-1.5">
@@ -731,9 +842,21 @@ export default function ChatPage() {
               </div>
 
               <span className="text-[10px] text-emerald-400/80 font-mono hidden md:inline">
-                Zero API Cost · Linked via Google Flow Bridge
+                {flowMediaType === 'image' ? 'Nano Banana first · Agnes image fallback' : 'Google Flow video'}
               </span>
-            </div>
+              </div>
+              {flowMediaType === 'image' ? (
+              <p className={`mt-2 text-[11px] leading-relaxed ${sharedImagePoolReady ? 'text-emerald-300' : 'text-amber-200'}`}>
+                {flowPoolStatus === null
+                  ? 'Checking the shared Google Flow image accounts…'
+                  : flowPoolStatus.success === false
+                    ? <>Could not check image availability. <Link href="/dashboard/connections" className="underline">Check Connections</Link>.</>
+                    : sharedImagePoolReady
+                      ? 'Shared Google Flow image generation is ready.'
+                      : <>The shared Flow pool is unavailable. HerovaAi tries Nano Banana 2.1 first, then the Agnes image fallback. Connect Flow to use your selected Nano Banana model directly; personal Flow may use your Google allowance. <Link href="/dashboard/connections" className="underline">Connect Flow</Link>.</>}
+              </p>
+              ) : null}
+            </>
           )}
 
           {/* ── Input + attach + send ── */}
@@ -744,7 +867,7 @@ export default function ChatPage() {
             <button type="button" onClick={() => fileInputRef.current?.click()}
               className="p-3 rounded-xl flex-shrink-0 transition-all hover:scale-105"
               style={{ background: 'rgba(6,182,212,0.07)', border: '1px solid rgba(6,182,212,0.15)' }}
-              title="Attach file (Gemini+ multimodal)">
+              title="Attach file (works with the free vision models)">
               <Paperclip className="w-4 h-4 text-cyan-400" />
             </button>
 
@@ -753,7 +876,7 @@ export default function ChatPage() {
               placeholder={
                 selectedSkill === 'flow'
                   ? flowMediaType === 'image'
-                    ? "Describe the image to generate with Nano Banana 2 (e.g. 'cyberpunk street in rain, 4k photorealistic')..."
+                    ? "Describe the image you want to generate..."
                     : "Describe the video clip to generate with Omni Flash 1.1 (e.g. 'cinematic aerial drone shot of waterfall')..."
                   : "Type your message... (Enter to send)"
               }

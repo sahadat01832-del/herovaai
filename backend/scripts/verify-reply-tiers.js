@@ -16,9 +16,9 @@ const { execFile } = require('child_process');
 const mongoose = require('mongoose');
 
 const CUSTOMER = '8801700000009@c.us';
-const CLOUD_ID = process.env.TIER_CLOUD_ID || 'groq/qwen/qwen3.8-27b';
+const CLOUD_ID = process.env.TIER_CLOUD_ID || 'omniroute/gemini/gemini-2.5-flash';
 const LOCAL_ID = process.env.TIER_LOCAL_ID || 'qwen2-0.5b-uncensored';
-const BOGUS = 'groq/this-model-does-not-exist-anywhere';
+const BOGUS = 'omniroute/this-model-does-not-exist-anywhere';
 
 const WhatsAppSession = require('../src/models/WhatsAppSession');
 const User = require('../src/models/User');

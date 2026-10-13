@@ -24,6 +24,10 @@ API_PORT="${API_PORT:-5000}"
 NODE_BIN="${NODE_BIN:-/home/sahadat/.nvm/versions/node/v26.8.2/bin/node}"
 CLOUDFLARED="${CLOUDFLARED:-$(command -v cloudflared)}"
 
+# Real quick-tunnel hostnames always contain a hyphen; api.trycloudflare.com (the
+# service endpoint in cloudflared error lines) must never be read as a public URL.
+URL_RE='https://[a-z0-9]+(-[a-z0-9]+)+\.trycloudflare\.com'
+
 mkdir -p "$LOGS"
 
 gw_pid()   { pgrep -f "node .*scripts/gateway.js" | head -1; }
@@ -96,16 +100,18 @@ start() {
     else
       echo "opening Cloudflare quick tunnel…"
       : > "$TUNNEL_LOG"
-      setsid nohup "$CLOUDFLARED" tunnel --url "http://localhost:$GATEWAY_PORT" --no-autoupdate \
+      # HTTP/2 over TCP: the UDP/QUIC path stalls on some ISPs, leaving a tunnel
+      # that looks alive but never connects (see tunnel-unit.sh).
+      setsid nohup "$CLOUDFLARED" tunnel --url "http://localhost:$GATEWAY_PORT" --no-autoupdate --protocol http2 \
         > "$TUNNEL_LOG" 2>&1 < /dev/null &
       for _ in $(seq 1 40); do
-        grep -qoE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" && break
+        grep -qoE "$URL_RE" "$TUNNEL_LOG" && break
         sleep 0.5
       done
     fi
   fi
 
-  url="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" | head -1)"
+  url="$(grep -oE "$URL_RE" "$TUNNEL_LOG" | head -1)"
   # A named tunnel has no generated hostname in the log; it is the one you chose.
   [ -n "$url" ] || url="https://${TUNNEL_HOSTNAME:-}"
   [ "$url" != "https://" ] || { echo "❌ no tunnel URL yet — see $TUNNEL_LOG"; return 1; }

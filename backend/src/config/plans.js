@@ -7,9 +7,14 @@
  * re-price without a deploy, but the *server* always reads the number from here
  * — a browser can never name its own price.
  *
- *   free        ৳0      — 1,000,000 cloud tokens per 7 days
- *   pro         ৳100/mo — 2,000,000 cloud tokens per 7 days
- *   enterprise  ৳300/mo — 5,000,000 cloud tokens per 7 days
+ *   free        ৳0      — 1,000,000 cloud tokens per 7 days, 10 images/day
+ *   pro         ৳100/mo — 2,000,000 cloud tokens per 7 days, 100 images/billing cycle
+ *   enterprise  ৳300/mo — 5,000,000 cloud tokens per 7 days, unlimited images
+ *
+ * Every tier draws on the same model set — the free models served by the deployment's
+ * OmniRoute gateway — so no plan promises a paid or frontier model that the picker cannot
+ * offer. What a plan buys is throughput, bigger local models, image generations, channels and
+ * automation, and the feature lists below say only that.
  */
 
 const CURRENCY = 'BDT';
@@ -21,10 +26,12 @@ const PLANS = [
     bdt: 0,
     period: 'forever',
     tokens: 1000000,
+    imageQuota: { limit: 10, period: 'day', unlimited: false },
     blurb: 'Everyday chatting, WhatsApp automation and the standard cloud models.',
     features: [
       'Local on-device models — free and unmetered',
       '1,000,000 cloud tokens per 7 days',
+      '10 AI image generations each day',
       'WhatsApp assistant with business memory',
       'Channel connections: Messenger, Facebook, Telegram',
       'Memory released automatically when idle',
@@ -36,14 +43,16 @@ const PLANS = [
     bdt: 100,
     period: 'per month',
     tokens: 2000000,
+    imageQuota: { limit: 100, period: 'billing cycle', unlimited: false },
     popular: true,
     blurb: 'Heavier throughput, larger local models and daily auto-posting.',
     features: [
       'Larger local models (3B – 26B)',
       '2,000,000 cloud tokens per 7 days',
+      '100 AI image generations per billing cycle',
       'Daily auto-post to Facebook, Instagram and Telegram',
       'AI auto-reply on Messenger, Instagram, Telegram and WhatsApp',
-      'Gemini+ multimodal: images, video, documents',
+      'Vision on the free models: images, screenshots and documents',
     ],
   },
   {
@@ -52,10 +61,12 @@ const PLANS = [
     bdt: 300,
     period: 'per month',
     tokens: 5000000,
+    imageQuota: { limit: null, period: 'billing cycle', unlimited: true },
     blurb: 'For high-volume operations and multi-number, multi-channel setups.',
     features: [
       '5,000,000 cloud tokens per 7 days',
-      'Frontier models: GPT-4o, Claude, Gemini Pro',
+      'Unlimited AI image generations',
+      'Every free model in the picker, vision included',
       'Multiple WhatsApp numbers + YouTube / Google channels',
       'Unlimited memory entries, personas and post topics',
       'Priority replies and admin quota controls',
@@ -86,6 +97,14 @@ function quotaFor(tier) {
   return BY_ID[tier]?.tokens || BY_ID.free.tokens;
 }
 
+/** Successful image generations included in each plan. */
+function imageQuotaFor(tier) {
+  return BY_ID[tier]?.imageQuota || BY_ID.free.imageQuota;
+}
+
 const isPaidTier = (tier) => tier === 'pro' || tier === 'enterprise';
 
-module.exports = { CURRENCY, PLANS, publicPlans, priceFor, quotaFor, isPaidTier, plan: (id) => BY_ID[id] || null };
+module.exports = {
+  CURRENCY, PLANS, publicPlans, priceFor, quotaFor, imageQuotaFor, isPaidTier,
+  plan: (id) => BY_ID[id] || null,
+};

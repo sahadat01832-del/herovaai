@@ -11,8 +11,10 @@ Restart=always
 RestartSec=3
 Environment=NODE_ENV=production
 Environment=GATEWAY_PORT=8088
-Environment=WEB_PORT=3001
+Environment=WEB_PORT=3003
 Environment=API_PORT=5000
+Environment=STUDIO_PORT=3002
+Environment=GATEWAY_EXTRA_PORTS=3001
 StandardOutput=append:/home/sahadat/herovaai/logs/gateway.log
 StandardError=append:/home/sahadat/herovaai/logs/gateway.log
 

@@ -12,7 +12,24 @@ const cloudAIService = require('../services/cloudAIService');
 const catalogService = require('../services/catalogService');
 const tokenQuotaService = require('../services/tokenQuotaService');
 const flowService = require('../services/flowService');
+const imageGenerationService = require('../services/imageGenerationService');
 const path = require('path');
+
+function imageQuotaSummary(quota) {
+  if (quota?.unlimited) {
+    return `Unlimited image generations on your plan (${quota.used} generated this billing cycle).`;
+  }
+  const period = quota?.period === 'billing cycle' ? 'this billing cycle' : 'today';
+  return `${quota?.remaining ?? 0} of ${quota?.limit ?? 0} images left ${period}.`;
+}
+
+function imageQuotaLimitMessage(quota) {
+  const period = quota?.period === 'billing cycle' ? 'this billing cycle' : 'today';
+  const reset = quota?.resetsAt
+    ? ` It resets ${quota.period === 'billing cycle' ? 'with your next plan cycle' : 'at midnight UTC'} (${new Date(quota.resetsAt).toISOString().slice(0, 10)} UTC).`
+    : '';
+  return `You’ve used all ${quota?.limit ?? 0} image generations ${period}.${reset}`;
+}
 
 function classifyModel(modelId, source = 'local') {
   const lower = (modelId || '').toLowerCase();
@@ -224,7 +241,7 @@ router.get('/conversations/:id', authenticate, async (req, res) => {
 // ─── Create a new conversation ─────────────────────────────────────────────
 router.post('/conversations', authenticate, async (req, res) => {
   try {
-    const { mode = 'api', model = 'nvidia/nemotron-3.5-lightning:free', skill = 'general' } = req.body;
+    const { mode = 'api', model = cloudAIService.DEFAULT_MODEL, skill = 'general' } = req.body;
     const convo = await Conversation.create({ userId: req.user._id, mode, model, skill });
     res.status(201).json({ success: true, conversation: convo });
   } catch (err) {
@@ -259,11 +276,13 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
     if (!convo) return res.status(404).json({ success: false, message: 'Conversation not found' });
 
     const chatMode = mode || convo.mode || 'api';
-    const chosenModel = model || convo.model || 'nvidia/nemotron-3.5-lightning:free';
+    const chosenModel = model || convo.model || cloudAIService.DEFAULT_MODEL;
     const chosenSkill = skill || convo.skill || 'general';
+    const mediaIntent = detectMediaGenerationIntent(message);
+    const isMediaGenerationRequest = chosenSkill === 'flow' || Boolean(mediaIntent);
 
     // ── Check Token Quota for API Models (1M Tokens / 7 Days limit) ─────────
-    if (chatMode === 'api') {
+    if (chatMode === 'api' && !isMediaGenerationRequest) {
       const quotaStatus = await tokenQuotaService.checkQuota(req.user._id, 200);
       if (!quotaStatus.allowed) {
         return res.status(429).json({
@@ -278,7 +297,7 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
     }
 
     // Check Local Paid vs Free Model permission (LM Studio only)
-    if (chatMode === 'local' && chosenModel) {
+    if (chatMode === 'local' && chosenModel && !isMediaGenerationRequest) {
       const modelInfo = classifyModel(chosenModel, 'local');
       if (modelInfo.isPaid && req.user.role !== 'admin' && !req.user.contentbotApiKey) {
         return res.status(403).json({
@@ -318,57 +337,86 @@ router.post('/conversations/:id/message', authenticate, async (req, res) => {
     let failedOverFrom = null;
     let tokensUsed = 0;
 
-    // Detect auto-intent for image or video generation
-    const mediaIntent = detectMediaGenerationIntent(message);
-
     // ── Skill: Google Flow Studio or Auto-Detected Media Intent ─────────────
     if (chosenSkill === 'flow' || mediaIntent) {
-      const isVideo = mediaIntent
-        ? mediaIntent.type === 'video'
-        : /\b(video|clip|movie|animation|animate|motion|film|veo|omni)\b/i.test(message);
+      // The Image/Video toggle in the chat composer is authoritative when set. It
+      // used to be ignored, so picking "Video" with a prompt that had no video
+      // keyword silently sent an IMAGE request to a VIDEO model. Only fall back
+      // to intent detection / keyword sniffing when no explicit type was chosen.
+      const requestedType = String(req.body.flowMediaType || '').trim().toLowerCase();
+      let isVideo;
+      if (requestedType === 'video' || requestedType === 'image') {
+        isVideo = requestedType === 'video';
+      } else if (mediaIntent) {
+        isVideo = mediaIntent.type === 'video';
+      } else {
+        isVideo = /\b(video|clip|movie|animation|animate|motion|film|veo|omni)\b/i.test(message);
+      }
       const mediaType = isVideo ? 'video' : 'image';
       const promptToUse = (mediaIntent?.prompt || message || '').trim();
 
       const userSettings = req.user?.chatSettings || {};
-      const defaultImageModel = userSettings.flowImageModel || 'nano-banana-2';
+      const defaultImageModel = userSettings.flowImageModel || 'nano-banana-pro';
       const defaultVideoModel = userSettings.flowVideoModel || 'omni-flash';
       const defaultRatio = userSettings.flowAspectRatio || '16:9';
-      const chosenFlowModel = req.body.flowModel || (isVideo ? defaultVideoModel : defaultImageModel);
+      // Keep the model on the same side as the type: an image request must never
+      // be sent to a video model (or vice versa) just because the picker said so.
+      // `ui-default` is deliberately in neither set — the Flow workspace picks.
+      const IMAGE_MODEL_IDS = new Set([
+        'nano-banana-2', 'nano-banana-pro', 'nano-banana-2-lite',
+        'agnes/agnes-image-2.0-flash', 'agy/gemini-3.1-flash-image',
+        'ui-default',
+      ]);
+      const VIDEO_MODEL_IDS = new Set([
+        'omni-flash', 'veo-3-1-quality', 'veo-3-1-fast', 'omni-flash-1.1',
+        'agnes/agnes-video-2.5-flash',
+      ]);
+      let chosenFlowModel = req.body.flowModel || (isVideo ? defaultVideoModel : defaultImageModel);
+      if (isVideo && IMAGE_MODEL_IDS.has(chosenFlowModel)) chosenFlowModel = defaultVideoModel;
+      if (!isVideo && VIDEO_MODEL_IDS.has(chosenFlowModel)) chosenFlowModel = defaultImageModel;
       const chosenRatio = req.body.flowAspectRatio || defaultRatio;
 
       try {
-        const flowStatus = await flowService.getStatus();
-        if (!flowStatus.ready) {
-          if (chosenSkill === 'flow') {
-            aiResponse = `⚠️ **Google Flow account is not verified yet.**\n\nTo connect Google Flow:\n1. Open **Brave** and navigate to \`chrome://extensions\` (Enable Developer mode).\n2. Click **Load unpacked** and select: \`${flowService.extensionDirectory}\`\n3. Click the **Flow Login Bridge** extension icon and click **Connect Flow**.\n4. Complete the account selection in the Google chooser.\n5. Then try your prompt again!`;
-          } else {
-            aiResponse = `🎨 **Google Flow Media Generation**\n\nI detected a request to generate a **${mediaType}**: *"${promptToUse}"* using **${chosenFlowModel}**.\n\nYour Google Flow MCP session is not linked yet. To enable direct image and video generation with zero API cost:\n1. Go to **Dashboard > Connections > Google Flow**\n2. Open **Brave** and load the unpacked extension from: \`${flowService.extensionDirectory}\`\n3. Click **Connect Flow** to link your Google session.\n\nOnce linked, I will generate high-fidelity images (Nano Banana) and videos (Omni Flash / Veo 3.1) instantly!`;
-          }
-          modelUsed = `Google Flow (${chosenFlowModel})`;
-        } else {
-          const genResult = await flowService.generateMedia({
+        const genResult = mediaType === 'image'
+          ? await imageGenerationService.generate({
+            prompt: promptToUse,
+            ratio: chosenRatio,
+            model: chosenFlowModel,
+            user: req.user,
+            ip: req.ip,
+          })
+          : await flowService.generateMedia({
             prompt: promptToUse,
             mediaType,
             model: chosenFlowModel,
             ratio: chosenRatio,
+            accountId: flowService.accountIdForGeneration(req.user, mediaType),
           });
-          if (genResult.url) {
-            aiResponse = isVideo
-              ? `🎬 **Generated Video with Google Flow (${chosenFlowModel})**\n\nPrompt: *${promptToUse}*\n\n[▶ View / Download Video](${genResult.url})`
-              : `🖼️ **Generated Image with Google Flow (${chosenFlowModel})**\n\nPrompt: *${promptToUse}*\n\n![${promptToUse}](${genResult.url})`;
-          } else if (genResult.pending) {
-            aiResponse = `⏳ Google Flow is processing your ${mediaType} with model **${chosenFlowModel}** (Job ID: ${genResult.jobId || 'in progress'}). It will appear shortly!`;
-          } else {
-            aiResponse = `Flow generation did not return a file: ${genResult.error || 'Unknown error'}`;
-          }
-          modelUsed = `Google Flow (${chosenFlowModel})`;
+
+        if (genResult.url) {
+          const providerName = genResult.providerName || 'Google Flow';
+          const engineLabel = `${providerName} (${genResult.modelName || genResult.model || chosenFlowModel})`;
+          aiResponse = isVideo
+            ? `🎬 **Generated Video with ${providerName} (${genResult.modelName || genResult.model || chosenFlowModel})**\n\nPrompt: *${promptToUse}*\n\n[▶ View / Download Video](${genResult.url})`
+            : `🖼️ **Generated Image (${engineLabel})**\n\nPrompt: *${promptToUse}*\n\n![${promptToUse}](${genResult.url})\n\n[⬇ Download High-Res Image](${genResult.url})\n\n_${imageQuotaSummary(genResult.imageQuota)}_`;
+          modelUsed = engineLabel;
+        } else if (genResult.pending) {
+          const providerName = genResult.providerName || 'Google Flow';
+          aiResponse = `⏳ ${providerName} is processing your ${mediaType} with model **${genResult.modelName || chosenFlowModel}** (Job ID: ${genResult.jobId || 'in progress'}). It will appear shortly!`;
+          modelUsed = `${providerName} (${genResult.modelName || chosenFlowModel})`;
+        } else if (genResult.code === 'IMAGE_QUOTA_LIMIT') {
+          aiResponse = `🎨 ${imageQuotaLimitMessage(genResult.imageQuota)}`;
+          modelUsed = `${genResult.providerName || 'Google Flow'} (${genResult.modelName || genResult.model || chosenFlowModel})`;
+        } else {
+          aiResponse = `🎨 I could not finish that ${mediaType} just now (${genResult.error || 'please try again'}). Text answers work normally in the meantime.`;
+          modelUsed = `${genResult.providerName || 'Google Flow'} (${genResult.modelName || genResult.model || chosenFlowModel})`;
         }
       } catch (flowErr) {
-        aiResponse = `Google Flow error: ${flowErr.message}`;
+        aiResponse = `🎨 I could not finish that ${mediaType} just now (${flowErr.message}). Please try again in a few minutes.`;
         modelUsed = `Google Flow (${chosenFlowModel})`;
       }
 
-    // ── Mode: Cloud API Models (OpenRouter / Gemini+ / OpenAI) ───────────────
+    // ── Mode: Cloud API Models — the free models on the OmniRoute gateway ────
     } else if (chatMode === 'api') {
       const contextMessages = convo.messages.slice(-15).map(m => ({
         role: m.role,
@@ -830,9 +878,9 @@ router.get('/lm-studio/status', async (req, res) => {
 });
 
 // ─── Public model routing ──────────────────────────────────────────────────
-// Cloud ids carry their provider as a prefix (groq/…, nvidia/…), the Gemini and
-// Cohere families do not. Everything else is treated as a local LM Studio id.
-const CLOUD_ID_PATTERN = /^(groq|agnes|unorouter|llm7|ollama|nvidia|google|liquid|cohere|thinkingmachines|deepseek|openai)\//;
+// Cloud ids carry their provider as a prefix (omniroute/…, groq/…, nvidia/…);
+// the Gemini and Cohere families do not. Everything else is treated as local.
+const CLOUD_ID_PATTERN = /^(omniroute|groq|agnes|unorouter|llm7|ollama|nvidia|google|liquid|cohere|thinkingmachines|deepseek|openai)\//;
 const CLOUD_BARE_ID_PATTERN = /^(gemini|command-r)/i;
 
 /** True when the caller carries a valid JWT for an active user (dashboard owner). */
@@ -960,7 +1008,8 @@ router.post('/public/message', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Message cannot be empty' });
     }
 
-    const route = resolvePublicRoute(model);
+    const publicMediaIntent = detectMediaGenerationIntent(message);
+    const route = resolvePublicRoute(publicMediaIntent?.type === 'image' ? null : model);
     if (!route.ok) {
       return res.status(403).json({ success: false, code: route.code, message: route.message });
     }
@@ -989,6 +1038,55 @@ router.post('/public/message', async (req, res) => {
 
     let aiResponse = '';
     let modelUsed = route.model;
+
+    // ── Auto-detect image / video generation requests ─────────────────────────
+    if (publicMediaIntent) {
+      const isVideo = publicMediaIntent.type === 'video';
+      const promptToUse = publicMediaIntent.prompt || message;
+
+      if (isVideo) {
+        // Videos need a connected Flow account — guide the visitor to sign in.
+        aiResponse = `🎬 Video generation requires a connected Google Flow account. **Sign in** to connect your Google account and generate Veo 3.1 / Omni Flash videos directly in the chat!`;
+        modelUsed = 'HerovaAi';
+      } else {
+        let imageModel = 'Nano Banana Pro';
+        let imageProviderName = 'Google Flow';
+        let imageGenerated = false;
+        try {
+          const imgResult = await imageGenerationService.generate({
+            prompt: promptToUse,
+            ratio: '1:1',
+            ip: req.ip,
+          });
+          imageModel = imgResult.modelName || imageModel;
+          if (imgResult.url) {
+            imageProviderName = imgResult.providerName || imageProviderName;
+            imageGenerated = true;
+            aiResponse = `🖼️ **Generated with ${imageProviderName} (${imageModel})**\n\n![${promptToUse}](${imgResult.url})\n\n*Prompt: ${promptToUse}*\n\n_${imageQuotaSummary(imgResult.imageQuota)}_`;
+          } else if (imgResult.code === 'IMAGE_QUOTA_LIMIT') {
+            aiResponse = `🎨 ${imageQuotaLimitMessage(imgResult.imageQuota)}`;
+          } else {
+            aiResponse = `🎨 I couldn't generate that image right now (${imgResult.error || 'try again in a moment'}). In the meantime you can describe what you need and I'll give you a text response.`;
+          }
+        } catch (imgErr) {
+          aiResponse = `🎨 Image generation hit an error: ${imgErr.message}. Try again in a moment!`;
+        }
+        modelUsed = imageGenerated
+          ? `${imageProviderName} (${imageModel})`
+          : 'HerovaAi';
+      }
+
+      convo.messages.push({ role: 'assistant', content: aiResponse, model: modelUsed, timestamp: new Date() });
+      convo.updatedAt = new Date();
+      await convo.save();
+
+      return res.json({
+        success: true,
+        conversationId: convo._id,
+        userMessage: { role: 'user', content: message },
+        aiMessage: { role: 'assistant', content: aiResponse, model: modelUsed },
+      });
+    }
 
     if (route.kind === 'cloud') {
       // ── Free cloud model, no local RAM involved ──────────────────────────
