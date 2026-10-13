@@ -469,6 +469,11 @@ export const flowApi = {
 
 /** Admin Google Flow Studio, which accepts optional multipart reference images. */
 export const googleFlowApi = {
-  getOptions: () => apiRequest<any>('/google-flow/options', { cache: 'no-store' }),
+  // `refresh` bypasses the backend's short-lived option cache (the manual
+  // "Sync Flow options" button); the automatic page-load read uses the cache.
+  getOptions: (refresh = false) => apiRequest<any>(
+    `/google-flow/options${refresh ? '?refresh=1' : ''}`,
+    { cache: 'no-store' },
+  ),
   generate: (formData: FormData) => apiUpload<any>('/google-flow/generate', formData),
 }

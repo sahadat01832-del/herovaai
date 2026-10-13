@@ -508,7 +508,26 @@ async function configureGenerationOptions(page, request) {
   }
 }
 
-async function getGenerationOptions() {
+// Reading the option list is a live scrape of the Flow settings panel — it
+// launches Brave and clicks through the UI — so it costs seconds per call and
+// needs the browser open. The models and aspect ratios an account is offered
+// change rarely, so a successful read is kept briefly: repeat visits to Flow
+// Studio then answer from memory without starting a browser at all, and the
+// only caller that must see the current list can bypass this with
+// `{ refresh: true }` (the "Sync Flow options" button).
+const OPTIONS_CACHE_MS = 10 * 60 * 1000;
+let optionsCache = null;
+
+async function getGenerationOptions({ refresh = false } = {}) {
+  if (!refresh && optionsCache && Date.now() - optionsCache.at < OPTIONS_CACHE_MS) {
+    return optionsCache.value;
+  }
+  const value = await scrapeGenerationOptions();
+  optionsCache = { at: Date.now(), value };
+  return value;
+}
+
+async function scrapeGenerationOptions() {
   const page = await getFlowPage();
   const settingsTrigger = await waitForVisible(
     page.getByRole('button', { name: /settings trigger/i }),

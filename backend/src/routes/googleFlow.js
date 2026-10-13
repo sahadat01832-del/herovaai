@@ -27,12 +27,22 @@ const upload = multer({
 
 router.use(authenticate, adminOnly);
 
-router.get('/options', async (_req, res) => {
+// Reading the options needs the Flow page, so this launches Brave exactly as a
+// generation does — and has to close it again. It used to skip the cleanup,
+// which meant merely OPENING Flow Studio left the browser resident afterwards
+// (≈500 MB of Brave on a 6 GB box, surviving until the next generation's
+// finally happened to close it). A cached answer never starts the browser;
+// ?refresh=1 forces a fresh scrape, which is what the Sync button sends.
+router.get('/options', async (req, res) => {
   try {
-    const options = await googleFlowService.getGenerationOptions();
+    const options = await googleFlowService.getGenerationOptions({
+      refresh: req.query.refresh === '1',
+    });
     res.json({ success: true, options });
   } catch (error) {
     res.status(502).json({ success: false, message: error.message });
+  } finally {
+    try { await googleFlowService.closeBrowserContext(); } catch { /* best-effort */ }
   }
 });
 
@@ -55,12 +65,31 @@ router.post('/generate', (req, res, next) => {
       await fs.writeFile(referenceImagePath, req.file.buffer, { mode: 0o600 });
     }
 
-    const result = await googleFlowService.generateImage({
+    const request = {
       prompt: req.body.prompt,
       model: req.body.model || undefined,
       aspectRatio: req.body.aspectRatio || undefined,
       referenceImagePath,
-    });
+    };
+    let result;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        result = await googleFlowService.generateImage(request);
+        break;
+      } catch (error) {
+        // Google's risk engine sometimes flags the automated session itself
+        // ("unusual activity") rather than anything about the request — it is
+        // intermittent (seen ~1 run in 5 on 2026-10-13), reports no charge, and
+        // a fresh browser context usually passes where the flagged one did not.
+        // Give it exactly one second attempt; every other failure, and a repeat
+        // of this one, is final so genuine errors and credit problems never loop.
+        const flagged = /unusual (?:browser )?activity/i.test(error.message);
+        if (!flagged || attempt === 2) throw error;
+        console.warn(`[google-flow] unusual-activity flag on attempt ${attempt} — retrying with a fresh browser context`);
+        try { await googleFlowService.closeBrowserContext(); } catch { /* best-effort */ }
+        await new Promise((resolve) => { setTimeout(resolve, 5000); });
+      }
+    }
     res.json({
       success: true,
       image: result.image,

@@ -34,11 +34,13 @@ export default function GoogleFlowPage() {
   const [generating, setGenerating] = useState(false)
   const [error, setError] = useState('')
 
-  const refreshOptions = async () => {
+  // `force` skips the backend's option cache — the Sync button wants a real
+  // re-read of Flow's current models, the automatic mount read does not.
+  const refreshOptions = async (force = false) => {
     setOptionsLoading(true)
     setError('')
     try {
-      const response = await googleFlowApi.getOptions()
+      const response = await googleFlowApi.getOptions(force)
       const nextOptions = response.options as FlowOptions
       setOptions(nextOptions)
       setModel((current) => (
@@ -130,7 +132,7 @@ export default function GoogleFlowPage() {
         </div>
         <button
           type="button"
-          onClick={refreshOptions}
+          onClick={() => refreshOptions(true)}
           disabled={optionsLoading || generating}
           className="btn-secondary flex items-center gap-2"
         >
