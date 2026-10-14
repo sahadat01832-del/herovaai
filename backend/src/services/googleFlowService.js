@@ -150,6 +150,40 @@ async function prepareBraveProfile(profileDir = PROFILE_DIR) {
   await fs.chmod(localStatePath, 0o600);
 }
 
+/**
+ * Kill Brave processes attached to OUR Flow profile that we did not start in
+ * this backend lifetime (backend restarts/crashes orphan them). An orphan
+ * keeps the profile locked, so every later spawn merely forwards to the
+ * orphan and exits 0 — the "Brave exited during startup" 502 that then fails
+ * EVERY generation until cleared by hand (hit 2026-10-14). Only processes
+ * whose cmdline names our exact profile dir are touched: the user's own
+ * Brave and the Facebook poster use different profiles and never match.
+ */
+function reapOrphanedFlowBrowsers() {
+  let entries;
+  try {
+    entries = fsSync.readdirSync('/proc');
+  } catch {
+    return 0;
+  }
+  let killed = 0;
+  for (const name of entries) {
+    if (!/^\d+$/.test(name) || Number(name) === process.pid) continue;
+    let cmdline;
+    try {
+      cmdline = fsSync.readFileSync(`/proc/${name}/cmdline`, 'utf8');
+    } catch {
+      continue; // exited between readdir and read
+    }
+    if (!cmdline.includes(`--user-data-dir=${PROFILE_DIR}`)) continue;
+    try {
+      process.kill(Number(name), 'SIGTERM');
+      killed += 1;
+    } catch { /* already gone */ }
+  }
+  return killed;
+}
+
 async function getAvailablePort() {
   const server = net.createServer();
   await new Promise((resolve, reject) => {
@@ -241,8 +275,10 @@ function validateGenerateInput(input) {
   if (typeof input.prompt !== 'string' || !input.prompt.trim()) {
     throw new Error('prompt is required and must not be empty.');
   }
-  if (input.prompt.length > 4000) {
-    throw new Error('prompt must be at most 4000 characters.');
+  if (input.prompt.length > 30000) {
+    // WAS 4000 — the owner's full master prompts (sb_master_prompts.md
+    // Prompt 2 + Prompt 3) build a ~17K-char image prompt (2026-10-14).
+    throw new Error('prompt must be at most 30000 characters.');
   }
   if (input.model !== undefined && (typeof input.model !== 'string' || !input.model.trim() || input.model.length > 100)) {
     throw new Error('model must be a non-empty string of at most 100 characters.');
@@ -323,6 +359,11 @@ async function validateReferenceImage(referenceImagePath) {
 async function getBrowserContext() {
   if (!browserContextPromise) {
     browserContextPromise = (async () => {
+      const orphans = reapOrphanedFlowBrowsers();
+      if (orphans > 0) {
+        console.warn(`[google-flow] reaped ${orphans} orphaned Flow Brave process(es) left by a previous backend lifetime`);
+        await new Promise((resolve) => setTimeout(resolve, 1000)); // let the profile locks release
+      }
       await prepareBraveProfile();
       const executablePath = findBraveExecutable();
       browserPort = await getAvailablePort();
