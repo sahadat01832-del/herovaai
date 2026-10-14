@@ -648,6 +648,33 @@ async function attachReferenceImage(page, image) {
   if (!selectedIngredient) {
     throw new Error(`Google Flow did not attach "${filename}" to the prompt.`);
   }
+
+  // OWNER RULE (2026-10-14): Flow's reference-image upload takes 5-10 s.
+  // The chip above can read "not busy" before Flow has actually processed the
+  // file — give it a guaranteed 5s minimum settle (polling for a real ready
+  // state, hard cap 12s) BEFORE the prompt is added and the generation is
+  // created. Clicking through early is what produced
+  // "generate button is disabled / reference image was not accepted".
+  const settleStart = Date.now();
+  const MIN_SETTLE_MS = 5000;
+  const MAX_SETTLE_MS = 12000;
+  let settled = false;
+  while (Date.now() - settleStart < MAX_SETTLE_MS) {
+    await new Promise((resolve) => { setTimeout(resolve, 750); });
+    const state = await page.evaluate(() => {
+      const chips = Array.from(document.querySelectorAll('button[aria-label="Ingredient"]'));
+      const chipOk = chips.length > 0 && chips.some((b) => b.getAttribute('aria-busy') !== 'true');
+      const uploading = /uploading|আপলোড/i.test(document.body.innerText || '');
+      return { chipOk, uploading };
+    });
+    if (state.chipOk && !state.uploading && Date.now() - settleStart >= MIN_SETTLE_MS) {
+      settled = true;
+      break;
+    }
+  }
+  console.log(settled
+    ? `[google-flow] reference image settled after ${((Date.now() - settleStart) / 1000).toFixed(1)}s — adding prompt`
+    : `[google-flow] reference image not fully confirmed after ${((Date.now() - settleStart) / 1000).toFixed(1)}s — proceeding (QA will verify)`);
 }
 
 async function findPromptField(page) {
@@ -698,6 +725,13 @@ async function runGeneration(request, referenceImage) {
   );
   if (!generateButton) {
     throw new Error('Google Flow generate button was not found. The Flow interface may have changed.');
+  }
+  // OWNER RULE (2026-10-14): right after a reference upload the button can
+  // stay disabled for a beat while Flow finishes processing — wait for it to
+  // ENABLE (up to 8s) before declaring failure.
+  const enableDeadline = Date.now() + 8000;
+  while (!await generateButton.isEnabled() && Date.now() < enableDeadline) {
+    await new Promise((resolve) => { setTimeout(resolve, 500); });
   }
   if (!await generateButton.isEnabled()) {
     throw new Error('Google Flow generate button is disabled. Check that the prompt and any reference image were accepted.');
