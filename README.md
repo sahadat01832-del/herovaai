@@ -9,12 +9,14 @@
 - **Public chat with on-demand local AI** — visiting the chat can wake LM Studio ("Bionic"),
   load a small model, and everything is unloaded again when the visitor leaves. Nothing
   boots implicitly, and RAM on the 5.8 GB host stays free otherwise.
+- **Live dashboard chat** — free API replies stream token-by-token, with a buffered retry
+  before the first token if the streaming transport is unavailable.
 - **Free cloud fallback** — guests are routed to free servable cloud models (20 requests/hour
   per IP) and never touch the local machine.
 - **WhatsApp DM automation** — QR pairing via `@wppconnect-team/wppconnect`, AI auto-reply,
   live message log.
-- **Business AI memory** — owner profile, persona/tone, custom knowledge base auto-injected
-  into chats and WhatsApp replies.
+- **Business AI memory** — verified business details guide owner chat as context and
+  customer/WhatsApp replies with strict fact and handoff rules.
 - **Admin control center** — users, API keys, global chat inspection.
 
 ## Quick start

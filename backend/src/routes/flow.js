@@ -228,6 +228,7 @@ router.post('/connect/disconnect', authenticate, async (req, res) => {
     req.user.flowAccountStatus = 'unlinked';
     req.user.flowAccountConnectedAt = null;
     await req.user.save();
+    flowService.invalidateStatusCache();
     res.json({ success: true, message: 'Google Flow account disconnected successfully' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

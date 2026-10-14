@@ -7,6 +7,9 @@ const crypto = require('crypto');
 
 const GATEWAY_URL = process.env.CONTENTBOT_API_URL || 'http://127.0.0.1:8787';
 const FLOW_STATUS_CACHE_MS = 5000;
+const FLOW_STATUS_ERROR_CACHE_MS = 1500;
+const FLOW_STATUS_RESPONSE_BUDGET_MS = 7000;
+const FLOW_STATUS_GATEWAY_TIMEOUT_MS = 20000;
 
 // Website images try the selected Flow Nano Banana model first, then Nano
 // Banana 2.1 through OmniRoute, and only then the Agnes image fallback.
@@ -97,41 +100,88 @@ for (const dir of MEDIA_DIRS) {
 const flowService = {
   extensionDirectory: EXTENSION_DIR,
   flowStatusCache: { at: 0, value: null },
+  flowStatusRevision: 0,
   flowStatusRequest: null,
 
   async getStatus() {
     const cached = flowService.flowStatusCache;
-    if (cached.value && Date.now() - cached.at < FLOW_STATUS_CACHE_MS) return cached.value;
-    if (flowService.flowStatusRequest) return flowService.flowStatusRequest;
+    const cacheTtl = cached.value?.success === false
+      ? FLOW_STATUS_ERROR_CACHE_MS
+      : FLOW_STATUS_CACHE_MS;
+    if (cached.value && Date.now() - cached.at < cacheTtl) return cached.value;
 
-    flowService.flowStatusRequest = (async () => {
+    const revision = flowService.flowStatusRevision;
+    const activeRequest = flowService.flowStatusRequest;
+    if (activeRequest?.revision === revision) return flowService.waitForStatus(activeRequest);
+
+    const request = { revision, startedAt: Date.now(), promise: null };
+    request.promise = (async () => {
+      let value;
       try {
-        const res = await axios.get(`${GATEWAY_URL}/flow/status`, { timeout: 15000 });
-        const value = {
+        const res = await axios.get(`${GATEWAY_URL}/flow/status`, { timeout: FLOW_STATUS_GATEWAY_TIMEOUT_MS });
+        value = {
           ...res.data,
           success: true,
           extensionDirectory: EXTENSION_DIR,
           availableModels: flowService.FLOW_MODELS,
         };
-        flowService.flowStatusCache = { at: Date.now(), value };
-        return value;
       } catch (err) {
-        return {
+        const timedOut = err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT'
+          || /timeout/i.test(err.message || '');
+        value = {
           success: false,
+          code: timedOut ? 'FLOW_STATUS_TIMEOUT' : 'FLOW_STATUS_UNAVAILABLE',
           ready: false,
           extensionDirectory: EXTENSION_DIR,
           availableModels: flowService.FLOW_MODELS,
-          error: err.message,
-          message: 'ContentBot gateway or Flow MCP is initializing. Check `contentbot flow status`.',
+          error: timedOut ? `Flow status gateway timed out after ${FLOW_STATUS_GATEWAY_TIMEOUT_MS} ms` : err.message,
+          message: timedOut
+            ? 'Flow status could not be verified. Retry shortly; no connected account has been assumed.'
+            : 'ContentBot gateway or Flow MCP is unavailable. Check `contentbot flow status`.',
         };
-      } finally {
-        flowService.flowStatusRequest = null;
       }
-    })();
-    return flowService.flowStatusRequest;
+
+      if (revision === flowService.flowStatusRevision) {
+        flowService.flowStatusCache = { at: Date.now(), value };
+      }
+      return value;
+    })().finally(() => {
+      if (flowService.flowStatusRequest === request) flowService.flowStatusRequest = null;
+    });
+    flowService.flowStatusRequest = request;
+
+    return flowService.waitForStatus(request);
+  },
+
+  async waitForStatus(request, responseBudgetMs = FLOW_STATUS_RESPONSE_BUDGET_MS) {
+    const remainingMs = Math.max(0, responseBudgetMs - (Date.now() - request.startedAt));
+    const pending = Symbol('flow-status-pending');
+    let timer;
+    const response = await Promise.race([
+      request.promise,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(pending), remainingMs);
+      }),
+    ]);
+    clearTimeout(timer);
+
+    if (request.revision !== flowService.flowStatusRevision) return flowService.getStatus();
+    if (response === pending) {
+      return {
+        success: false,
+        code: 'FLOW_STATUS_PENDING',
+        pending: true,
+        ready: false,
+        extensionDirectory: EXTENSION_DIR,
+        availableModels: flowService.FLOW_MODELS,
+        message: 'Flow status is still being verified. No account is reported connected until its live status is confirmed.',
+      };
+    }
+    return response;
   },
 
   invalidateStatusCache() {
+    flowService.flowStatusRevision += 1;
     flowService.flowStatusCache = { at: 0, value: null };
   },
 
@@ -187,13 +237,20 @@ const flowService = {
     // Cached briefly: a status call is seconds of MCP round-trips, and the
     // account list only changes when someone connects or disconnects an account.
     const cache = flowService.houseAccountsCache;
-    if (!fresh && cache.at && Date.now() - cache.at < 60000) return cache.ids;
+    if (!status && !fresh && cache.at && Date.now() - cache.at < 60000) return cache.ids;
 
     try {
       const res = status ? null : await axios.get(`${GATEWAY_URL}/flow/status`, { timeout: 20000 });
       const statusData = status || res?.data;
+      if (statusData?.success === false) {
+        flowService.houseAccountsCache = { at: 0, ids: [] };
+        return [];
+      }
       const ids = statusData?.accounts?.connectedAccountIds;
-      if (!Array.isArray(ids)) return cache.ids || [];
+      if (!Array.isArray(ids)) {
+        if (status) flowService.houseAccountsCache = { at: 0, ids: [] };
+        return status ? [] : cache.ids || [];
+      }
       const accounts = statusData.accounts;
       const connected = ids.map(String).filter((id) => id && !id.startsWith('user_'));
       const house = configured.length
