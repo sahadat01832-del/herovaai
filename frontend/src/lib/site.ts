@@ -26,8 +26,10 @@ export function siteOrigin(): string {
 }
 
 export const SITE_NAME = 'HerovaAi'
-export const SITE_TAGLINE = 'The AI assistant that answers your customers while you serve them'
+// Kept verbatim in sync with the static public site's <title>/meta description
+// (herovaai-site/index.html) so both front doors present the same positioning.
+export const SITE_TAGLINE = 'The Autonomous AI Engine for Your Shop & Content'
 export const SITE_DESCRIPTION =
-  'HerovaAi answers customer questions on WhatsApp in your own words — your prices, your hours, your rules — and keeps a memory of your business. Try it free, no sign-up needed.'
+  'HerovaAi automates customer service on WhatsApp 24/7 in your own words, generates images and cinematic video with Google Flow, and publishes daily to YouTube Shorts & TikTok. Free to try.'
 /** Pages that are meant to be found by search engines. */
 export const PUBLIC_ROUTES = ['/', '/login', '/register', '/privacy', '/terms'] as const

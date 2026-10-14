@@ -3,8 +3,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import Link from 'next/link'
 import {
-  Bot, Send, User, Sparkles, ShieldCheck, Smartphone, Brain,
-  ArrowRight, Cpu, Loader2, Square, Wifi, WifiOff, Check, Lock, Download,
+  Bot, Send, User, Sparkles,
+  ArrowRight, Loader2, Square, Wifi, WifiOff, Check, Lock, Download,
 } from 'lucide-react'
 import { chatApi, authApi } from '@/lib/api'
 import { getToken, getUser, getApiUrl, ApiError } from '@/lib/auth'
@@ -50,6 +50,127 @@ const QUICK_PROMPTS = [
   'Write a WhatsApp reply for a price question',
   'Give me 3 ideas to bring customers back',
 ]
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Marketing content — kept in step with the static public site
+   (herovaai-site/index.html) so both front doors tell the same story.
+   The live demo panel beside the hero is this app's own addition.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const STATS = [
+  ['24/7', 'always-on replies'],
+  ['<1s', 'typical response'],
+  ['10/day', 'free AI images'],
+  ['৳0', 'to get started'],
+] as const
+
+const FEATURES: { icon: string; title: string; body: string; wide?: boolean }[] = [
+  {
+    icon: '💬',
+    title: '24/7 WhatsApp & Messenger AI',
+    body: 'Scan a QR code once. It answers customers while you sleep or serve someone else — prices, inventory, shipping and orders — in your own tone of voice.',
+  },
+  {
+    icon: '🎨',
+    title: 'Google Flow image & video studio',
+    body: 'Generate photorealistic images (Nano Banana) and cinematic video straight from a prompt — a free daily allowance included, no API keys or subscriptions of your own.',
+  },
+  {
+    icon: '📱',
+    title: 'Shorts & TikTok auto-poster',
+    body: 'Turn one offer into a short vertical clip and schedule it to YouTube Shorts and TikTok — one click, no extra tools.',
+  },
+  {
+    icon: '🧠',
+    title: 'Adaptive business memory',
+    body: 'Your prices, policies and style get remembered once and used in every answer — no repeated explanations.',
+  },
+  {
+    icon: '⚡',
+    title: 'Transparent local billing',
+    body: '৳100/month Pro, ৳300/month Enterprise, Nagad & local payment. No hidden credits, no surprise usage fees.',
+  },
+  {
+    icon: '🛡️',
+    title: 'Tenant isolation',
+    body: 'Every shop gets a private workspace. Your customers, memory and media never mix with anyone else.',
+  },
+  {
+    icon: '🔌',
+    title: 'Every channel, one place',
+    body: 'WhatsApp, Messenger, Telegram, web chat, YouTube and TikTok — manage all of them from a single dashboard.',
+    wide: true,
+  },
+]
+
+const FLOW_TILES = [
+  'bg-gradient-to-br from-brand-400/40 to-brand-600/15',
+  'bg-gradient-to-br from-amber-200/25 to-brand-500/20',
+  'bg-gradient-to-br from-brand-300/30 to-orange-500/10',
+  'bg-gradient-to-br from-yellow-100/20 to-brand-400/25',
+]
+
+const STEPS = [
+  {
+    title: 'Create your account:',
+    body: 'Register in 30 seconds and add your store name, products and rules to the AI memory.',
+  },
+  {
+    title: 'Connect your channels:',
+    body: 'Pair WhatsApp with a QR scan, or link YouTube & TikTok with one-click helpers.',
+  },
+  {
+    title: 'Sit back and grow:',
+    body: 'Let the AI answer customers around the clock and auto-publish your content.',
+  },
+] as const
+
+const PLANS = [
+  {
+    name: 'Free Starter',
+    desc: 'For testing the waters and small shops.',
+    price: '৳0',
+    features: [
+      '1,000,000 AI tokens per week',
+      '1 WhatsApp assistant connection',
+      '10 AI images per day',
+      'Basic business memory',
+      'Web AI chat assistant',
+    ],
+    cta: 'Start free',
+    featured: false,
+  },
+  {
+    name: 'Pro Creator & Shop',
+    desc: 'For active shops, creators and sellers.',
+    price: '৳100',
+    features: [
+      '5,000,000 AI tokens per week',
+      'Google Flow studio (image & video)',
+      '100 AI images per billing cycle',
+      'Shorts & TikTok 1-click publishing',
+      'Daily automated social posting',
+      'Messenger & Telegram auto-replies',
+    ],
+    cta: 'Upgrade to Pro',
+    featured: true,
+  },
+  {
+    name: 'Enterprise',
+    desc: 'For agencies, high-volume shops and brands.',
+    price: '৳300',
+    features: [
+      'Unlimited token throughput',
+      'Unlimited AI image generation',
+      'Multiple WhatsApp numbers',
+      'Priority generation queue',
+      'Custom webhook automations',
+      'Dedicated support & setup',
+    ],
+    cta: 'Get Enterprise',
+    featured: false,
+  },
+] as const
 
 export default function HomePage() {
   const { user, token } = useAuth()
@@ -284,6 +405,23 @@ export default function HomePage() {
             </span>
           </Link>
 
+          <nav className="hidden items-center gap-1 lg:flex" aria-label="Page sections">
+            {[
+              { href: '#features', label: 'Features' },
+              { href: '#flow', label: 'Flow Studio' },
+              { href: '#pricing', label: 'Pricing' },
+              { href: '#how', label: 'How it works' },
+            ].map(l => (
+              <a
+                key={l.href}
+                href={l.href}
+                className="rounded-lg px-3 py-1.5 text-[13px] font-medium text-dark-300 transition-colors hover:bg-white/[0.06] hover:text-white"
+              >
+                {l.label}
+              </a>
+            ))}
+          </nav>
+
           <div className="flex items-center gap-2">
             <span
               className="hidden items-center gap-1.5 rounded-full border border-white/[0.08] bg-white/[0.03] px-3 py-1.5 text-[11px] font-medium text-dark-300 md:inline-flex"
@@ -324,55 +462,42 @@ export default function HomePage() {
             <Reveal>
               <span className="inline-flex items-center gap-2 rounded-full border border-brand-400/25 bg-brand-400/[0.08] px-3.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-brand-200 shadow-[0_0_20px_rgba(216,189,133,0.15)]">
                 <Sparkles className="h-3 w-3 text-brand-300" aria-hidden />
-                Autonomous Business AI &amp; Content Engine
+                Autonomous AI Engine for Business &amp; Content
               </span>
 
               <h1 className="mt-5 text-[32px] font-semibold leading-[1.08] tracking-tight text-white sm:text-[42px] lg:text-[46px]">
-                Automate Customer Sales
-                <span className="gradient-text block">&amp; Grow Your Social Presence</span>
+                Automate customer sales
+                <span className="gradient-text block">&amp; grow your social presence</span>
               </h1>
 
               <p className="mt-5 max-w-xl text-[14.5px] leading-relaxed text-dark-300 sm:text-[15px]">
-                “How much is it?” “When do you open?” “Do you deliver?” — HerovaAi answers inquiries on WhatsApp using your shop rules, turns your offers or references into original social posts, and schedules content for your connected channels.
+                Tell it once what you sell, your prices and your rules. HerovaAi answers customers on
+                WhatsApp around the clock, generates images and cinematic video with Google Flow, and
+                publishes to YouTube Shorts &amp; TikTok — all from one dashboard.
               </p>
 
               <div className="mt-8 flex flex-wrap items-center gap-3">
+                <Link href={isLoggedIn ? '/dashboard' : '/register'} className="btn-primary btn-sheen btn-lg shadow-gold">
+                  {isLoggedIn ? 'Open your dashboard' : 'Get started free'}
+                  <ArrowRight className="h-4 w-4" aria-hidden />
+                </Link>
                 <button
                   onClick={() => {
                     // On a phone the panel sits below the fold: bring it up first, then focus.
                     panelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
                     chatInputRef.current?.focus({ preventScroll: true })
                   }}
-                  className="btn-primary btn-sheen btn-lg shadow-gold"
+                  className="btn-ghost btn-lg"
                 >
-                  Ask it something
-                  <ArrowRight className="h-4 w-4" aria-hidden />
+                  <Sparkles className="h-4 w-4 text-brand-300" aria-hidden />
+                  Try the live AI chat
                 </button>
-                <Link href={isLoggedIn ? '/dashboard' : '/login'} className="btn-ghost btn-lg">
-                  <ShieldCheck className="h-4 w-4" aria-hidden />
-                  {isLoggedIn ? 'Open dashboard' : 'Owner sign in'}
-                </Link>
               </div>
-            </Reveal>
 
-            <dl className="stagger mt-9 space-y-4 border-t border-white/[0.06] pt-7">
-              {[
-                { icon: Smartphone, title: 'Autonomous WhatsApp & Messenger AI', body: 'Pair your number once. Customers get replies at 11pm, on holidays, while you are with someone.' },
-                { icon: Sparkles, title: 'AI image generation · no personal account needed', body: 'HerovaAi tries its shared Google Flow image pool first and uses its configured backup image engine when Flow is unavailable. Free includes 10 successful images a day, Pro (৳100/month) includes 100 per billing cycle, and Enterprise (৳300/month) is unlimited.' },
-                { icon: Brain, title: 'Original posts for connected channels', body: 'Create distinct, on-brand posts from an offer, reference image, or business profile, then schedule them for your connected social channels.' },
-                { icon: Cpu, title: 'Private & Isolated Execution', body: 'Prefer nothing leaving your shop? Run private local models with strict tenant data isolation.' },
-              ].map(({ icon: Icon, title, body }) => (
-                <div key={title} className="flex gap-4">
-                  <span className="mt-0.5 flex h-9 w-9 flex-none items-center justify-center rounded-xl border border-brand-400/20 bg-brand-400/[0.08] text-brand-200 shadow-sm">
-                    <Icon className="h-4 w-4" aria-hidden />
-                  </span>
-                  <div>
-                    <dt className="text-[13.5px] font-semibold text-white">{title}</dt>
-                    <dd className="mt-1 text-[13px] leading-relaxed text-dark-400">{body}</dd>
-                  </div>
-                </div>
-              ))}
-            </dl>
+              <p className="mt-4 text-[12px] text-dark-500">
+                Zero credit card required · Free tier forever · Nagad &amp; local payment ready
+              </p>
+            </Reveal>
           </section>
 
           {/* ── Right: live chat ─────────────────────────────────────── */}
@@ -608,6 +733,234 @@ export default function HomePage() {
             </div>
           </section>
         </div>
+
+        {/* ── Trust bar (mirrors the redesigned public site) ────────────── */}
+        <Reveal>
+          <dl className="mt-14 grid grid-cols-2 gap-y-6 border-y border-white/[0.06] py-7 sm:grid-cols-4">
+            {STATS.map(([value, label]) => (
+              <div key={label} className="px-2 text-center">
+                <dt className="font-display text-[26px] font-semibold text-brand-300">{value}</dt>
+                <dd className="mt-1 text-[11px] uppercase tracking-[0.14em] text-dark-500">{label}</dd>
+              </div>
+            ))}
+          </dl>
+        </Reveal>
+
+        {/* ── Features bento ─────────────────────────────────────────────── */}
+        <section id="features" className="mt-24 scroll-mt-20">
+          <Reveal className="text-center">
+            <h2 className="font-display text-[26px] font-semibold tracking-tight text-white sm:text-[32px]">
+              Everything you need to run on autopilot
+            </h2>
+            <p className="mx-auto mt-3 max-w-2xl text-[14.5px] leading-relaxed text-dark-400">
+              Automate conversations, create media, and distribute content — without paying for
+              separate API keys.
+            </p>
+          </Reveal>
+
+          <div className="mt-9 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {FEATURES.map(f => (
+              <Reveal
+                key={f.title}
+                className={f.wide ? 'sm:col-span-2 lg:col-span-3' : 'h-full'}
+              >
+                <article
+                  className={`group h-full rounded-2xl border border-white/[0.07] bg-white/[0.025] p-6 transition-colors hover:border-brand-400/30 hover:bg-brand-400/[0.05] ${
+                    f.wide ? 'flex flex-col gap-4 sm:flex-row sm:items-center sm:gap-6' : ''
+                  }`}
+                >
+                  <div className="text-[26px] leading-none" aria-hidden>
+                    {f.icon}
+                  </div>
+                  <div className={f.wide ? 'min-w-0 flex-1' : ''}>
+                    <h3 className="text-[15px] font-semibold text-white">{f.title}</h3>
+                    <p className="mt-2 text-[13.5px] leading-relaxed text-dark-400">{f.body}</p>
+                  </div>
+                </article>
+              </Reveal>
+            ))}
+          </div>
+        </section>
+
+        {/* ── Google Flow showcase ───────────────────────────────────────── */}
+        <section id="flow" className="mt-24 scroll-mt-20">
+          <Reveal>
+            <div className="overflow-hidden rounded-3xl border border-white/[0.07] bg-gradient-to-br from-brand-400/[0.08] via-transparent to-transparent">
+              <div className="grid gap-8 p-7 sm:p-10 lg:grid-cols-2 lg:items-center">
+                <div>
+                  <span className="inline-flex items-center rounded-full border border-brand-400/25 bg-brand-400/[0.08] px-3 py-1 text-[10.5px] font-semibold uppercase tracking-[0.16em] text-brand-200">
+                    Now working · free tier
+                  </span>
+                  <h2 className="mt-4 font-display text-[24px] font-semibold tracking-tight text-white sm:text-[30px]">
+                    Generate images in seconds with Google Flow
+                  </h2>
+                  <p className="mt-3 max-w-xl text-[14.5px] leading-relaxed text-dark-300">
+                    Type a prompt, pick an aspect ratio, and HerovaAi drives Google Flow to create
+                    photorealistic images — no API key, no subscription. Free includes 10 successful
+                    images a day; Pro gets 100 per billing cycle and Enterprise is unlimited.
+                  </p>
+                  <div className="mt-6 flex flex-wrap gap-3">
+                    <Link href={isLoggedIn ? '/dashboard/flow' : '/register'} className="btn-primary btn-sheen">
+                      Open Flow Studio
+                    </Link>
+                    <a href="#pricing" className="btn-ghost">
+                      See plans
+                    </a>
+                  </div>
+                </div>
+
+                {/* Prompt bar + four result tiles: the Flow Studio in miniature. */}
+                <div className="rounded-2xl border border-white/[0.08] bg-black/40 p-4 shadow-lift">
+                  <div className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.03] px-3.5 py-2.5 text-[13px] text-dark-200">
+                    <span className="text-brand-300" aria-hidden>
+                      ›
+                    </span>
+                    <span className="truncate">
+                      a serene mountain lake at golden hour, cinematic, ultra detailed
+                    </span>
+                  </div>
+                  <div className="mt-3 grid grid-cols-4 gap-2.5">
+                    {FLOW_TILES.map((tile, i) => (
+                      <div
+                        key={i}
+                        className={`aspect-square rounded-lg ring-1 ring-inset ring-white/[0.06] ${tile}`}
+                      />
+                    ))}
+                  </div>
+                  <p className="mt-3 flex items-center gap-1.5 text-[11px] text-dark-500">
+                    <Sparkles className="h-3 w-3 text-brand-300" aria-hidden />
+                    4 variations · saved to your media library
+                  </p>
+                </div>
+              </div>
+            </div>
+          </Reveal>
+        </section>
+
+        {/* ── How it works ───────────────────────────────────────────────── */}
+        <section id="how" className="mt-24 scroll-mt-20">
+          <Reveal>
+            <div className="rounded-3xl border border-white/[0.07] bg-white/[0.02] p-7 sm:p-10">
+              <h2 className="font-display text-[24px] font-semibold tracking-tight text-white sm:text-[28px]">
+                How it works in 3 simple steps
+              </h2>
+              <ol className="mt-7 grid gap-4 md:grid-cols-3">
+                {STEPS.map((step, i) => (
+                  <li
+                    key={step.title}
+                    className="rounded-2xl border border-white/[0.06] bg-white/[0.025] p-5"
+                  >
+                    <span className="flex h-8 w-8 items-center justify-center rounded-full bg-brand-400/15 text-[13px] font-semibold text-brand-200 ring-1 ring-inset ring-brand-400/30">
+                      {i + 1}
+                    </span>
+                    <p className="mt-3.5 text-[13.5px] leading-relaxed text-dark-300">
+                      <strong className="text-white">{step.title}</strong> {step.body}
+                    </p>
+                  </li>
+                ))}
+              </ol>
+              <p className="mt-6 text-[13px] text-dark-500">
+                Your data stays in your private workspace. Review every message and activity anytime
+                from the dashboard.
+              </p>
+            </div>
+          </Reveal>
+        </section>
+
+        {/* ── Pricing ────────────────────────────────────────────────────── */}
+        <section id="pricing" className="mt-24 scroll-mt-20">
+          <Reveal className="text-center">
+            <h2 className="font-display text-[26px] font-semibold tracking-tight text-white sm:text-[32px]">
+              Transparent, flat-rate pricing
+            </h2>
+            <p className="mx-auto mt-3 max-w-2xl text-[14.5px] leading-relaxed text-dark-400">
+              Zero hidden fees. Free to start, affordable to scale your whole business.
+            </p>
+          </Reveal>
+
+          <Reveal>
+            <div className="mt-10 grid gap-4 lg:grid-cols-3">
+              {PLANS.map(plan => (
+                <div
+                  key={plan.name}
+                  className={`relative flex flex-col rounded-2xl border p-6 ${
+                    plan.featured
+                      ? 'border-brand-400/40 bg-brand-400/[0.06] shadow-gold'
+                      : 'border-white/[0.07] bg-white/[0.025]'
+                  }`}
+                >
+                  {plan.featured && (
+                    <span className="absolute -top-3 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full border border-brand-400/40 bg-dark-900 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-brand-200">
+                      Most popular
+                    </span>
+                  )}
+                  <h3 className="text-[15px] font-semibold text-white">{plan.name}</h3>
+                  <p className="mt-1 text-[12.5px] text-dark-500">{plan.desc}</p>
+                  <p
+                    className={`mt-4 font-display text-[34px] font-semibold leading-none ${
+                      plan.featured ? 'text-brand-200' : 'text-white'
+                    }`}
+                  >
+                    {plan.price}{' '}
+                    <span className="text-[13px] font-normal text-dark-500">/ month</span>
+                  </p>
+                  <ul className="mt-5 flex-1 space-y-2.5">
+                    {plan.features.map(f => (
+                      <li key={f} className="flex items-start gap-2 text-[13px] text-dark-300">
+                        <Check className="mt-0.5 h-3.5 w-3.5 flex-none text-brand-300" aria-hidden />
+                        {f}
+                      </li>
+                    ))}
+                  </ul>
+                  <Link
+                    href={isLoggedIn ? '/dashboard/subscription' : '/register'}
+                    className={`mt-6 w-full justify-center ${plan.featured ? 'btn-primary btn-sheen' : 'btn-ghost'}`}
+                  >
+                    {plan.cta}
+                  </Link>
+                </div>
+              ))}
+            </div>
+          </Reveal>
+        </section>
+
+        {/* ── Final CTA band ─────────────────────────────────────────────── */}
+        <section className="mt-24">
+          <Reveal>
+            <div className="relative overflow-hidden rounded-3xl border border-brand-400/25 bg-gradient-to-br from-brand-400/[0.12] via-brand-400/[0.04] to-transparent px-7 py-12 text-center sm:px-12">
+              <h2 className="font-display text-[26px] font-semibold tracking-tight text-white sm:text-[32px]">
+                Put your shop on autopilot today
+              </h2>
+              <p className="mx-auto mt-3 max-w-2xl text-[14.5px] leading-relaxed text-dark-300">
+                Start free, connect your WhatsApp in five minutes, and let HerovaAi answer your
+                customers while you focus on the work.
+              </p>
+              <div className="mt-7 flex flex-wrap items-center justify-center gap-3">
+                <Link href={isLoggedIn ? '/dashboard' : '/register'} className="btn-primary btn-sheen btn-lg shadow-gold">
+                  Create your free account
+                  <ArrowRight className="h-4 w-4" aria-hidden />
+                </Link>
+                {isLoggedIn ? (
+                  <Link href="/dashboard/connections" className="btn-ghost btn-lg">
+                    See what you can connect
+                  </Link>
+                ) : (
+                  <a
+                    href="https://sahadat01832-del.github.io/herovaai/connect/"
+                    className="btn-ghost btn-lg"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    See what you can connect
+                  </a>
+                )}
+              </div>
+              <p className="mt-5 text-[12px] text-dark-500">
+                Zero credit card required · Free tier forever · Nagad &amp; local payment ready
+              </p>
+            </div>
+          </Reveal>
+        </section>
       </main>
 
       {/* One footer for every public page: the policy pages live here so a
